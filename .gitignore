@@ -1,0 +1,23 @@
+# 运行时数据 —— 不提交
+# 这些文件由扩展在用户机器上自动生成，内容是你本地的译文/日志，提交上去既没用又泄露使用痕迹
+/cache.json
+/domCache.json
+/failCache.json
+/collected.json
+/translator.log
+/translator.log.1
+/games-available.json
+/seed-skip.json
+
+# 临时文件
+*.tmp
+*.bak
+*.log
+
+# 系统垃圾
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# 注意：domCache.seed.json 要提交（打包时作为种子译文），
+# 上面的 *.log / 具体文件列表都没有覆盖它。

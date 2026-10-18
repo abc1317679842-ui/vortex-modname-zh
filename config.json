@@ -1,0 +1,91 @@
+{
+  "enabled": true,
+  "autoTranslateOnInstall": true,
+  "requestDelayMs": 300,
+  "provider": {
+    "type": "openai",
+    "baseUrl": "",
+    "apiKey": "",
+    "model": ""
+  },
+  "fallbackLibre": false,
+  "includeCollections": true,
+  "writeToNameField": false,
+  "batchSize": 20,
+  "concurrency": 2,
+  "collectMode": false,
+  "domTranslate": true,
+  "translateAttrs": true,
+  "terms": [
+    {
+      "en": "Witcher Sense",
+      "zh": "猎魔感官"
+    },
+    {
+      "en": "Next Gen",
+      "zh": "次世代"
+    },
+    {
+      "en": "Remastered",
+      "zh": "重制版"
+    },
+    {
+      "en": "Fast Travel",
+      "zh": "快速旅行"
+    },
+    {
+      "en": "Quest Marker",
+      "zh": "任务标记"
+    },
+    {
+      "en": "Missable Quest",
+      "zh": "可错过任务"
+    },
+    {
+      "en": "Quest",
+      "zh": "任务"
+    },
+    {
+      "en": "Inventory",
+      "zh": "物品栏"
+    },
+    {
+      "en": "Loot",
+      "zh": "战利品"
+    },
+    {
+      "en": "Reshade",
+      "zh": "画质滤镜"
+    },
+    {
+      "en": "Texture",
+      "zh": "贴图"
+    },
+    {
+      "en": "Grass",
+      "zh": "草地"
+    },
+    {
+      "en": "Blood",
+      "zh": "血迹"
+    },
+    {
+      "en": "Overlay",
+      "zh": "叠加层"
+    },
+    {
+      "en": "Tracker",
+      "zh": "追踪"
+    },
+    {
+      "en": "Completion",
+      "zh": "完成度"
+    }
+  ],
+  "libreEndpoints": [
+    "https://translate.disroot.org",
+    "https://translate.private.coffee",
+    "https://translate.fortytwo-it.com",
+    "https://translate.terraprint.co"
+  ]
+}
