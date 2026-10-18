@@ -104,7 +104,7 @@ AI 会自己判断路径、检查进程、解压、告诉你下一步。你只�
 
 ### 方式二：一键脚本
 
-Win + X → **终端**（PowerShell），粘贴这两行回车（第一行下载脚本，第二行运行）：
+Win + X → **终端**（PowerShell）。把下面代码块里两行**一起复制、粘贴进窗口，按一次回车**即可——PowerShell 会自动先执行第一行（下载脚本）、再执行第二行（运行脚本）。一行一行分两次粘贴也行，效果一样：
 
 ```powershell
 Invoke-WebRequest 'https://github.com/abc1317679842-ui/vortex-modname-zh/releases/latest/download/install.ps1' -OutFile "$env:TEMP\vortex-zh-install.ps1"
