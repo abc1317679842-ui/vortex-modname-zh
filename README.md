@@ -3,6 +3,8 @@
 把 [Vortex](https://www.nexusmods.com/site/mods/1)（Nexus Mods 官方的模组管理器）变成中文的。
 一个扩展搞定，不依赖任何第三方中文包。
 
+**Vortex Chinese Translation / Vortex 汉化 / Vortex 简体中文 / 模组管理器中文界面 / 模组名翻译**
+
 ![version](https://img.shields.io/badge/version-0.15.8-blue)
 ![platform](https://img.shields.io/badge/platform-Windows-lightgrey)
 ![license](https://img.shields.io/badge/license-MIT%20%2B%20CC%20BY--NC--SA-green)
@@ -226,6 +228,24 @@ gamenames.json       游戏固定译名
 ```
 
 ---
+
+## 搜索关键词
+
+<details>
+<summary>点开看（给搜索引擎和 GitHub 搜索用的，你不需要读）</summary>
+
+**中文**：Vortex 汉化、Vortex 中文、Vortex 简体中文、Vortex 中文补丁、Nexus Mods 汉化、
+模组管理器 汉化、模组管理器 中文、模组名翻译、模组名称 中文、合集名翻译、更新日志翻译、
+Nexus 模组 中文、游戏模组 汉化、MOD 汉化、模组管理器 界面汉化、Vortex 扩展、
+巫师3 模组 汉化、赛博朋克2077 模组 汉化、上古卷轴5 模组 汉化、博德之门3 模组 汉化、
+辐射4 模组 汉化、怪物猎人 模组 汉化
+
+**English**：Vortex Chinese translation, Vortex localization, Vortex zh-CN, Vortex Simplified Chinese,
+Nexus Mods Chinese, mod manager translation, mod name translator, mod manager localization,
+Vortex extension i18n, translate mod names, translate changelog,
+LM Studio, Ollama, OpenAI-compatible, local LLM, offline translation
+
+</details>
 
 ## 许可
 
