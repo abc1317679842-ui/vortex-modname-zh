@@ -2,7 +2,10 @@
 <#
   Vortex 汉化扩展 一键安装脚本
 
-  用法（PowerShell）：irm <本文件 raw 地址> | iex
+  用法（PowerShell，两行）：
+    Invoke-WebRequest '<release 里本文件的地址>' -OutFile "$env:TEMP\vortex-zh-install.ps1"
+    powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\vortex-zh-install.ps1"
+  （不要用一行管道执行：GitHub 资产不带编码声明，PS 5.1 会按 Latin-1 解码，中文全乱）
 
   做的事：检测 Vortex 进程 → 下载最新 release → 解压到扩展目录 → 提示后续步骤
   不改注册表、不改系统设置、不写扩展目录以外的任何位置（临时 zip 除外，装完即删）
