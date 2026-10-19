@@ -9,6 +9,8 @@
 
 > 界面汉化 6046 条 / 游戏固定译名 746 条 / 模组名、合集名、更新日志走 AI 翻译
 
+📦 **本扩展也已发布到 Nexus Mods：[Vortex Full Chinese Localization - AI Mod Name Translation](https://www.nexusmods.com/site/mods/2475)**
+
 ---
 
 ## 先看效果
