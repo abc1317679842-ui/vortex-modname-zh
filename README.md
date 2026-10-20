@@ -3,7 +3,7 @@
 把 [Vortex](https://www.nexusmods.com/site/mods/1)（Nexus Mods 官方的模组管理器）变成中文的。
 一个扩展搞定，不依赖任何第三方中文包。
 
-![version](https://img.shields.io/badge/version-0.15.8-blue)
+![version](https://img.shields.io/badge/version-0.15.9-blue)
 ![platform](https://img.shields.io/badge/platform-Windows-lightgrey)
 ![license](https://img.shields.io/badge/license-MIT%20%2B%20CC%20BY--NC--SA-green)
 
@@ -196,6 +196,37 @@ Vortex 的 i18n 只认一份来源。装本扩展前建议先把别的中文包�
 
 **能不能只装词库，不装 AI 翻译**
 可以。不填接口地址就行，界面照旧是中文。
+
+---
+
+## 更新记录
+
+### 0.15.9（2026-10-21）
+
+- **修正**：更新下载时界面卡死、CPU 占用飙高。翻译层回填中文与界面重渲染互相拉锯，形成自持循环，每轮全树重扫把渲染进程的一个核吃满。已加熔断、退避与扫描时间预算三道保护（实测 renderer CPU 从 101% 降到 4.5%）
+- **修正**：带按钮或链接的通知翻译后点击无响应。通知类区域不再整块重建 DOM，改为只改文字
+- **改进**：下载速度、进度百分比等动态数字不再送去翻译，省掉无效调用与重试
+- **新增**：适配 Vortex 2.9.0 新界面文案 13 条（健康检查警告与建议、作者说明弹窗、LOOT 排序提示等）
+
+### 0.15.8（2026-10-18）
+
+- **修正**：偶发的「半繁半简」混合文本（如「已修復以下問題」）。繁简对照表换成 OpenCC 全量单字表（2965 条，Apache-2.0，已署名）
+- **新增**：README 增加真实运行截图与「为什么不是丢个语言包进去」的差异说明
+
+### 0.15.7（2026-10-18）
+
+- **整理**：许可与署名。界面词库主体译自 [liuyanxi](https://www.nexusmods.com/site/mods/29) 的 *Chinese Translation for Vortex*，并经 [Evander666](https://www.nexusmods.com/site/mods/2320) 的全量补全版校对，按 CC BY-NC-SA 4.0 分发（必须署名、必须同协议、禁止商业使用）；源代码仍为 MIT
+- 详细署名与条款见 [LICENSE-DATA](LICENSE-DATA) 与 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)
+
+### 0.15.6 及以前
+
+- 游戏名对照改为按需注入（可用游戏从 18 款提升到全部 746 条固定名）
+- 语言包每次覆盖前按哈希判断并自动备份
+- 云端 429/5xx 原地退避重试
+- 繁简表补齐 60 余个高频单字
+- 「每批送翻条数」真正生效；配置兜底不再污染出厂配置
+
+> 完整的施工日志在 [DEV-NOTES.md](DEV-NOTES.md)，每一条都对应一次真实故障。
 
 ---
 

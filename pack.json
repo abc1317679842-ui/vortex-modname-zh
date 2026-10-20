@@ -6224,5 +6224,13 @@
   "UE4SS DLL": "UE4SS DLL",
   "Root Folder": "根目录",
   "Blueprint": "蓝图",
-  "No mods installed": "没有安装任何模组"
+  "No mods installed": "没有安装任何模组",
+  "Suggestions": "建议",
+  "Changes that may improve your loadout or add optional extras.": "可能改善你的加载方案或添加可选内容的改动。",
+  "Collapse section": "折叠此分区",
+  "Expand section": "展开此分区",
+  "Review mod author notes": "查看模组作者说明",
+  "Some suggested mods have additional guidance from their authors and may not always be required.": "部分建议安装的模组带有作者的额外说明，可能并非必需。",
+  "Review the notes below and choose which mods to install.": "查看下方说明，选择要安装的模组。",
+  "For mods:": "适用模组："
 }

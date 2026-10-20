@@ -382,6 +382,16 @@ if (nk !== t) { ...查 lexNorm... }
 
 ## 10. 施工日志
 
+### 0.15.9（DOM 拉锯熔断 + 交互区守卫 + Vortex 2.9.0 适配）
+- 症状：更新下载时界面卡死、CPU 吃满一个核。根因是翻译层回填中文与 React 重渲染互相拉锯 —— 回填→还原→再回填，自持循环，每轮全树重扫
+- 三道防线：① 拉锯熔断（同一**元素 + 同一原文**回填超 6 次 → 打 `data-zh-skip` 冷却 60 秒。计数键必须是元素+原文，按 TextNode 记数永远归 1，因为 React 会重建节点）② 补扫退避 120→300→1000→3000→8000ms ③ walk 60ms 时间预算 + **断点续扫**（`resumeNode`）—— 不加续扫的话每次都从头超时，页面后半部分永远扫不到
+- jsdom 对照（3000 节点 + 1 个拉锯点，3.5s）：改写次数 **73 → 6**
+- 第四个 bug：`canBlockReplace` 改成**默认从严 + 内容区豁免** —— 块内含 `button/input/select/textarea/[role=button]/a[href]` 任一即不整块重建（不依赖容器类名）。Vortex 通知有更新/模组更新/错误/扩展更新好几种、类名各异，靠 `[class*="notification"]` 前缀匹配必漏。命中缓存这条路径以前**漏了这道闸**，`applyUnit` 会 `removeChild` 掉 React 管理的按钮 → 点一下就陷入重渲染循环。只有 `closest(CONTENT_TEXT_SEL)`（changelog/description/markdown/readme/note/summary/preview）才放宽链接
+- 第五个 bug：下载速度/进度百分比没被过滤。`isNoise` 只认 `384 KB`，认不出 `384 KB/s`，更认不出拼成一坨的 `384 KB/s640 KB/s896 KB/s` → 送模型必失败 → 进重试队列每分钟烧一次。噪声规则补动态数值（含拼接），12 条样本验证不误伤
+- 2.9.0 适配：locales diff 出 `health_check.json` 新增 13 条 → 8 条静态进 pack.json（3 条已存在自动去重），2 条动态模板进 PATTERNS（`Install selected (N)`、`Missing mod may be required for: X` —— 带插值的必须走正则，静态键匹配不上渲染后的实际值）
+- 实测：renderer CPU 8 秒 0.36 秒（约 4.5%），卡死时是 6.08/6 秒（101%）→ 相差 22 倍；新增日志 15 条含速度文本 0 条
+- 踩坑：`processBlock` 主路径当时漏了熔断计数，`hit` 缓存路径漏了 `canBlockReplace`，两处都补上才闭环
+
 ### 0.15.8（繁简表换血 + 仓库文档）
 - 中：`TRAD2SIMP` 是手写的百来字，缺 `後` `問` `會` `訂` `閱` `購` `誌` `體` 等高频字 —— 模型偶尔吐繁体时，`toSimplified` 只转掉一半，页面上出现「已修復以下問題」这种混合文本（用户截图实证）
 - 换成 OpenCC `TSCharacters.txt` 里单字对单字的 2965 条，压成 6735 字符的交替串，首次用到再建 Map（不再生成三千键的对象字面量）；文件从 41.1 KB 涨到 59.8 KB

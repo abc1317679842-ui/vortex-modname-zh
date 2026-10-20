@@ -85,6 +85,14 @@ function startDomTranslator(opts) {
   const UNSAFE_SEL = 'button,input,select,textarea,[role="button"],[contenteditable="true"],video,audio,canvas,iframe';
   // 菜单/工具栏里的块不整块替换（里面是图标 + 短标签，整块换会把图标清掉）
   const NO_BLOCK_SEL = 'button,[role="button"],nav,[class*="menu"],[class*="toolbar"],[class*="breadcrumb"],[class*="pagination"],[class*="sidebar"]';
+  // 通知 / 弹窗是 React 控件区：这里的元素常常绑着点击回调（不只是跳转），整块重建会把
+  // 它们换掉，React 回来更新时找不到节点就陷入重渲染循环（Vortex 2.9.0 更新通知的下载
+  // 按钮就是这个情况）。所以在这片区域里，链接也一并当交互元素，只改文字、不重建 DOM。
+  const UI_INTERACTIVE_SEL = '[class*="notification"],[class*="toast"],[class*="modal"],[class*="dialog"]';
+  // 但 changelog / 简介这类内容区常常就显示在弹窗里，里面的链接是纯外链，而且整块翻
+  // 译文才连贯 —— 命中内容区就维持原样，不加严，免得长文翻译质量倒退。
+  const CONTENT_TEXT_SEL = '[class*="changelog"],[class*="description"],[class*="markdown"],[class*="readme"],' +
+    '[class*="note"],[class*="summary"],[class*="preview"]';
 
   const ATTRS = ['title', 'placeholder', 'aria-label'];
   const MAX_LEN = 3000;   // 单个翻译单元上限；超过则切分成多片（见 splitUnit）
@@ -205,6 +213,10 @@ function startDomTranslator(opts) {
     if (/^#[0-9a-f]{3,8}$/i.test(s)) return true;
     if (/^[vV]?\d+(\.\d+)+([-a-z0-9.]*)?$/i.test(s)) return true;
     if (/^\d+(\.\d+)?\s?(B|KB|MB|GB|TB|KiB|MiB|GiB)$/i.test(s)) return true;
+    // 下载速度 / 进度百分比这类动态数值：每刷新一次就是一个新串（"384 KB/s"），
+    // 而且常被拼成一坨（实测 "384 KB/s640 KB/s896 KB/s"）。翻不出任何东西，还会
+    // 不停产生新词条、失败后反复重试，白烧调用。整体只由「数字+单位+%/s」构成才算噪声。
+    if (/^(\s*\d[\d.,]*\s*(B|KB|MB|GB|TB|KiB|MiB|GiB)?\s*(\/s|%)?\s*)+$/i.test(s)) return true;
     if (/^\d+$/.test(s)) return true;
     if (/^[\d\s.,:%+\-–—/()]+$/.test(s)) return true;
     if (/^[a-z][a-z0-9]*(-[a-z0-9]+)+$/.test(s) && !/[A-Z]/.test(s)) return true;
@@ -265,6 +277,9 @@ function startDomTranslator(opts) {
     [/^(\d[\d,]*)\s+mods?\s+updates?\s+available\.?$/i, (m) => `${m[1]} 个模组可更新`],
     [/^(\d[\d,]*)\s+(?:new\s+)?updates?\s+available\.?$/i, (m) => `${m[1]} 个更新可用`],
     [/^(\d[\d,]*)\s+mods?\s+installed\.?$/i, (m) => `已安装 ${m[1]} 个模组`],
+    // 2.9.0 健康检查改版新增的两条动态文案（{{count}}/{{modName}} 渲染后是实际值）
+    [/^Install\s+selected\s*\((\d+)\)$/i, (m) => `安装所选（${m[1]}）`],
+    [/^Missing\s+mod\s+may\s+be\s+required\s+for:\s*(.+)$/i, (m) => `可能缺少 ${m[1]} 所需的模组`],
     [/^(\d[\d,]*)\s+mods?\s+enabled\.?$/i, (m) => `已启用 ${m[1]} 个模组`],
     [/^(\d[\d,]*)\s+mods?\s+disabled\.?$/i, (m) => `已停用 ${m[1]} 个模组`],
     [/^(\d[\d,]*)\s+mods?\s+deployed\.?$/i, (m) => `已部署 ${m[1]} 个模组`],
@@ -353,8 +368,16 @@ function startDomTranslator(opts) {
   function canBlockReplace(el) {
     if (!el || el.nodeType !== 1) return false;
     if (el.closest && el.closest(NO_BLOCK_SEL)) return false;
+    // 默认从严：只要块里含交互元素（含链接）就不整块重建，与容器叫什么名字无关。
+    // 通知有更新 / 模组更新 / 错误 / 扩展更新好几种，类名各不相同，靠
+    // [class*="notification"] 这种前缀匹配早晚漏一种 —— 与其猜名字，不如一律从严。
+    // 只有 changelog / 简介这类「内容区」才放宽链接（那里的链接是纯外链，且整块翻才连贯）。
+    let sel = UNSAFE_SEL + ',a[href]';
+    try {
+      if (el.closest && el.closest(CONTENT_TEXT_SEL)) sel = UNSAFE_SEL;
+    } catch (e) { /* ignore */ }
     let bad;
-    try { bad = el.querySelector(UNSAFE_SEL); } catch (e) { return false; }
+    try { bad = el.querySelector(sel); } catch (e) { return false; }
     return !bad;
   }
 
@@ -786,13 +809,20 @@ function startDomTranslator(opts) {
         }
         return false;
       }
+      // 危险块守卫（命中缓存这条路径以前漏了）：applyUnit 会 removeChild 掉整块子节点再
+      // 用译文重建，块里只要含 button / input / [role=button] 这类 React 自己管的交互元素，
+      // 节点就被换掉了 —— React 下次 insertBefore 找不到它记得的节点，点一下就陷入重渲染
+      // 循环（Vortex 2.9.0 更新通知里的下载按钮就是这个情况：按钮已经翻成中文，点它界面
+      // 立刻卡死、CPU 吃满）。所以命中缓存同样要先过这道闸，过不了就退回节点级改文本。
+      if (!canBlockReplace(el)) return 'nodelevel';
       const done = applyUnit(el, hit, map, slots);
       if (done) live.hits++;
       return done ? true : fallback();
     }
 
     const pat = patternHit(src);
-    if (pat) return applyUnit(el, pat, map, slots) ? true : fallback();
+    if (pat && canBlockReplace(el)) return applyUnit(el, pat, map, slots) ? true : fallback();
+    if (pat) return 'nodelevel';
 
     if (!canBlockReplace(el)) return 'nodelevel';    // 危险块交给节点级
     enqueue(src, el);
