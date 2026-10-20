@@ -171,6 +171,23 @@ function startDomTranslator(opts) {
   // 列表页挂机（200+ 模组、已经全中文）也照跑，白烧 CPU。没有变更就直接跳过。
   let docDirty = true;
   let modelDown = false;                // 连续 2 轮 0 成功 → 判定模型挂机，暂停重试
+
+  // ── 抗卡死三件套（2026-10-21 修复 Vortex 更新下载时 renderer 吃满一个核）──
+  // 1) 拉锯熔断：同一文本节点被改写超过 WRITE_PATIENCE 次就判定「写了被还原、还原了再写」
+  const writeCount = new WeakMap();     // el -> Map<原文, 已改写次数>（不能按 textNode 记，会被重建）
+  const WRITE_PATIENCE = 6;
+  const PINGPONG_COOL_MS = 60000;       // 熔断后的冷却时长，到点再给一次机会
+  let pingPong = 0;                     // 被熔断的节点总数（面板可看）
+  // 2) 补扫退避：连续补扫次数越多，间隔越长，杜绝 120ms 一次的自持全树重扫
+  let burst = 0;
+  let lastBurstAt = 0;
+  let afterWriteTimer = null;
+  const BURST_GAPS = [120, 120, 300, 1000, 3000, 8000];
+  const BURST_ALERT = 6;
+  // 3) 扫描时间预算：单次 walk 超预算就收手，剩下的下一轮接着扫，不让长任务卡主线程
+  const WALK_BUDGET_MS = 60;
+  let walkTruncated = 0;
+  let resumeNode = null;                // 被时间预算截断时的断点，下一轮从这里继续
   let downStreak = 0;
 
   // 可见性优先：用户正在看的弹窗/面板插队，不再被后台文本饿死
@@ -745,6 +762,30 @@ function startDomTranslator(opts) {
     // 时若有内联子元素，就退回节点级逐段写 —— 否则这类块会永远停在英文
     const fallback = () => (slots.length > 1 ? 'nodelevel' : false);
     if (hit) {
+      // 拉锯熔断（块级路径）：命中缓存/词库就立刻回填，而 React 重渲染可能把译文还原成英文，
+      // 于是「回填→还原→再回填」自持 —— 每轮还要全树重扫，在下载/进度这类高频重渲染界面
+      // 上能把 renderer 一个核吃满（Vortex 2.9.0 更新下载实测卡死）。同一元素+同一原文
+      // 反复回填超过上限就判定拉锯，打跳过标记彻底退出。
+      let bucket = writeCount.get(el);
+      if (!bucket) { bucket = new Map(); writeCount.set(el, bucket); }
+      const wc = (bucket.get(src) || 0) + 1;
+      bucket.set(src, wc);
+      if (wc > WRITE_PATIENCE) {
+        // 冷却而不是永久放弃：拉锯多半是「那阵子在高频重渲染」，等它停了这块还是该翻的。
+        // 60 秒后摘掉标记、清空计数再给一次机会；还在拉锯就再冻一轮。
+        try {
+          el.setAttribute('data-zh-skip', '1');
+          setTimeout(() => {
+            try { el.removeAttribute('data-zh-skip'); } catch (e) { /* ignore */ }
+            bucket.delete(src);
+          }, PINGPONG_COOL_MS);
+        } catch (e) { /* ignore */ }
+        pingPong += 1;
+        if (pingPong === 1 || pingPong % 20 === 0) {
+          log('warn', 'write ping-pong cooled', { n: pingPong, sec: PINGPONG_COOL_MS / 1000, sample: src.slice(0, 60) });
+        }
+        return false;
+      }
       const done = applyUnit(el, hit, map, slots);
       if (done) live.hits++;
       return done ? true : fallback();
@@ -794,6 +835,24 @@ function startDomTranslator(opts) {
   function processNode(node, raw, t, el) {
     const hit = lookup(t) || (() => { const b = shellInner(t); return b ? lookup(b) : null; })();
     if (hit) {
+      // 拉锯熔断：命中缓存/词库就会立刻改写，而 React 重渲染又可能把译文还原成英文，
+      // 于是「写完→还原→再写」自持循环 —— 每循环一次还要全树重扫，在下载/进度这类
+      // 高频重渲染界面上会把 renderer 一个核吃满、界面卡死。同一节点改写超过上限
+      // 就判定拉锯，给它打跳过标记彻底退出（不再扫描、不再改写）。
+      // 计数键必须是「元素 + 原文」而不是文本节点：React 重渲染（以及设置 textContent）
+      // 会重建 text node，按节点记数的话每轮都是新节点、计数永远归 1，熔断永远不触发。
+      let bucket = writeCount.get(el);
+      if (!bucket) { bucket = new Map(); writeCount.set(el, bucket); }
+      const wc = (bucket.get(t) || 0) + 1;
+      bucket.set(t, wc);
+      if (wc > WRITE_PATIENCE) {
+        try { el.setAttribute('data-zh-skip', '1'); } catch (e) { /* ignore */ }
+        pingPong += 1;
+        if (pingPong === 1 || pingPong % 20 === 0) {
+          log('warn', 'write ping-pong stopped', { n: pingPong, sample: t.slice(0, 60) });
+        }
+        return false;
+      }
       // 第二参数用回调：直接传字符串的话，译文里的 $& / $` / $1 会被当成替换模式展开，
       // 该段文字会被吞掉半截，而且结果还会进缓存，重扫也修不回来。
       const next = raw.replace(t, () => hit);
@@ -856,12 +915,29 @@ function startDomTranslator(opts) {
     if (cfg && cfg.domTranslate === false) return 0;
     let walker;
     try { walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null); } catch (e) { return 0; }
-    let n, replaced = 0, seen = 0;
+    // 从上次被截断的位置接着扫：否则每轮都从头开始、又在同一处超时，
+    // 页面靠后的文本永远扫不到（实测 3000 节点的页面里，末尾的条目一次都没被翻）。
+    if (resumeNode && resumeNode.isConnected && root.contains(resumeNode)) {
+      try { walker.currentNode = resumeNode; } catch (e) { /* ignore */ }
+    }
+    let n, replaced = 0, seen = 0, truncated = false;
     const visited = new Set();
+    const clock = () => ((typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now());
+    const t0 = clock();
     while ((n = walker.nextNode())) {
       if (handleTextNode(n, visited)) replaced++;
       if (++seen >= 8000) break;
+      // 时间预算：大页面整树扫一遍可能上百毫秒，每 256 个节点查一次表，超预算就收手；
+      // 记下断点并置脏，下一轮从这里接着扫，避免一次长任务把主线程（界面）卡住。
+      if ((seen & 255) === 0 && clock() - t0 > WALK_BUDGET_MS) {
+        walkTruncated += 1;
+        docDirty = true;
+        truncated = true;
+        try { resumeNode = walker.currentNode; } catch (e) { resumeNode = null; }
+        break;
+      }
     }
+    if (!truncated) resumeNode = null;
     return replaced;
   }
 
@@ -1146,9 +1222,24 @@ function startDomTranslator(opts) {
     writing = false;
     if (!pendingAfterWrite) return;
     pendingAfterWrite = false;
-    setTimeout(() => {
-      try { if (!writing && !flushing) walk(document.body); } catch (e) { /* ignore */ }
-    }, 120);
+    // 补扫退避：写完立刻补扫本是为了救「React 同步重渲染丢掉的 mutation」，但只要页面
+    // 上存在一个「写完就被还原」的拉锯点，这条路径就会自持 —— 每 120ms 一次全树重扫，
+    // 实测能把 renderer 一个核吃满（Vortex 2.9.0 更新下载时就是这样，界面完全卡死）。
+    // 连续补扫越多间隔越长（最多退到 8 秒一次），安静 6 秒后计数清零恢复正常响应。
+    const now = Date.now();
+    if (now - lastBurstAt > 6000) burst = 0;
+    lastBurstAt = now;
+    burst += 1;
+    if (burst === BURST_ALERT) {
+      log('warn', 'rescan burst high', { burst, gap: BURST_GAPS[BURST_GAPS.length - 1] });
+    }
+    const gap = BURST_GAPS[Math.min(burst - 1, BURST_GAPS.length - 1)];
+    if (afterWriteTimer) clearTimeout(afterWriteTimer);
+    afterWriteTimer = setTimeout(() => {
+      afterWriteTimer = null;
+      if (writing || flushing) return;
+      try { walk(document.body); } catch (e) { /* ignore */ }
+    }, gap);
   }
 
   const mo = new MutationObserver((muts) => {
@@ -1190,6 +1281,9 @@ function startDomTranslator(opts) {
     if (writing || flushing) return;
     if (cfg && cfg.enabled === false) return;
     if (queue.size > 0) scheduleFlush(200);
+    live.pingPong = pingPong;         // 面板可看：被拉锯熔断的节点数 / 当前补扫档位 / 扫描被截断次数
+    live.burst = burst;
+    live.walkTruncated = walkTruncated;
     if (!docDirty) return;            // 页面没变过：不重扫（队列该推的上面已经推了）
     docDirty = false;
     try {
