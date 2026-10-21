@@ -91,8 +91,14 @@ function startDomTranslator(opts) {
   const UI_INTERACTIVE_SEL = '[class*="notification"],[class*="toast"],[class*="modal"],[class*="dialog"]';
   // 但 changelog / 简介这类内容区常常就显示在弹窗里，里面的链接是纯外链，而且整块翻
   // 译文才连贯 —— 命中内容区就维持原样，不加严，免得长文翻译质量倒退。
-  const CONTENT_TEXT_SEL = '[class*="changelog"],[class*="description"],[class*="markdown"],[class*="readme"],' +
-    '[class*="note"],[class*="summary"],[class*="preview"]';
+  // 只保留「确定是纯内容区」的四个。原来还挂着 note / summary / preview 三个，
+  // 但它们是子串匹配，太宽：任何叫 xx-preview、xx-summary 的容器都会被当成内容区，
+  // 于是里面的 <a href> 不再算交互元素 → 整块重建把链接节点换掉。
+  // 后果取决于那个链接是不是 React 绑了 onClick 的（0.15.9 卡死就是按钮被换掉这一套）。
+  // 取证：Vortex 2.9 前端包里搜不到任何 note-panel / summary-bar / preview-strip 这类
+  // 容器类名（命中的全是 AWS/markdown 的无关字符串），即这三个在现实里基本不命中，
+  // 去掉它们不会让任何真实页面少翻一个字 —— 纯粹是拆掉一个没用的定时炸弹。
+  const CONTENT_TEXT_SEL = '[class*="changelog"],[class*="description"],[class*="markdown"],[class*="readme"]';
 
   const ATTRS = ['title', 'placeholder', 'aria-label'];
   const MAX_LEN = 3000;   // 单个翻译单元上限；超过则切分成多片（见 splitUnit）
@@ -292,7 +298,9 @@ function startDomTranslator(opts) {
     [/^Extracting\s+(.+)$/i, (m) => `正在解压 ${m[1]}`],
     [/^Update\s+available\s+for\s+(.+)$/i, (m) => `${m[1]} 有可用更新`],
     [/^(.+?)\s+update\s+available\.?$/i, (m) => `${m[1]} 有可用更新`],
-    [/^(\d[\d,]*)\s+of\s+(\d[\d,]*)$/, (m) => `${m[1]} / ${m[2]}`],
+    // 必须输出中文：写成 "2 / 10" 这种没有汉字的译文，applyInPlace 会判「没翻出来」回滚，
+    // 而回滚本身又产生一条 mutation → 观察者再扫 → 再写 → 再回滚，界面当场冻死。
+    [/^(\d[\d,]*)\s+of\s+(\d[\d,]*)$/, (m) => `第 ${m[1]} / 共 ${m[2]}`],
     [/^(\d[\d,]*)\s+selected\.?$/i, (m) => `已选中 ${m[1]} 项`],
     [/^(\d[\d,]*)\s+items?\s+selected\.?$/i, (m) => `已选中 ${m[1]} 项`],
   ];
@@ -301,7 +309,14 @@ function startDomTranslator(opts) {
     if (!t) return null;
     for (const [re, fn] of PATTERNS) {
       const m = t.match(re);
-      if (m) { try { return fn(m); } catch (e) { /* ignore */ } }
+      if (!m) continue;
+      let out = null;
+      try { out = fn(m); } catch (e) { /* ignore */ }
+      // 输出不含汉字的规则一律作废：写上去也会被 applyInPlace 判「没翻出来」回滚，
+      // 而回滚本身又产生一条 mutation → 观察者再扫 → 再写 → 再回滚，
+      // 整套循环跑在微任务里，定时器永远排不上队，界面直接冻死（"1 of 5" 就是这么卡的）。
+      // 这里是总闸门：以后再加 pattern，输出没中文也不会把页面搞死。
+      if (out && CJK.test(out)) return out;
     }
     return null;
   }
@@ -520,6 +535,10 @@ function startDomTranslator(opts) {
   function applyInPlace(el, zh, slots) {
     const toks = parseTokens(zh);
     if (!toks) return false;
+    // 译文里一个汉字都没有就别动 DOM。写了也会在末尾被 CJK 校验判回滚，而回滚本身
+    // 产生一条 mutation，观察者会立刻再扫一次 —— 「写→回滚→再写」全在微任务里转，
+    // 定时器排不上队，界面就是卡死。预先判掉，一次 DOM 都不碰。
+    if (!CJK.test(String(zh).replace(/<\/?i\d+>/g, '').replace(/\{\{\d+\}\}/g, ''))) return false;
     // id → 真实节点（serialize 的 slots 里存的是原节点引用）
     const idOfNode = new Map();
     for (const sl of slots) {
@@ -534,7 +553,14 @@ function startDomTranslator(opts) {
     };
     collectAll(el);
     const backup = allText.map((nd) => [nd, nd.nodeValue]);
-    const rollback = () => { for (const [nd, v] of backup) { try { nd.nodeValue = v; } catch (e) { /* ignore */ } } };
+    // 回滚也必须挡在 writing 里，并且值没变就不赋值：
+    // ① 赋值即产生 MutationRecord，不挡住就会被观察者当成「页面变了」再扫一轮；
+    // ② 写回同一个值同样算一次 mutation，白白多一轮。
+    const rollback = () => {
+      writing = true;
+      for (const [nd, v] of backup) { try { if (nd.nodeValue !== v) nd.nodeValue = v; } catch (e) { /* ignore */ } }
+      endWrite();
+    };
 
     function writeInto(node, toksList) {
       const W = [];
