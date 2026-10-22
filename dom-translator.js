@@ -1300,6 +1300,11 @@ function startDomTranslator(opts) {
 
   const mo = new MutationObserver((muts) => {
     if (writing) { pendingAfterWrite = true; docDirty = true; return; }
+    // 实时翻译总开关的直调路径闸门：walk() 第 971 行有这道判断，但观察器这条不过，
+    // 于是「启动时开着、后来在设置页关掉」之后，已存在文本节点的 characterData 改动、
+    // 以及给新元素设 textContent（React 最常见的更新模式）产生的新文本节点，
+    // 仍会被词库翻译 —— 开关名不副实。这里补上同一道闸门，顺带拦 cfg.enabled。
+    if (cfg && (cfg.domTranslate === false || cfg.enabled === false)) return;
     docDirty = true;
     let dirty = 0;
     for (const m of muts) {

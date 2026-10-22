@@ -254,6 +254,9 @@ function applyTranslation(item, zh) {
   if (!zh) return false;
   const clean = String(zh).replace(/^["'\s]+|["'\s]+$/g, '');
   if (!clean) return false;
+  // 译文=原文 = 无需翻译（专名/已中文）。不写 Vortex 持久化状态——originalName 和
+  // customFileName 都写成原值没有意义，只在缓存里标记「这条处理过了」。
+  if (clean === item.raw) { cache[item.raw] = clean; return true; }
   dispatch('originalName', item.gameId, item.modId, item.raw);
   dispatch('customFileName', item.gameId, item.modId, clean);
   if (cfg.writeToNameField) dispatch('name', item.gameId, item.modId, clean);
@@ -266,6 +269,8 @@ function applyDownloadTranslation(item, zh) {
   if (!zh) return false;
   const clean = String(zh).replace(/^["'\s]+|["'\s]+$/g, '');
   if (!clean) return false;
+  // 译文=原文 = 无需翻译：不写 Vortex 状态，只标记缓存（同 applyTranslation）
+  if (clean === item.raw) { cache[item.raw] = clean; return true; }
   try {
     contextRef.api.store.dispatch(va.actions.setDownloadModInfo(item.dlId, 'name', clean));
     cache[item.raw] = clean;
@@ -629,6 +634,13 @@ function makeSettingsComponent() {
         if (!model) throw new Error('连上了但拿不到模型列表，请手动填「模型名」');
         const probe = Object.assign({}, c, { provider: Object.assign({}, c.provider, { model }), batchSize: 5 });
         const out = await core.translateBatch(probe, {}, ['Dynamic Grass - Next Gen']);
+        // translateBatch 失败时不抛异常、只返回含 null 的数组。以前这里照样拼出
+        // 「✓ 连接正常（模型: X），示例: 空」——用户按提示去查模型，而真正错的是接口地址。
+        // 没拿到有效译文就必须当失败抛，且不做后面的 failCache 复活。
+        const got = out && out[0];
+        if (!got || got === 'Dynamic Grass - Next Gen') {
+          throw new Error('接口或模型不可用：没收到有效译文（请检查接口地址、模型名与密钥）');
+        }
         // 模型可用 → 只给「暂态失败」重新来过的机会。
         // -1 是已判定不可译的专名（模型两次原样返回），> RETRY_MAX 是重试用尽，
         // 这两类清掉只会让它们再各烧一轮调用、然后照样失败。
@@ -844,11 +856,13 @@ function makeSettingsComponent() {
           h('button', { style: btnStyle, onClick: () => {
             try {
               const before = {
-                dom: Object.keys(domCache).filter((k) => typeof domCache[k] === 'string').length,
+                dom: Object.keys(domCache).filter((k) => typeof domCache[k] === 'string' && k !== '_ver').length,
                 mod: Object.keys(cache).length,
                 fail: Object.keys(failCache).filter((k) => k !== '_ver').length,
               };
-              Object.keys(domCache).forEach((k) => delete domCache[k]);
+              // 保留 _ver：手动清空后同版本内还能从 seed 恢复，删了就会被当成
+              // 「跨版本」连 seed 一起跳过（那是升级才有的待遇）
+              Object.keys(domCache).forEach((k) => { if (k !== '_ver') delete domCache[k]; });
               writeJson(DOM_CACHE_PATH, domCache);
               // 不能写包内的 domCache.seed.json：扩展目录是只读静态资源区，
               // 写失败时用户会看到「清空了，重启又回来」。改用 userData 里的忽略标记。
@@ -1062,37 +1076,49 @@ function main(context) {
       }
       gameKeep = readJson(GAME_KEEP_PATH, []);
       if (!Array.isArray(gameKeep)) gameKeep = [];
-      cache = asDict(readJson(CACHE_PATH, {}));
-      domCache = asDict(readJson(DOM_CACHE_PATH, {}));
-      // 发版前按规矩清空了 domCache，但已经翻好的译文没必要跟着丢。
-      // 打包时会把清空前的内容留一份 domCache.seed.json，这里发现缓存为空就自动恢复，
-      // 这样升级后更新日志、界面文案立刻还是中文，不必等模型重翻一遍（重翻还经常失败）。
-      const seedSkip = readJson(SEED_SKIP_PATH, null);
-      const skipSeed = !!(seedSkip && (!seedSkip.ver || seedSkip.ver === extVerOf()));
-      if (!skipSeed && Object.keys(domCache).filter((k) => typeof domCache[k] === 'string').length === 0) {
-        const seed = readJson(SEED_PATH, {});
-        const n = Object.keys(seed).filter((k) => typeof seed[k] === 'string').length;
-        if (n > 0) {
-          domCache = asDict(seed);
-          writeJson(DOM_CACHE_PATH, domCache);
-          log('info', 'dom cache restored from seed', { n });
-        }
-      }
-      failCache = asDict(readJson(FAIL_PATH, {}));
       // 明确保持英文的名字（gamenames-keep.json）：
       // **不要**写进 domCache 来表达「保持英文」。DOM 层启动自清洗的判据就是
       // 「值等于键 = 假翻译，删掉」，写进去会被同一进程立刻清光，机制等于没有。
       // 改为单独一张 Set 交给 DOM 层，在送翻入口直接短路。
       if (gameKeep.length) log('info', 'keep-en names loaded', { n: gameKeep.length });
-      // 版本标记：版本升级 → 清空失败名单（新版本给所有失败文本重新来过的机会）
+      cache = asDict(readJson(CACHE_PATH, {}));
+      domCache = asDict(readJson(DOM_CACHE_PATH, {}));
+      failCache = asDict(readJson(FAIL_PATH, {}));
+      // 版本标记：升级 → 译文缓存与失败名单整体作废。
+      // 旧缓存是旧版本翻译管道的产物，新版本修过的 bug（全角引号/裸粘连/占位符/
+      // 占比门槛/回声判定）在旧缓存里照样是坏的，留着等于留着 bug。
+      // 用户填的配置在 config.json，不在此列，升级不受影响。
+      let cacheResetFor = '';
       try {
         const extVer = (JSON.parse(fs.readFileSync(path.join(EXT_DIR, 'info.json'), 'utf8')).version) || '';
+        if (extVer && domCache._ver !== extVer) {
+          domCache = asDict({ _ver: extVer });
+          writeJson(DOM_CACHE_PATH, domCache);
+          cacheResetFor = extVer;
+          log('info', 'dom cache reset for new version', { version: extVer });
+        }
         if (extVer && failCache._ver !== extVer) {
-          failCache = { _ver: extVer };
+          failCache = asDict({ _ver: extVer });
           writeJson(FAIL_PATH, failCache);
           log('info', 'fail cache reset for new version', { version: extVer });
         }
       } catch (e) { /* info.json 读不到就跳过 */ }
+      // 发版前按规矩清空了 domCache，但已经翻好的译文没必要跟着丢。
+      // 打包时会把清空前的内容留一份 domCache.seed.json，同版本内缓存为空就自动恢复，
+      // 这样误清缓存后界面文案立刻还是中文，不必等模型重翻一遍（重翻还经常失败）。
+      // **跨版本不恢复**：刚因升级被清空正是为了扔掉旧译文，塞回来等于没清。
+      const seedSkip = readJson(SEED_SKIP_PATH, null);
+      const skipSeed = !!(seedSkip && (!seedSkip.ver || seedSkip.ver === extVerOf()));
+      if (!cacheResetFor && !skipSeed && Object.keys(domCache).filter((k) => typeof domCache[k] === 'string' && k !== '_ver').length === 0) {
+        const seed = readJson(SEED_PATH, {});
+        const n = Object.keys(seed).filter((k) => typeof seed[k] === 'string' && k !== '_ver').length;
+        if (n > 0) {
+          domCache = asDict(seed);
+          if (domCache._ver === undefined) domCache._ver = extVerOf();
+          writeJson(DOM_CACHE_PATH, domCache);
+          log('info', 'dom cache restored from seed', { n });
+        }
+      }
   let extVer = '';
   try { extVer = (JSON.parse(fs.readFileSync(path.join(EXT_DIR, 'info.json'), 'utf8')).version) || ''; } catch (e) { /* ignore */ }
   log('info', 'loaded v' + (extVer || '?'), { dir: EXT_DIR, baseUrl: cfg.provider && cfg.provider.baseUrl });

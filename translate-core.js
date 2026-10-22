@@ -270,6 +270,33 @@ function extractJsonArray(s) {
       if (Array.isArray(v)) return v;
     } catch (e) { /* give up */ }
   }
+  // 全角引号兜底：模型有时用 “” 包裹字符串，实测日志里有 `[""ModSkillSlotPages重制版 1.8""]`
+  // 这种形态——上面三条路径都因引号不合法而失败，而第 266 行那条兜底又要求 t 里没有 '['，
+  // 刚好把「带方括号 + 全角引号」挡在门外，整批直接作废。放在最后试：原文能用半角引号
+  // 解析的（包括译文内部合法含全角引号的）在上面就已经返回了，不会走到这里被改写。
+  // 注意引号还会写成双份（““X””），直接替换成半角会得到 ""X"" 照样不合法，先压成单份。
+  if (/[“”‘’]/.test(t)) {
+    const norm = t.replace(/[“”‘’]{2,}/g, (run) => run[0])
+      .replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
+    try {
+      const v = JSON.parse(norm);
+      if (Array.isArray(v)) return v;
+    } catch (e) { /* give up */ }
+    const m2 = norm.match(/\[[\s\S]*\]/);
+    if (m2) {
+      try {
+        const v = JSON.parse(m2[0]);
+        if (Array.isArray(v)) return v;
+      } catch (e) { /* give up */ }
+    }
+    // 不带外层方括号 + 双份引号（""译文A"",""译文B""）也一并救回来
+    if (norm.indexOf('[') === -1 && /["']/.test(norm)) {
+      try {
+        const v = JSON.parse('[' + norm + ']');
+        if (Array.isArray(v)) return v;
+      } catch (e) { /* give up */ }
+    }
+  }
   return null;
 }
 
@@ -504,16 +531,50 @@ async function llmTranslate(cfg, texts, modeOverride) {
       if (box && box.map.size) {
         for (const k of box.map.keys()) if (raw.indexOf(k) === -1) return markReject(texts[i]);
       }
-      return restorePaths(finishOne(raw, texts[i]), box);
+      const done = restorePaths(finishOne(raw, texts[i]), box);
+      // 模型会重新编号甚至臆造占位符（实测：URL 掩码是 {{P1}}，模型回成 {{P2}} 还多造
+      // 一个 {{P1}}；另有 "Released under" 被译成 "以{{license}}许可发布"）。上面的 box
+      // 校验只看「原占位符在不在」，防不住这种。还原后残留的字面量会直接显示给用户，
+      // 所以译文里出现源文没有的 {{...}} 一律按格式不合规打回，宁可留英文。
+      const srcHoles = new Set((String(texts[i]).match(/\{\{[^{}]+\}\}/g) || []));
+      const outHoles = String(done).match(/\{\{[^{}]+\}\}/g) || [];
+      if (outHoles.some((h) => !srcHoles.has(h))) return markReject(texts[i]);
+      return done;
     });
     while (mapped.length < texts.length) mapped.push(null);
     return withRejects(mapped);
   }
 
+  // 多条裸粘连：小批次时模型会把多条译文用「、」「，」连起来返回，不带数组语法
+  // （实测 "“384 KB/秒”、“640 KB/秒”以及“896 KB/秒”。" 与 "药丸，品牌，药丸类型"）。
+  // 整批判负 → 逐条重试，重试还可能再回声。按标点拆，仅当拆出条数正好等于输入条数、
+  // 且至少一条确实变了才采用——条数对不上说明译文里自带标点，宁可不拆走逐条重试。
+  // 第一轮不带「以及」，对不上再试带「以及」的，避免误拆含「和/以及」的正常译文。
+  if (texts.length > 1) {
+    let c = String(content).trim().replace(/^```(?:json)?/i, '').replace(/```\s*$/, '').trim();
+    c = c.replace(/^["'“”‘’\s]+/, '').replace(/["'“”‘’\s。．.]+$/, '');
+    const trySplit = (sepRe) => {
+      const parts = c.split(sepRe)
+        .map((s) => s.trim().replace(/^["'“”‘’\s]+|["'“”‘’\s]+$/g, '').trim())
+        .filter((s) => s.length > 0);
+      if (parts.length !== texts.length) return null;
+      if (!parts.some((p, i) => p !== String(texts[i]))) return null;
+      return parts;
+    };
+    const parts = trySplit(/[、，,；;]/) || trySplit(/[、，,；;]|以及/);
+    if (parts) {
+      const mapped2 = parts.map((p, i) => {
+        const box = boxes[i];
+        if (box && box.map.size) {
+          for (const k of box.map.keys()) if (p.indexOf(k) === -1) return markReject(texts[i]);
+        }
+        try { return restorePaths(finishOne(p, texts[i]), box); } catch (e) { return markReject(texts[i]); }
+      });
+      return withRejects(mapped2);
+    }
+  }
+
   // 兜底：单条长文时小模型经常直接输出纯中文译文、不带 JSON 数组括号。
-  // 判据只能是「确实翻成了中文」。之前用「英文字母占比 < 40%」，
-  // 含大量专名的句子（UE4SS / LogicMods / Content/Paks/xxx.txt）英文占比轻松过半，
-  // 会被误判成「拒翻吐回原文」整条丢掉 —— 实测稳定复现，已改成看中文占比。
   if (texts.length === 1) {
     let raw = String(content).trim();
     raw = raw.replace(/^```(?:json)?/i, '').replace(/```\s*$/, '').trim();
@@ -522,9 +583,7 @@ async function llmTranslate(cfg, texts, modeOverride) {
     // 模型有时把整条译文用方括号括起来、且不带引号（实测 html 模式「inZOI Vortex Extension」
     // 稳定输出 [inZOI Vortex 扩展]）：这本身就是「只有一个元素的数组」，直接用括号里的内容
     const mOnly = raw.match(/^\[([^\[\]]{1,200})\]$/);
-    if (mOnly && /[\u4e00-\u9fff]/.test(mOnly[1]) && mOnly[1].trim() !== src.trim()) {
-      raw = mOnly[1].trim();
-    }
+    if (mOnly && mOnly[1].trim() !== src.trim()) raw = mOnly[1].trim();
     // 模型偶尔输出「[原文] 译文」这种把原文包进方括号的格式（实测 inZOI 那条一直失败：
     // 「[inZOI Vortex Extension] 即为《inZOI Vortex》的扩展内容包。」），把前缀剥掉照样能用
     const mEcho = raw.match(/^\[([^\[\]]{1,160})\]\s*([\s\S]+)$/);
@@ -532,12 +591,41 @@ async function llmTranslate(cfg, texts, modeOverride) {
       raw = mEcho[2].trim();
     }
     const cjkN = (raw.match(/[\u4e00-\u9fff]/g) || []).length;
-    if (raw !== src && cjkN >= 2 && cjkN / Math.max(1, raw.length) > 0.12) {
+    // 中文占比门槛从 12% 降到 5%，且 html 模式不看占比、但要求至少一个汉字：
+    // 实测「inZOI Vortex扩展」（8.3%）、「ModSkillSlotPages重制版1.8」（8.6%）都是有效
+    // 译文被当成非中文丢弃；同一字符串模型多吐几个中文就能过——通过与否全看模型心情，
+    // 是概率性失败。html 模式的伪标签配对、占位符齐全由下面的 finishOne 和 box 校验
+    // 兜底，那里不过一样打回，这里再卡占比纯属误杀；但「一个汉字都没有」必须卡——
+    // 英译中的译文不可能不含汉字，没有的一律是回声（含 [pillType] 这种括号粘连回声）。
+    const structurallyOk = mode === 'html'
+      ? (raw !== src && cjkN >= 1)
+      : (cjkN >= 2 && cjkN / Math.max(1, raw.length) > 0.05);
+    if (raw !== src && structurallyOk) {
       const box0 = boxes[0];
       if (box0 && box0.map.size) {
         for (const k of box0.map.keys()) if (raw.indexOf(k) === -1) return withRejects([markReject(src)]);
       }
       return withRejects([restorePaths(finishOne(raw, src), box0)]);
+    }
+    // 回声分两种：真失败（该翻没翻）和「无需翻译」（源文已是中文 / 专名 / 标识符）。
+    // 以前一律落到下面的 throw，上层记 failCache，两轮后 -1 永久跳过——每次出现都白烧
+    // 一次调用，统计上的失败也是假的。无需翻译的返回原串算成功：界面无变化，也不进
+    // failCache。真回声继续 throw，交给上层重试。
+    // 判据：先把单层方括号剥掉再比（[pillType] 这种括号粘连回声），命中以下任一即无需翻译——
+    // 源文已是中文；太短；没有小写开头单词的短串（NightSky 2.0.4、<i1>Steam</i1>、
+    // SSEEdit、B.O.B. 这类专名，句子一定有 the/is/your 这类小写词）；纯符号。
+    const bare = raw.replace(/^\[([^\[\]]{1,200})\]$/, '$1').trim();
+    const srcBare = src.trim().replace(/^\[([^\[\]]{1,200})\]$/, '$1').trim();
+    if (bare === srcBare) {
+      const t = src.trim();
+      const words = t.split(/\s+/).filter(Boolean);
+      const hasLowerWord = words.some((w) => /^[a-z]/.test(w));
+      const noop = /[\u4e00-\u9fff]/.test(src)
+        || t.length < 4
+        || (!hasLowerWord && words.length <= 3)
+        || /^[A-Za-z0-9_.\-\/:{}+%]+$/.test(t)
+        || /^[\W_]+$/.test(t);
+      if (noop) return withRejects([src]);
     }
   }
 
@@ -633,7 +721,11 @@ async function retryEchoed(cfg, chunk, out, results, idxs, mode) {
     if (out[k] === chunk[k]) idx.push(k);
   }
   if (idx.length === 0) return 0;
-  if (idx.length >= chunk.length) return 0;        // 整批照抄 = 模型状态异常，重发也没用
+  // 多条整批照抄 = 模型状态异常，重发也没用（下一条可能就是好的）。
+  // 但单条批次例外：实测同一字符串这次译下次抄（模型侧抖动，temperature 0.2 也在抖），
+  // 单条回声重发一次约一半能救回来——而单条组恰恰是预算切分后最常见的形态，
+  // 不救的话这些条目永远停在上一次的回声上。
+  if (idx.length >= chunk.length && chunk.length > 1) return 0;
   if (idx.length > 20) return 0;                    // 太多说明批太大，交给下一次更小的批
   let fixed = 0;
   for (const k of idx) {
