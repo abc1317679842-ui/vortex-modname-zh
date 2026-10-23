@@ -35,7 +35,16 @@ function startDomTranslator(opts) {
   const keepSet = keepEn instanceof Set ? keepEn : new Set();
   // 每条最后一次失败的时间：只有 failed 计数没有时间，idleRevive 每 10 秒把 failed<4 的全放回去，
   // 结果是「必失败的条目」10 秒重试一次、无限循环（实测 inZOI 那条烧了几十次调用）。用它做冷却。
+  // 启动时用 index 传来的 lastFailInit（failCache.json 的最后写入时间）给已有失败条目播种：
+  // lastFail 是内存 Map，重启后归零 → 重启后立即对同一批失败条目全速重试，配置错误时
+  // 每次重启都白打一轮请求 + 刷一屏错误日志。文件 mtime 是「最晚一次失败」的保守近似。
   const lastFail = new Map();
+  if (opts.lastFailInit) {
+    for (const k of Object.keys(failed)) {
+      if (k === '_ver') continue;
+      lastFail.set(k, opts.lastFailInit);
+    }
+  }
   let collectTimer = null;
   if (typeof document === 'undefined' || !document.body) return;
 
@@ -758,7 +767,7 @@ function startDomTranslator(opts) {
 
   /** 段落单元处理（同步命中即换；否则入队）
    *  返回 true=已替换 / false=已入队或无需处理 / 'nodelevel'=这块不适合整块翻，请按文本节点处理 */
-  const seenLen = new WeakMap();   // el -> 上次处理时的文字长度，用来跳过没变化的块
+  const seenText = new WeakMap();   // el -> 上次处理时的 textContent 全文，用来跳过没变化的块
   const reviveAt = new Map();      // src -> 上次「可见复活」时间，防止反复重试烧 token
   const reviveCount = new Map();   // src -> 被可见复活过几次（封顶 MAX_VISIBLE_REVIVE）
   let reviveBudget = 8;            // 当前 20 秒窗口内还能复活几条
@@ -777,9 +786,13 @@ function startDomTranslator(opts) {
     // 子元素特别多的容器（整片区域）才退回节点级，避免一句话把十几个控件粘在一起
     if (!isContentBox(el) && el.children.length > 12) return 'nodelevel';
 
-    const len = (el.textContent || '').length;
-    if (el.getAttribute('data-zh-key') === '1' && seenLen.get(el) === len) return false;
-    seenLen.set(el, len);
+    // 已处理过且内容一字不差 → 跳过。以前只比长度：React 虚拟列表回收复用节点时，
+    // 新旧文本字符数恰好相同就会被当成「同一段已处理的文本」永久跳过
+    // （data-zh-key 是常量 '1'，不携带内容信息，serialize 又在短路之后才调用，
+ // 连「内容是否真的相同」都不会被比较）。改为存全文比对，同长不同文照样翻。
+    const txt = el.textContent || '';
+    if (el.getAttribute('data-zh-key') === '1' && txt && seenText.get(el) === txt) return false;
+    seenText.set(el, txt);
 
     const { src, map, slots } = serialize(el);
     if (!src) return false;
@@ -931,7 +944,10 @@ function startDomTranslator(opts) {
     const m = t.match(/^(created by|uploaded by|by)\s+([\s\S]+)$/i);
     if (!m) return false;   // 纯作者名不翻
     const prefixZh = /^created by$/i.test(m[1]) ? '创建者：' : (/^uploaded by$/i.test(m[1]) ? '上传者：' : '作者：');
-    const next = raw.replace(t, prefixZh + m[2]);
+    // 必须用 replacer 函数：作者名是用户可控内容（Nexus 用户名），字符串 replace 的
+    // replacement 里 $& / $` / $' / $$ 会被展开成匹配串，作者名含 $& 就输出
+    // 「创建者：Created by Foo$&Bar」这种重复粘连文本并写进 DOM + 缓存。
+    const next = raw.replace(t, () => prefixZh + m[2]);
     if (next === raw) return false;
     writing = true; node.nodeValue = next; endWrite(); scheduleSave();
     return true;
@@ -982,7 +998,18 @@ function startDomTranslator(opts) {
     const t0 = clock();
     while ((n = walker.nextNode())) {
       if (handleTextNode(n, visited)) replaced++;
-      if (++seen >= 8000) break;
+      if (++seen >= 8000) {
+        // 8000 节点硬上限：和时间预算出口同一套收尾——置断点、置脏、记统计。
+        // 以前这里是裸 break：不置 truncated/docDirty，循环末尾的
+        // `if (!truncated) resumeNode = null` 还会把已有断点清掉 → 补扫被
+        // docDirty 门控挡在门外，第 8000 条之后的文本一直留英文，
+        // 直到用户切页/滚动等外部 DOM 变化才可能被处理。
+        walkTruncated += 1;
+        docDirty = true;
+        truncated = true;
+        try { resumeNode = walker.currentNode; } catch (e) { resumeNode = null; }
+        break;
+      }
       // 时间预算：大页面整树扫一遍可能上百毫秒，每 256 个节点查一次表，超预算就收手；
       // 记下断点并置脏，下一轮从这里接着扫，避免一次长任务把主线程（界面）卡住。
       if ((seen & 255) === 0 && clock() - t0 > WALK_BUDGET_MS) {
@@ -1037,7 +1064,7 @@ function startDomTranslator(opts) {
           // 明确失败：清掉入队标记，下一轮重新判定（等 idleRevive 清掉失败计数后会再试）
           for (const el of Array.from(els)) {
             try { el.removeAttribute('data-zh-key'); } catch (e) { /* ignore */ }
-            seenLen.delete(el);
+            seenText.delete(el);
           }
           pendingBySrc.delete(src);
         }
@@ -1057,9 +1084,9 @@ function startDomTranslator(opts) {
         } else {
           // 回填失败（结构对不齐 / 不在 CONTENT_SEL 不允许重建）：
           // 必须撤掉「已处理」标记，否则 processBlock 开头那句
-          // `data-zh-key==='1' && seenLen===len` 会永久短路，译文明明在缓存里也贴不上去。
+          // `data-zh-key==='1' && seenText===当前文本` 会永久短路，译文明明在缓存里也贴不上去。
           try { el.removeAttribute('data-zh-key'); } catch (e) { /* ignore */ }
-          try { seenLen.delete(el); } catch (e) { /* ignore */ }
+          try { seenText.delete(el); } catch (e) { /* ignore */ }
         }
         els.delete(el);
       }
@@ -1087,12 +1114,12 @@ function startDomTranslator(opts) {
     if (cfg && cfg.enabled === false) return;
     if (cfg && cfg.domTranslate === false) {
       queue.clear(); queueMeta.clear(); live.queued = 0;
-      // 光清队列不够：这些块身上还留着 data-zh-key，seenLen 也记着长度，
+      // 光清队列不够：这些块身上还留着 data-zh-key，seenText 也记着处理时的文本，
       // 重新打开实时翻译后会被双重短路，永久不再入队，只能重启 Vortex。
       for (const els of pendingBySrc.values()) {
         for (const el of els) {
           try { el.removeAttribute('data-zh-key'); } catch (e) { /* ignore */ }
-          try { seenLen.delete(el); } catch (e) { /* ignore */ }
+          try { seenText.delete(el); } catch (e) { /* ignore */ }
         }
       }
       pendingBySrc.clear();
@@ -1244,7 +1271,7 @@ function startDomTranslator(opts) {
         if (els) {
           for (const el of Array.from(els)) {
             try { el.removeAttribute('data-zh-key'); } catch (err) { /* ignore */ }
-            seenLen.delete(el);
+            seenText.delete(el);
           }
           if (failed[t] > MAX_TRY) pendingBySrc.delete(t);
         }

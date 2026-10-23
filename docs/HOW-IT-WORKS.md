@@ -19,7 +19,7 @@ Vortex 的界面文字来自三个完全不同的地方，一种手段治不了�
 
 | 层 | 负责 | 代价 |
 |---|---|---|
-| 界面语言包 | 走 `t()` 的 6046 条 | 0 token，重启生效 |
+| 界面语言包 | 走 `t()` 的 6166 条（字符串叶子，= 语言包 manifest 的 `entries`） | 0 token，重启生效 |
 | DOM 实时翻译 | 硬编码文案、扩展标题、游戏卡片 | 词库命中 0 token，否则走模型 |
 | 批量翻译 | 模组名、合集名、更新日志、简介 | 走模型，结果落缓存 |
 
@@ -109,14 +109,25 @@ LM Studio 的 `/api/v0/models` 里 `loaded_context_length` 才是真的（开发
 写死 `max_tokens: 4096` 会撞上实际只有 4096 的窗口，服务端返回
 `Context size has been exceeded`，整批作废 —— 这是早期「整页英文」的真正原因。
 
-现在的算法：
+现在的算法（权重为 2026-10 在 LM Studio + hy-mt2-7b 上的实测值，全部刻意高于实测）：
 
 ```
-estIn = 输入字符数 / 1.6 + 500
-room  = ctx - estIn - 128
-if (room < 400) → 抛 CTX_OVER，上层劈半重发
-outTokens = clamp(min(期望值, room, 4096), 256, …)
+estIn    = estInputTokens(输入) + 系统提示词估值 + 64
+           estInputTokens 按字符分类加权：ASCII 0.25 / 汉字 0.68 /
+           假名谚文全角 0.95 / emoji 符号 1.65 / 其他拼音文字 0.75，
+           另对 ≥20 字符的无空格 ASCII 长串（URL、Base64）加收 0.5/字符
+want     = 输入字符数 × 0.5（mod）/ 0.85（html、ui）+ 256   // 输出需求
+room     = ctx - estIn - 128
+if (room < 400 || room < min(want, 4096)) → 抛 CTX_OVER，上层劈半重发
+outTokens = clamp(min(want, room, 4096), 256, …)
 ```
+
+两个闸门缺一不可：只查输入，大批次的 `room` 会被吃得只剩几百 token，发出去必被
+`max_tokens` 截断整批作废；输出估低了同样截断（短模组名实测约 0.4 token/源字符，
+含版本号和术语标记开销，所以 mod 取 0.5）。
+
+真实 400 里能从报错学窗口（请求量和窗口同时出现时取小值），但**解析值等于当前估值时不动**——
+那说明探测本来就对，是估算低估，该劈批而不是砍窗口。
 
 超过 3000 字符的块按句子切成约 800 字符的小片，只在伪标签外部切，保证每片 `<iN>` 配对完整。
 
@@ -200,7 +211,7 @@ index.js              入口、设置页 UI、模组名批量翻译、缓存读�
 dom-translator.js     DOM 兜底层：扫描、判定、序列化、回填、队列、重试
 translate-core.js     模型调用层：HTTP、提示词、占位符保护、分批、JSON 解析
 locale-pack.js        语言包接管：扫 en 词条、合并词库、写 common.json
-pack.json             界面词库（6046 条）
+pack.json             界面词库（6166 条，按字符串叶子计）
 gamenames.json        游戏固定中文名（746 条）
 gamenames-keep.json   明确保持英文的名单
 domCache.seed.json    种子译文（清缓存升级后垫底）

@@ -8,7 +8,6 @@
     "apiKey": "",
     "model": ""
   },
-  "fallbackLibre": false,
   "includeCollections": true,
   "writeToNameField": false,
   "batchSize": 20,
@@ -81,11 +80,5 @@
       "en": "Completion",
       "zh": "完成度"
     }
-  ],
-  "libreEndpoints": [
-    "https://translate.disroot.org",
-    "https://translate.private.coffee",
-    "https://translate.fortytwo-it.com",
-    "https://translate.terraprint.co"
   ]
 }

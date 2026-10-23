@@ -179,8 +179,10 @@ function flushPendingNotice() {
 function dispatch(key, gameId, modId, value) {
   try {
     contextRef.api.store.dispatch(va.actions.setModAttribute(gameId, modId, key, value));
+    return true;
   } catch (e) {
     log('error', 'setModAttribute fail', String(e));
+    return false;
   }
 }
 
@@ -257,9 +259,14 @@ function applyTranslation(item, zh) {
   // 译文=原文 = 无需翻译（专名/已中文）。不写 Vortex 持久化状态——originalName 和
   // customFileName 都写成原值没有意义，只在缓存里标记「这条处理过了」。
   if (clean === item.raw) { cache[item.raw] = clean; return true; }
-  dispatch('originalName', item.gameId, item.modId, item.raw);
-  dispatch('customFileName', item.gameId, item.modId, clean);
+  // dispatch 抛错（action 未注册/状态树异常/初始化竞态）时不写缓存、返回 false：
+  // 以前三次 dispatch 无条件写缓存 → 界面还是英文、缓存说翻了，同批次 applied 还虚高。
+  // 必需两项（originalName 留底 + customFileName 显示）任一失败就留给下一轮重送
+  // （dispatch 幂等，重试安全）；name 字段是可选兜底，失败只记日志不影响判定。
+  const okOrig = dispatch('originalName', item.gameId, item.modId, item.raw);
+  const okCustom = dispatch('customFileName', item.gameId, item.modId, clean);
   if (cfg.writeToNameField) dispatch('name', item.gameId, item.modId, clean);
+  if (!okOrig || !okCustom) return false;
   cache[item.raw] = clean;
   return true;
 }
@@ -297,6 +304,42 @@ function restoreAll(state) {
         // 按缓存把中文又写回 customFileName，用户会以为「还原」按钮根本没生效。
         if (cache[a.originalName] !== undefined) { delete cache[a.originalName]; dropped++; }
         n++;
+      }
+    }
+  }
+  // 下载条目（尚未安装的模组）：译文是 setDownloadModInfo 直接覆盖 modInfo.name
+  // 写进 Vortex 状态的，没有 originalName 可依，原名只存在于 cache 的键里。
+  // 不遍历这里，「还原为英文」对下载页的条目毫无作用；而 applyCachedSilently()
+  // 对下载路径没有 cur 比对（不像 mods 路径那样先看当前值），重启约 8 秒后会把
+  // 中文按缓存又写回该条目；用户改用手动清缓存则原名映射永久丢失。
+  const dlFiles = (((state.persistent || {}).downloads || {}).files) || {};
+  if (Object.keys(dlFiles).length > 0 && Object.keys(cache).length > 0) {
+    // 反查表：译文 → cache 键（原名）。同一译文可能对应多个原名，取第一个。
+    const rev = new Map();
+    for (const k of Object.keys(cache)) {
+      const v = cache[k];
+      if (typeof v === 'string' && !rev.has(v)) rev.set(v, k);
+    }
+    for (const dlId of Object.keys(dlFiles)) {
+      const f = dlFiles[dlId];
+      const cur = f && f.modInfo && f.modInfo.name;
+      if (!cur || typeof cur !== 'string') continue;
+      const orig = rev.get(cur);
+      if (orig !== undefined && !needsTranslate(cur)) {
+        // 当前显示名不是英文（是我们的译文）→ 写回原名、删缓存映射。
+        // needsTranslate 守卫：防「译文恰好是另一个英文名」时把没翻过的条目改坏。
+        try {
+          contextRef.api.store.dispatch(va.actions.setDownloadModInfo(dlId, 'name', orig));
+          n++;
+        } catch (e) {
+          log('error', 'setDownloadModInfo restore fail', String(e));
+          continue;   // 没写成功就不删缓存，下次还能再试
+        }
+        if (cache[orig] !== undefined) { delete cache[orig]; dropped++; }
+      } else if (cache[cur] !== undefined) {
+        // 显示名仍是英文但缓存里有映射（翻过又被 Vortex 重置）→ 只清映射，
+        // 否则重启后 applyCachedSilently 又会把中文写回来。
+        delete cache[cur]; dropped++;
       }
     }
   }
@@ -542,7 +585,13 @@ function makeSettingsComponent() {
         busy: '',           // 正在执行的按钮 key（执行期间禁用，防重复点）
         testing: false,
         testResult: '',
-        stats: { dom: Object.keys(dm).length, mod: Object.keys(mn).length, fail: Object.keys(fl).length },
+        stats: {
+          // _ver 是版本标记不是条目，两条缓存都带它，不过滤的话计数恒 +1
+          //（和「清空全部翻译缓存」按钮里的 before 快照口径保持一致）
+          dom: Object.keys(dm).filter((k) => k !== '_ver').length,
+          mod: Object.keys(mn).length,
+          fail: Object.keys(fl).filter((k) => k !== '_ver').length,
+        },
         lexCount: Object.keys(lex()).length,
         loc: locStat,
         locMsg: '',
@@ -717,7 +766,10 @@ function makeSettingsComponent() {
               style: dirty ? Object.assign({}, btnStyle, { borderColor: '#e08b2a' }) : btnStyle,
               onClick: () => this.applyNum(key, min, max, label),
             }, '应用'),
-            dirty ? h('span', { style: { fontSize: 12, color: '#e08b2a' } }, `未应用（当前已存 ${c[key]}）`) : null,
+            dirty ? h('span', { style: { fontSize: 12, color: '#e08b2a' } },
+              c[key] == null
+                ? `未应用（当前未设置，将使用默认值 ${DEFAULT_CFG[key] === undefined ? '（无）' : DEFAULT_CFG[key]}）`
+                : `未应用（当前已存 ${c[key]}）`) : null,
           ),
           h('div', { style: { margin: '2px 0 0 158px', opacity: 0.6, fontSize: 12, lineHeight: 1.6 } }, hint),
         );
@@ -815,7 +867,7 @@ function makeSettingsComponent() {
         numRow('并发路数', 'concurrency', 1, 10,
           '同时向模型发几个请求。LM Studio 里 Parallel Requests 填几，这里就填几（本地一般 2-4）。填多了只会排队超时，不会更快。'),
         numRow('每批送翻条数', 'batchSize', 1, 50,
-          '一次最多把多少条文本交给模型（默认 20 条文本，不是 20 个字）。长文本仍会自动按长度再切小批，一般不用改。'),
+          '一次最多把多少条文本交给模型（默认 20 条文本，不是 20 个字）。注意：受本地小模型输出稳定性限制，每组实际最多 12 条，调更大只影响切批策略、不会突破 12。长文本仍会自动按长度再切小批，一般不用改。'),
         row('',
           mkCheck(c.domTranslate !== false, (v) => this.save({ domTranslate: v }), '实验性：实时翻译页面上的英文（浏览页/合集详情/安装说明等）')),
         row('',
@@ -995,12 +1047,16 @@ function makeSettingsComponent() {
               const st = localePack.status({ userData: localePack.resolveUserData(va), selfDir: EXT_DIR });
               this.setState({
                 loc: st,
-                locMsg: `已移除接管：删除 ${r.removed} 个文件${r.restoredFrom ? '，并已从备份还原' : ''}。重启 Vortex 生效。`,
+                locMsg: r.keptPack
+                  ? `未删除 common.json：无法确认它是本扩展写的（manifest 缺失或哈希不符）。如确认要删，请手动删除 ${r.dir} 下的 common.json`
+                  : `已移除接管：删除 ${r.removed} 个文件${r.restoredFrom ? '，并已从备份还原' : ''}。重启 Vortex 生效。`,
                 flash: {
-                  text: r.removed > 0
-                    ? `✓ 已移除接管：删除 ${r.removed} 个文件${r.restoredFrom ? '，并已从备份还原' : ''}，重启 Vortex 后还原英文界面`
-                    : '✓ 本来就没接管，无需移除',
-                  ok: true,
+                  text: r.keptPack
+                    ? '△ 未能确认 common.json 的归属，已保留不动（详见左侧说明）'
+                    : (r.removed > 0
+                      ? `✓ 已移除接管：删除 ${r.removed} 个文件${r.restoredFrom ? '，并已从备份还原' : ''}，重启 Vortex 后还原英文界面`
+                      : '✓ 本来就没接管，无需移除'),
+                  ok: !r.keptPack,
                 },
               });
             } catch (e) {
@@ -1031,7 +1087,7 @@ function makeSettingsComponent() {
           : null,
 
         h('div', { style: { margin: '12px 0 0 158px', opacity: 0.7, lineHeight: 1.6 } },
-          `内置词库 ${this.state.lexCount} 条（游戏译名 + 界面文案 + 术语），硬编码文案由页面层零延迟替换。`,
+          `内置词库 ${this.state.lexCount} 条（DOM 页面替换词典，按去重键计）· 界面语言包 ${(this.state.loc && this.state.loc.manifest && this.state.loc.manifest.entries) || 0} 条（写入 locales/zh/common.json 的条数，见 manifest.entries），硬编码文案由页面层零延迟替换。`,
           h('br'),
           `已缓存：模组名 ${this.state.stats.mod} 条 · 页面文本 ${this.state.stats.dom} 条 · 放弃(失败3次) ${this.state.stats.fail} 条。`,
           h('br'),
@@ -1103,6 +1159,13 @@ function main(context) {
           log('info', 'fail cache reset for new version', { version: extVer });
         }
       } catch (e) { /* info.json 读不到就跳过 */ }
+      // 退避状态跨重启恢复：failCache 只存失败计数、不存时间，dom-translator 的
+      // lastFail 是内存 Map，重启后归零 → 重启后立即对同一批失败条目全速重试
+      // （配置错误时每次重启都白打一轮请求 + 刷一屏错误日志）。
+      // 用 failCache.json 的最后写入时间当「最晚一次失败时刻」的近似：每次
+      // saveFail 都会更新它，重启后按 BACKOFF 接着算，零格式改动、零新键。
+      let failMtime = 0;
+      try { failMtime = fs.statSync(FAIL_PATH).mtime.getTime() || 0; } catch (e) { /* 没有文件就没有失败条目 */ }
       // 发版前按规矩清空了 domCache，但已经翻好的译文没必要跟着丢。
       // 打包时会把清空前的内容留一份 domCache.seed.json，同版本内缓存为空就自动恢复，
       // 这样误清缓存后界面文案立刻还是中文，不必等模型重翻一遍（重翻还经常失败）。
@@ -1160,19 +1223,36 @@ function main(context) {
   // 改为首次触发后固定延迟执行一次）
   try {
     let scheduled = false;
+    // 退避：模型挂机时状态变化会不断触发 autoHook，以前每 5 秒一次全量重试 +
+    // 每条失败通知，刷屏且持续打已挂机的模型。现在：挂机直接跳过（等探活恢复）；
+    // 一轮翻完有失败就按 5s→30s→2min→10min 退避，成功一批立即归零。
+    let hookFails = 0;
+    let hookNextAt = 0;
+    const HOOK_BACKOFF = [5000, 30000, 120000, 600000];
     const autoHook = () => {
       try {
         if (!cfg || !cfg.enabled || !cfg.autoTranslateOnInstall || scheduled || running) return;
+        if (liveStatus && liveStatus.modelDown) return;   // 模型挂机：不白刷
+        if (Date.now() < hookNextAt) return;
         const st = context.api.getState();
         const todo = collectTargets(st, null).filter((t) => !t.cached)
           .concat(collectDownloadTargets(st).filter((t) => !t.cached));
-        if (todo.length === 0) return;
+        if (todo.length === 0) { hookFails = 0; return; }
         scheduled = true;
-        log('info', 'auto translate scheduled', { todo: todo.length });
+        const wait = HOOK_BACKOFF[Math.min(hookFails, HOOK_BACKOFF.length - 1)];
+        log('info', 'auto translate scheduled', { todo: todo.length, wait });
         setTimeout(() => {
           scheduled = false;
-          translateAll();
-        }, 5000);
+          const done = (r) => {
+            if (r && !r.error && (r.failed || 0) === 0 && ((r.applied || 0) > 0 || r.none)) hookFails = 0;
+            else hookFails = Math.min(hookFails + 1, HOOK_BACKOFF.length - 1);
+            hookNextAt = Date.now() + HOOK_BACKOFF[hookFails];
+          };
+          Promise.resolve(translateAll()).then(done).catch(() => {
+            hookFails = Math.min(hookFails + 1, HOOK_BACKOFF.length - 1);
+            hookNextAt = Date.now() + HOOK_BACKOFF[hookFails];
+          });
+        }, wait);
       } catch (e) {
         log('warn', 'auto hook inner', String(e));
       }
@@ -1203,6 +1283,7 @@ function main(context) {
         translateConcurrently: core.translateConcurrently,
         saveCollect: (arr) => writeJson(COLLECT_PATH, arr),
         saveFail: (obj) => writeJson(FAIL_PATH, obj),
+        lastFailInit: failMtime,
         log,
         save: () => writeJson(DOM_CACHE_PATH, domCache),
       });

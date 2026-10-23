@@ -327,15 +327,56 @@ function salvageJsonArray(s) {
   return out;
 }
 
+/** 估算一段文本的 token 占用（按字符分类加权）。
+ *  权重来自 2026-10-23 在 LM Studio + hy-mt2-7b 上的实测（内容 tok/char）：
+ *  英文散文 0.207 / 中文 0.58 / 日文混合 0.803 / 西里尔希腊 0.629 / emoji 符号 1.322 /
+ *  Base64 长串 0.695。权重全部比实测值高 6%~25%，故意高估：估高的代价只是批次
+ *  略小（安全），估低的代价是服务端 400 整批作废、掉进逐条慢速重试。
+ *  以前全站统一 inChars/1.6（=0.625/字符）：emoji 类内容低估 2.1 倍必撞 400，
+ *  日文/Base64 也低估。另对 ≥20 字符的无空格 ASCII 长串（URL、哈希、Base64）
+ *  每条加收 0.5/字符——实测长串 0.695，散文只有 0.207，差在能不能被合并成整词。 */
+function estInputTokens(s) {
+  const t = String(s == null ? '' : s);
+  let tok = 0, run = 0;
+  const endRun = () => { if (run >= 20) tok += run * 0.5; run = 0; };
+  for (const ch of t) {
+    const c = ch.codePointAt(0);
+    if (c < 128) {
+      tok += 0.25;
+      if (ch === ' ' || ch === '\n' || ch === '\t' || ch === '\r') endRun();
+      else run++;
+      continue;
+    }
+    endRun();
+    // 注意区间含继：假名(3040-30FF)、谚文(AC00-D7AF)、全角(FF00-FFEF)都被
+    // 2E80-9FFF 包着，必须先判它们，剩下的 CJK 才算汉字
+    if ((c >= 0x3040 && c <= 0x30FF) || (c >= 0x31F0 && c <= 0x31FF) ||
+      (c >= 0x1B000 && c <= 0x1B2FF) || (c >= 0xAC00 && c <= 0xD7AF) ||
+      (c >= 0x1100 && c <= 0x11FF) || (c >= 0x3130 && c <= 0x318F) ||
+      (c >= 0xFF00 && c <= 0xFFEF)) tok += 0.95;                                              // 假名/谚文/全角（日文混合样本实测 0.803）
+    else if ((c >= 0x2E80 && c <= 0x303F) || (c >= 0x3400 && c <= 0x4DBF) ||
+      (c >= 0x4E00 && c <= 0x9FFF) || (c >= 0xF900 && c <= 0xFAFF)) tok += 0.68;               // 汉字及中文标点（实测 0.58）
+    else if (c >= 0x1F000 || (c >= 0x2600 && c <= 0x27BF) || (c >= 0x2B00 && c <= 0x2BFF) ||
+      (c >= 0x2190 && c <= 0x21FF) || (c >= 0x2200 && c <= 0x22FF) ||
+      (c >= 0x25A0 && c <= 0x25FF) || c === 0xFE0F) tok += 1.65;                                                       // emoji/符号（实测 1.32）
+    else tok += 0.75;                                                                                                  // 西里尔/希腊等（实测 0.63）
+  }
+  endRun();
+  return tok;
+}
+
 /** 探测模型「实际加载」的上下文窗口。
  *  LM Studio 的 /api/v0/models 会给出 loaded_context_length（比如模型本身 256k，
  *  但界面里只加载了 4096）。请求超过它，LM Studio 直接 400
  *  "Context size has been exceeded" —— 整批作废、队列看起来像空跑，
  *  这就是合集页等几分钟还是英文的根因。拿不到就按本地 4096 / 云端 8192 保守估。 */
-let ctxCache = { key: '', ctx: 0, at: 0 };
+let ctxCache = { key: '', ctx: 0, at: 0, learned: false };
+const CTX_TTL_MS = 60000;          // 探测值的有效期
+const CTX_LEARNED_TTL_MS = 300000; // 从服务端 400 学到的值的有效期（长一些，避免每 60 秒重新撞同一堵墙）
 async function probeContext(base, key, model) {
   const k = String(base) + '|' + String(model);
-  if (ctxCache.key === k && Date.now() - ctxCache.at < 60000) return ctxCache.ctx;
+  const ttl = ctxCache.learned ? CTX_LEARNED_TTL_MS : CTX_TTL_MS;
+  if (ctxCache.key === k && Date.now() - ctxCache.at < ttl) return ctxCache.ctx;
   let ctx = 0;
   try {
     const root = String(base).replace(/\/v1\/?$/i, '');
@@ -348,8 +389,44 @@ async function probeContext(base, key, model) {
     }
   } catch (e) { ctx = 0; }
   if (!ctx) ctx = /127\.0\.0\.1|localhost/i.test(String(base)) ? 4096 : 8192;
-  ctxCache = { key: k, ctx, at: Date.now() };
+  ctxCache = { key: k, ctx, at: Date.now(), learned: false };
   return ctx;
+}
+
+/** 从服务端 400 报错里学习真实的上下文窗口。
+ *  LM Studio / llama.cpp："Context size has been exceeded"（数字格式不固定）；
+ *  云端："maximum context length is N tokens" / "context length exceeded"。
+ *  实测真实 400 形体（2026-10-23，LM Studio + hy-mt2-7b）：
+ *  "request (500002 tokens) exceeds the available context size (8192 tokens)…
+ *   \"n_prompt_tokens\":500002,\"n_ctx\":8192" —— 请求量和窗口同时出现，
+ *  窗口必然是小的那个，故抓报错里所有 1024..2000000 的整数取最小。
+ *  采用规则（只减不增，这个信号只能证明「估高了」）：
+ *   - 解析值 < 当前估值 → 采用（探测只拿到 max_context_length 时的主路径）；
+ *   - 解析值 > 当前估值 → 不信，多半只抓到了请求量，退回减半；
+ *   - 解析值 = 当前估值 → 探测本来就对，这条 400 是 estIn 低估造成的，窗口不用动；
+ *   - 解析不到数字 → 减半，但不低于 minCtx（见下方 floor 注释）。
+ *  没有当前估值做基线（cur=0）时分不清「窗口」和「请求量」，直接不学。
+ * @param minCtx 减半时的窗口下限（调用方传 系统提示词估值 + 640）
+ * @returns 学到的窗口（0 = 这条 400 没提供可靠信号，ctxCache 不动） */
+function learnCtxFrom400(base, model, body, minCtx) {
+  const text = String(body || '');
+  if (!/context size|context length|context window|n_ctx|context_length|context_length_exceeded/i.test(text)) return 0;
+  const k = String(base) + '|' + String(model);
+  const cur = ctxCache.key === k ? ctxCache.ctx : 0;
+  if (!cur) return 0;                                      // 没有估值做基线，分不清「窗口」和「请求量」
+  const floor = Math.max(1024, Number(minCtx) || 0);
+  const nums = (text.match(/\d{3,7}/g) || []).map(Number).filter((n) => n >= 1024 && n <= 2000000);
+  let learned = nums.length > 0 ? Math.min.apply(null, nums) : 0;
+  // 比当前估值大 → 抓错了（多半只抓到了请求量），不信；等于估值 → 探测本来就对，
+  // 这条 400 是 estIn 低估造成的，窗口不用动（硬改只会把产能白白砍半）
+  if (learned > cur) learned = 0;
+  // 解析不到数字 → 减半收敛，但不低于 minCtx：提示词+最小条目都放不下的窗口
+  // 没有意义，硬减会连单条都发不出去（CTX_OVER 循环到 TTL 过期）
+  if (!learned) learned = cur > floor ? Math.max(floor, Math.floor(cur / 2)) : 0;
+  if (!learned) return 0;                                  // 无可靠信号，保持原值，靠劈批收敛
+  learned = Math.max(1024, Math.min(learned, 2000000));
+  if (learned !== cur) ctxCache = { key: k, ctx: learned, at: Date.now(), learned: true };
+  return learned;
 }
 
 async function pickModel(base, key) {
@@ -401,25 +478,39 @@ async function llmTranslate(cfg, texts, modeOverride) {
   const boxes = payloadList.map(() => ({ seq: 1, map: new Map() }));
   const safeList = payloadList.map((t, i) => protectPaths(t, boxes[i]));
 
+  // 系统提示词先构建：估算输入占用时要连它一起算（见下方 estIn）
+  const sysPrompt = mode === 'html' ? buildHtmlPrompt(terms) : buildSystemPrompt(terms, mode);
+
   // 输出预算必须跟着输入走，但**绝不能超过模型实际加载的上下文**：
   // 之前写死 4096 撞 4096 的窗口，动态放大到 8192 更是直接超限，
   // LM Studio 返回 400「Context size has been exceeded」，整批作废。
   const inChars = safeList.reduce((n, s) => n + String(s).length, 0);
   const ctx = await probeContext(base, key, model);
-  const estIn = Math.ceil(inChars / 1.6) + 500;             // 输入 token 估算（含系统提示词）
+  // estIn = 输入 + 系统提示词一起估。输入按字符分类加权（estInputTokens，权重全部
+  // 高于 2026-10-23 实测值：中文 0.58 / 日文 0.80 / emoji 1.32 / 英文 0.21 tok/char），
+  // 系统提示词按 1.2 字符/token（实测 0.632，留余量）。以前输入用统一 /1.6（=0.625），
+  // emoji 类内容低估 2.1 倍必撞 400、日文/Base64 也低估；估高的代价只是批次略小。
+  const estIn = Math.ceil(estInputTokens(safeList.join('\n'))) + Math.ceil(sysPrompt.length / 1.2) + 64;
+  // 输出需求也要估，闸门只查输入会出大事：大批次的 room 被输入吃得只剩几百 token，
+  // 发出去必被 max_tokens 截断 → JSON 解析失败整批作废 → 全部逐条慢速重试
+  // （页面长期半翻译，且高频单发会把本地模型打到大量失败）。
+  // 实测输出密度（2026-10-23，hy-mt2-7b，英→中）：短模组名约 0.4 token/源字符
+  // （带版本号和术语标记开销），长简介约 0.2，html/ui 保留伪标签和结构、译文长度
+  // 接近原文约 0.6。mod 取 0.5 / 其余取 0.85，各留 25%+ 边际。
+  const want = Math.ceil(inChars * (mode === 'mod' ? 0.5 : 0.85)) + 256;
   const room = ctx - estIn - 128;                            // 留给输出的空间
-  if (room < 400) {
-    const e = new Error('CTX_OVER 输入约 ' + estIn + ' token，模型上下文只有 ' + ctx);
+  if (room < 400 || room < Math.min(want, 4096)) {
+    const e = new Error('CTX_OVER 输入约 ' + estIn + ' token（含系统提示词 ' + Math.ceil(sysPrompt.length / 1.2) +
+      '），输出约需 ' + Math.min(want, 4096) + '，模型上下文只有 ' + ctx);
     e.code = 'CTX_OVER';
     throw e;                                                 // 上层把这批劈半重发
   }
-  const want = Math.ceil(inChars * 1.8) + 256;               // 中文字数略多于英文
   const outTokens = Math.max(256, Math.min(want, room, 4096));
 
   const body = JSON.stringify({
     model: model,
     messages: [
-      { role: 'system', content: mode === 'html' ? buildHtmlPrompt(terms) : buildSystemPrompt(terms, mode) },
+      { role: 'system', content: sysPrompt },
       { role: 'user', content: JSON.stringify(safeList) },
     ],
     temperature: 0.2,
@@ -442,6 +533,13 @@ async function llmTranslate(cfg, texts, modeOverride) {
   }
 
   if (r.status < 200 || r.status >= 300) {
+    // 上下文超限的 400：从报错里学真实窗口并写进 probeContext 缓存（带 5 分钟有效期），
+    // 下一个批次/重试立刻按学到的值估，不用反复撞同一堵墙。学不到就原样抛出。
+    // minCtx 传「系统提示词 + 最小条目都放得下」的下限：减半低于它就连单条都发不出。
+    if (r.status === 400) {
+      const learned = learnCtxFrom400(base, model, r.body, Math.ceil(sysPrompt.length / 1.2) + 640);
+      if (learned > 0) throw new Error('HTTP 400 ' + r.body.slice(0, 160) + ' [上下文窗口=' + learned + '，下批按此估算]');
+    }
     throw new Error('HTTP ' + r.status + ' ' + r.body.slice(0, 200));
   }
 
@@ -751,6 +849,17 @@ async function translateBatch(cfg, cache, texts, mode) {
       if (!out || out.length !== chunk.length) throw new Error('batch shape ' + (out ? out.length : 'null') + '/' + chunk.length);
       for (let k = 0; k < chunk.length; k++) res[g[k]] = out[k];
       await retryEchoed(cfg, chunk, out, res, g, mode);
+      // 模型少返条目（max_tokens 截断后 salvage 的尾巴，或干脆漏译——实测 37 条
+      // 长文批次 finish=stop 却只回 30 条）：llmTranslate 会把缺的补 null，
+      // 这里必须像 translateConcurrently 一样单条补发，否则这些条目永远停空
+      for (let k = 0; k < chunk.length; k++) {
+        if (res[g[k]] != null) continue;
+        try {
+          const one = await llmTranslate(cfg, [chunk[k]], mode);
+          if (one && one[0] != null) res[g[k]] = one[0];
+        } catch (e) { /* 保持 null，上层计失败 */ }
+        await delay(cfg.requestDelayMs || 150);
+      }
       return;
     } catch (e) {
       // 上下文超限：劈半重发（模组简介动辄上千字符，整批塞进去会直接被服务端拒）
@@ -769,7 +878,12 @@ async function translateBatch(cfg, cache, texts, mode) {
           const single = await llmTranslate(cfg, [t], mode);
           r = single[0];
         } catch (e) {
-          if (cfg.fallbackLibre) r = await libreTranslate(cfg, t);
+          // 公共 LibreTranslate 是隐私暗通道（文本逐条发往第三方服务器）：
+        // 出厂配置不再预置 fallbackLibre / libreEndpoints，只有用户**显式**打开
+        // 开关**并且**自己配了端点才启用（README 有说明）。单有条件都不触发。
+        if (cfg.fallbackLibre === true && Array.isArray(cfg.libreEndpoints) && cfg.libreEndpoints.length > 0) {
+          r = await libreTranslate(cfg, t);
+        }
         }
       }
       res[g[k]] = r || null;
@@ -884,6 +998,9 @@ module.exports = {
   splitIndexed,
   pickModel,
   probeContext,
+  estInputTokens,
+  learnCtxFrom400,
+  _ctxCache: () => ctxCache,
   llmTranslate,
   libreTranslate,
   translateBatch,

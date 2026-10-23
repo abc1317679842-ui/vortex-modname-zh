@@ -167,8 +167,31 @@ function build(opts) {
   fs.mkdirSync(targetDir, { recursive: true });
   writeJsonAtomic(target, pack);
 
-  // 老版本是按 namespace 拆文件写的（manifest.written 里记着），全部清掉，
-  // 只留 common.json —— 避免旧内容遮蔽新词条，也让「一个文件」成立。
+  // 一次性迁移：老版本按 namespace 拆文件写（manifest 没有 mode 字段即是老格式）。
+  // 残留的 ns 文件会遮蔽 common.json 里的新词条——i18next 先查请求的 ns、找不到才
+  // 回退 common，旧 ns 文件里同名 key 的旧译文优先显示。而 cleanupStaleFiles 依赖的
+  // manifest.written 对历史用户永远不存在（老 manifest 从来没写过这个字段），
+  // 按「manifest 是我们产的旧格式」判定，**先备份再删**，归属存疑也不丢数据。
+  let migrated = [];
+  if (prev && prev.generator === 'vortex-modname-zh' && !prev.mode) {
+    try {
+      const leftovers = fs.readdirSync(targetDir)
+        .filter((f) => f.endsWith('.json') && f !== PACK_FILE && f !== MANIFEST_NAME);
+      if (leftovers.length > 0) {
+        const bak = path.join(userData, 'locales', `${LANG}.backup-${Date.now()}-stale`);
+        fs.mkdirSync(bak, { recursive: true });
+        for (const f of leftovers) fs.copyFileSync(path.join(targetDir, f), path.join(bak, f));
+        for (const f of leftovers) {
+          try { fs.unlinkSync(path.join(targetDir, f)); migrated.push(f); } catch (e) { /* ignore */ }
+        }
+        if (log) log('info', 'locale pack: migrated stale ns files', { files: migrated, bak });
+        pruneBackups(path.join(userData, 'locales'));
+      }
+    } catch (e) { if (log) log('warn', 'locale pack: stale migration failed', String(e)); }
+  }
+
+  // 新格式 manifest 的 written 里记着我们实际写过的文件；当前版本只写 common.json
+  // （这个循环实际是空转），机制留着防止将来又拆文件时留残留。
   const removed = cleanupStaleFiles(targetDir, prev);
 
   let entries = 0;
@@ -177,6 +200,9 @@ function build(opts) {
 
   writeJsonAtomic(manifestPath, {
     generator: 'vortex-modname-zh',
+    mode: 'single-file',          // 新格式标记：只写 common.json 一个文件
+    written: [PACK_FILE],         // 本次实际写出去的文件（供未来版本清理残留）
+    migrated,                     // 本次从旧版 ns 拆分格式迁移走的残留文件
     entries,
     bytes: Buffer.byteLength(payload, 'utf8'),
     // 哈希用来回答「现在磁盘上这份 common.json 还是我们写的吗」。
@@ -187,7 +213,7 @@ function build(opts) {
     builtAt: new Date().toISOString(),
   });
 
-  return { changed: true, reason: prev ? 'updated' : 'created', entries, dir: targetDir, removed };
+  return { changed: true, reason: prev ? 'updated' : 'created', entries, dir: targetDir, removed, migrated };
 }
 
 /** 移除接管：删掉我们的文件，有备份就还原 */
@@ -197,15 +223,18 @@ function restore(opts) {
   const manifestPath = path.join(targetDir, MANIFEST_NAME);
   // 只删「确实是我们写的」那份：manifest 里的哈希对得上才动手。
   // 用户可能后来又装了别的中文包（同样叫 common.json），无条件 unlink 等于替别人做决定。
-  const manifest = readJson(path.join(targetDir, MANIFEST_NAME));
+  // manifest 缺失 / 无 hash / 读取出错 → 无法证明归属 → **不动 common.json**，只删 manifest。
+  // 以前这三种情况默认 mine=true，会把别人后装的包静默删掉（restore 路径不做备份，
+ // 删掉即不可恢复），与 build()「归属不明就不动」的保守策略自相矛盾。
+  const manifest = readJson(manifestPath);
   const packPath = path.join(targetDir, PACK_FILE);
-  let mine = true;
+  let mine = false;
   try {
     if (manifest && manifest.hash && fs.existsSync(packPath)) {
       const cur = fs.readFileSync(packPath, 'utf8');
       mine = crypto.createHash('sha256').update(cur, 'utf8').digest('hex') === manifest.hash;
     }
-  } catch (e) { mine = true; }
+  } catch (e) { mine = false; }
 
   let removed = 0;
   for (const f of (mine ? [PACK_FILE, MANIFEST_NAME] : [MANIFEST_NAME])) {
@@ -233,7 +262,9 @@ function restore(opts) {
     if (fs.readdirSync(targetDir).length === 0) { fs.rmdirSync(targetDir); emptied = true; }
   } catch (e) { /* ignore */ }
 
-  return { removed, restoredFrom, emptied, dir: targetDir };
+  // keptPack：磁盘上有 common.json 但我们没能证明是归属自己 → 没删，让调用方告知用户
+  const keptPack = !mine && fs.existsSync(packPath);
+  return { removed, restoredFrom, emptied, dir: targetDir, keptPack };
 }
 
 /** 只读状态（给设置页展示，不写盘） */

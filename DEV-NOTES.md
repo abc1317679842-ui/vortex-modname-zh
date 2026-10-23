@@ -194,7 +194,7 @@ if (nk !== t) { ...查 lexNorm... }
 **症状**：条目失败后元素上留着 `data-zh-key="1"`，之后即使复活也不再被处理。
 
 **纪律**
-- 失败时必须清掉 `data-zh-key` 和 `seenLen`，让元素能被重新发现。
+- 失败时必须清掉 `data-zh-key` 和 `seenText`，让元素能被重新发现。
 - 是否重试由 `failed` 状态决定，不由 DOM 标记决定。
 
 ### 3.4 加了门控，就要同时找到所有「该重新放行」的地方
@@ -310,7 +310,7 @@ if (nk !== t) { ...查 lexNorm... }
 
 | 文件 | 作用 | 发版时 |
 |---|---|---|
-| `pack.json` | 界面词库 6046 条 | 保留 |
+| `pack.json` | 界面词库 6166 条（字符串叶子数，= 语言包 manifest 的 `entries`） | 保留 |
 | `gamenames.json` | 游戏名固定表 746 条 | 保留 |
 | `gamenames-keep.json` | 明确保持英文的名单 | 保留 |
 | `domCache.json` | 运行时译文缓存 | **清空** |
@@ -342,9 +342,9 @@ if (nk !== t) { ...查 lexNorm... }
 
 1. 清 `domCache.json`（写成 `{}`）、`failCache.json`（写成 `{"_ver":"新版本号"}`）
 2. `domCache.seed.json` 保留，先跑一遍清洗（去无效条目、去包裹）
-3. 三个 js 全部 `node --check`
+3. 四个 js 全部 `node --check`
 4. 跑回归：完整性断言 + 真实模型抽样 + 压力测试
-5. 打包只带 10 个文件（README 里列了清单），不带 `domCache.json` / `failCache.json` / `translator.log`
+5. 打包只带白名单内的静态文件（README 里列了清单，当前 15 个），不带 `domCache.json` / `failCache.json` / `translator.log`
 6. 记录到 `.workbuddy/memory/` 当日日志
 
 ---
@@ -411,7 +411,7 @@ if (nk !== t) { ...查 lexNorm... }
 - 中高：`readJson(CONFIG_PATH, cfg)` 兜底是自身引用，配置损坏时把 `cfg` 清空
 - 中：`cfg.terms` 被文件版 16 条覆盖（746 条游戏名对照消失）；`processLongBlock` 用 `&&` 绕过控件保护，内容容器内长块带按钮时 `restore()` 会 removeChild；429/502/503/504 无退避重试；**界面语言不是中文时语言包不会被加载**（README 补步骤 + 设置页黄字检测）
 - 中低：`collected.json` 每次启动清空；自检判据仍是 `>= 8`（上限早已是 4，`-1` 显示成「失败 -1 次」）；清空缓存时去写包内的 `domCache.seed.json`
-- 低：关实时翻译不清 `data-zh-key`/`seenLen`；`cache['toString']` 命中原型链；`replace(t, 译文)` 会展开 `$&`；`restore()` 无条件删别人的 `common.json`；`PRE` 不在原样保留集合里，多行被折叠成一行
+- 低：关实时翻译不清 `data-zh-key`/`seenText`；`cache['toString']` 命中原型链；`replace(t, 译文)` 会展开 `$&`；`restore()` 无条件删别人的 `common.json`；`PRE` 不在原样保留集合里，多行被折叠成一行
 - 配套：`restore()` 增加 manifest 哈希校验（只删自己写的，且只在文件仍属自己时才回灌备份）；`seed-skip.json` 标记替代改包内文件
 
 ### 0.15.4（发布前独立审查，19 条全修）
