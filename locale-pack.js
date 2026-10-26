@@ -126,6 +126,13 @@ function build(opts) {
   const target = path.join(targetDir, PACK_FILE);
   const manifestPath = path.join(targetDir, MANIFEST_NAME);
 
+  // 空包守卫（review4-M2）：上游解析失败/被清空后误调 build，会把用户机器上的好
+  // 语言包整份覆盖成 {}，界面悄悄回到英文且没有备份。空包一律拒写。
+  if (!pack || Object.keys(pack).length === 0) {
+    if (log) log('error', 'locale pack: empty pack, rebuild refused', {});
+    return { changed: false, reason: 'empty-pack', entries: 0, dir: targetDir, removed: [] };
+  }
+
   const payload = JSON.stringify(pack);
   let prevRaw = null;
   try { prevRaw = fs.readFileSync(target, 'utf8'); } catch (e) { /* ignore */ }

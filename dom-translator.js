@@ -21,14 +21,141 @@
 // 用户看到的直接就是中文，不会先闪一下英文。只有词库也没有的才排队等模型。
 
 const CJK = /[\u4e00-\u9fa5\u3400-\u4dbf]/;
+// 零宽字符：Vortex 动态文案实测形态。必须与 index.js 的 ZW_RE/normKey 同一份口径，
+// 否则「译文反查」「归一化查缓存」在带零宽字符的文本上会漏（modname-namepaste-test 组 9 对拍）。
+const ZW_RE = /[\u200b-\u200d\u2060\ufeff]/g;
+// 半句碎片的「裸虚词」表（模块级：启动自检在 startDomTranslator 开头就要用它，
+// 放函数体内会撞 TDZ —— Cannot access 'DANGLING_WORDS' before initialization）
+const DANGLING_WORDS = /^(?:the|a|an|while|with|of|to|in|on|for|and|or|but|is|are|was|were|by|at|from|as|that|this|these|those|it|its|if|so|than|then|when|which|who|whom|what|how|no|not|can|could|will|would|shall|should|may|might|must|do|does|did|has|have|had|be|been|being|about|into|over|under|between|during|before|after|above|below|up|down|out|off|again|further|once|here|there|all|any|both|each|few|more|most|other|some|such|only|own|same|too|very|just|also|because|until|where|why)$/i;
 
 // 自动重试上限：DOM 层与设置页共用同一个数（设置页「测试连接」要按这个边界只清暂态失败）
 const RETRY_MAX = 3;
 
+/** 压缩包文件名 → 名字骨架（不是文件名 / 剥完不像名字就返回空串）。
+ *
+ *  ★ 这是全项目唯一一份「文件名剥尾」实现。index.js 的 fileBaseName 已改为调它
+ *    （0.16.3 审计 v4 S-1：同一判据两份实现，双向不一致 —— 旧 fileBaseName 剥不掉
+ *    空格分隔的尾巴，还会把 `1.2.3.zip` 剥成 `1`、把 `a1b2c3d4e5f6.zip` 原样返回）。
+ *
+ *  下载页那几行的文本是整串文件名（实测），Nexus 标配形态：
+ *    `Stellar Blade Vortex Extension 1.0.4 1.0.8-2025-10-19T15-42-60E1a5f8f9.zip`
+ *          → `Stellar Blade Vortex Extension`
+ *    `ModSkillSlotPages_Remaster-13188-1-8-2026-10-24T05-38-53Z.zip`
+ *          → `ModSkillSlotPages_Remaster`
+ *    `Cyberpunk 2077-1234-1-0-2026-10-24T05-38-53Z.zip`
+ *          → `Cyberpunk 2077`   ← 2077 是名字的一部分，不是版本号
+ *
+ *  opts.requireArchive === false 时允许无压缩包后缀的输入（index.js 的下载记录
+ *  fileName 可能不带后缀）。
+ */
+function fileStemOf(s, opts) {
+  const o = opts || {};
+  let t = String(s == null ? '' : s).trim();
+  if (!t || t.length > 260) return '';
+  if (/[<>{}『』]/.test(t)) return '';            // 带伪标签/占位符的不是文件名
+  if (/\.(zip|7z|rar)$/i.test(t)) t = t.replace(/\.(zip|7z|rar)$/i, '').trim();
+  else if (o.requireArchive !== false) return '';
+  if (!t) return '';
+  // 1) 日期戳：日期戳之后全是尾巴，直接扔（本体里不会出现 ISO 日期）。
+  //    切完必须把残留的尾部分隔符一起去掉 —— 逐段剥是按「分隔符 + 段」匹配的，
+  //    留着尾巴上的 `-` 会让第一轮就 match 不到（实测：整串原样返回）。
+  const dt = t.search(/\d\d\d\d-\d\d-\d\dT/i);
+  if (dt > 0) t = t.slice(0, dt).replace(/[\s_\-.]+$/, '').trim();
+  // 2) 从尾逐段剥「版本号 / fileId / hash」。peel = 「这段像不像文件尾巴」，
+  //    不是「该不该剥」—— 1~4 位纯数字既可能是版本号（`-1-0`）也可能是名字结尾
+  //    （`Cyberpunk 2077`），由两件事定夺：
+  //      a) 分隔符是不是空格 —— 名字里的数字用空格隔开（`Cyberpunk 2077` /
+  //         `Fallout 4` / `The Witcher 3`），Nexus 拼 fileId 用的是 `-`（`-13188`）。
+  //      b) 剥掉它之后，前一段还是不是尾巴。
+  //    ★段分隔符不含 `.`：`1.0.8` 必须当成一整段。早期实现把点也当分隔符，
+  //      `1.0.8` 被拆成 1/0/8 逐段剥，最后只剩个 `1` 被误判成名字结尾
+  //      （实测：`Stellar Blade Vortex Extension 1.0.4 1.0.8-…zip` → `…Extension 1`）。
+  const isVer = (w) => /^v?\d+(?:\.\d+)*[a-z]?$/i.test(w);
+  const peel = (w) => isVer(w) || /\d{9,}/.test(w) || /^[0-9a-f]{8,}$/i.test(w);
+  // 空格分隔的纯数字：是名字的一部分，还是 Nexus 拼进去的 fileId？按位数分：
+  //   → 1~2 位（`The Witcher 3` / `Fallout 4`）＝ 名字里的序号，保留
+  //   → 4 位年份 1900~2099（`Cyberpunk 2077`）＝ 名字里的年份，保留
+  //   → 其余（3 位 `913` / `241`，5 位以上）＝ fileId，照剥
+  // 早期判据是「1~4 位纯数字一律保留」，结果 `Resident Evil 4 (2023) Vortex Extension 913`
+  // 把 913 留在骨架里 → 缓存查不到 → 落到模型手里把版本尾巴揉进中文（实测 `扩展包913`）。
+  const isNameNumber = (w) => /^(?:\d{1,2}|(?:19|20)\d{2})$/.test(w);
+  for (;;) {
+    const m = t.match(/([\s_\-]+)([^\s_\-]+)$/);
+    if (!m) break;
+    const seg = m[2];
+    if (!peel(seg)) break;
+    const head = t.slice(0, m.index).trim();
+    if (!head) return '';
+    // 最靠名字的那段尾巴：head 末尾已经不是尾巴了。
+    //   → `Cyberpunk 2077` 的 2077 留、`The Witcher 3` 的 3 留（空格分隔 = 名字一部分）；
+    //   → `SwordFXRemaster-9999` 的 9999 照剥（`-` 分隔 = fileId）；
+    //   → `1.0.4` 照剥（含点 = 版本号）。
+    const m2 = head.match(/([\s_\-]+)([^\s_\-]+)$/);
+    const isLast = !m2 || !peel(m2[2]);
+    if (isLast && /^\s+$/.test(m[1]) && isNameNumber(seg)) break;
+    t = head;
+  }
+  // 3) 骨架必须还像个名字：≥2 个 token（至少一个含字母），或 1 个 ≥6 字符的长词
+  //    （长词允许下划线和数字：`ModSkillSlotPages_Remaster` 是单 token 的合法模组名）。
+  //    token 数按「全部段」算而不是「含字母的段」—— 名字尾巴可以就是数字：
+  //    `Cyberpunk 2077` / `Fallout 4` / `The Witcher 3` 都只有 1~2 个含字母 token。
+  //    纯 hash / `1.2.3` / 纯数字 一律返空，免得拿去查缓存贴错译文。
+  const toks = t.split(/\s+/).filter(Boolean);
+  if (!toks.some((w) => /[A-Za-z]/.test(w))) return '';
+  if (toks.length < 2 && !/^[A-Za-z][A-Za-z0-9_'’.\-]{5,}$/.test(t)) return '';
+  if (/[0-9a-f]{8,}/i.test(t)) return '';
+  return t;
+}
+
+/** 启动自检：清洗「一定是假翻译」的缓存条目，返回清掉的条数。
+ *
+ *  只清三类：译文为空 / 译文=原文 / 译文不含中文。keep 表污染（P3-3）也清。
+ *
+ *  **这里曾经还有一条 isHalfSentence（半句碎片）规则，2026-10-26 移除。**
+ *  启动自检发生在任何渲染之前，此刻缓存里的每一条都是上一次会话真正写进过界面的
+ *  译文，不可能是「React 撕裂中间态」。按 isHalfSentence 去删，只能删掉稳定的句子
+ *  （实测每次启动清 51 条，全是更新日志里带内联链接的那种「句子前半截」），
+ *  代价是每次启动都为同一批文本重新调一次模型 —— 翻出来的结果和上次一模一样。
+ *  P1-1 的原意由 okUnit() 在**入队**时守着，那里才是中间态唯一能出现的地方。
+ */
+function cleanStaleCache(cache, keepSet, cjkRe) {
+  let cleaned = 0;
+  for (const k of Object.keys(cache)) {
+    // 元数据键（_ver 版本戳等）不是译文，值本来就不是中文 → 必须先跳，
+    // 否则下面的无中文判定会把版本戳吃掉，每次启动都判「跨版本」重清一次。
+    if (k.charAt(0) === '_') continue;
+    const v = cache[k];
+    if (!v || v === k || !cjkRe.test(v)) { delete cache[k]; cleaned++; continue; }
+    // P3-3：keep 表名字被硬译进缓存（Vortex→漩涡 / UE4SS→Ue4ss插件）。keep 的 key
+    // 入队时就被 keepSet 拦了，缓存里存在就是旧版本污染 → 启动即清。
+    if (keepSet.has(k)) { delete cache[k]; cleaned++; continue; }
+  }
+  return cleaned;
+}
+
 function startDomTranslator(opts) {
+  // P2-2：拿不到 body 必须明确返回 false。以前这里静默 return undefined，
+  // 调用方照置 domStarted=true，之后所有定时器都对着一个不存在的 document 跑。
+  if (typeof document === 'undefined' || !document || !document.body) return false;
   const { cfg, cache, failCache, termExact, lexicon, keepEn, translateBatch, translateConcurrently, log, save, saveCollect, saveFail } = opts;
+  // 名字闸门三件套（index.js 注入）：
+  //   nameGate       这段文本是不是模组名（状态层签名表 + 同族兜底）
+  //   nameTranslationOf  是名字 → 只读 cache.json 查译文（D1 单一缓存源）
+  //   unfinishedName 翻了一半的显示名（供日志/后续词级补翻）
+  // 没有注入就整档退回 step2 老行为（名字走普通文本路）。
+  const nameGate = typeof opts.nameGate === 'function' ? opts.nameGate : null;
+  const unfinishedName = typeof opts.unfinishedName === 'function' ? opts.unfinishedName : null;
+  const nameTranslationOf = typeof opts.nameTranslationOf === 'function' ? opts.nameTranslationOf : null;
   // 采集是跨会话累积的素材，启动时接着上次的攒，不能每次清空
   const collected = new Set(Array.isArray(opts.collected) ? opts.collected : []);
+  // 采集上限（审计 E5）：collected.json 出厂是空的、开关关着时完全静止，
+  // 但一旦有人打开采集模式，源码里原本没有任何 truncate / 上限逻辑 —— 没有刹车。
+  // 5000 条约 1 MB 文本素材，够做词表补全了。
+  const COLLECT_MAX = 5000;
+  let collectFull = false;
+  // 名字候选记录（noteNameCandidate 写入，unfinishedName 诊断用；有上限，防内存涨）
+  const nameCandidates = new Map();
+  const LATIN_NAME_RE = /[A-Za-z]/;
   const failed = failCache || {};
   // 明确「保持英文」的名字（gamenames-keep.json）：不送模型、不记失败、不当成待翻。
   // 不能再靠「往 cache 里写值=原文」来表达 —— 下面就有一条自清洗专门删这种条目。
@@ -39,6 +166,9 @@ function startDomTranslator(opts) {
   // lastFail 是内存 Map，重启后归零 → 重启后立即对同一批失败条目全速重试，配置错误时
   // 每次重启都白打一轮请求 + 刷一屏错误日志。文件 mtime 是「最晚一次失败」的保守近似。
   const lastFail = new Map();
+  // retrySweep 的「放行票」：退避到点给key发一张，入队时核销（一次一焚）。
+  // 计数不删——删了就永远是首轮，累加不到 MAX_TRY+1，永久放弃永不到位（P0-1）。
+  const sweepPass = new Set();
   if (opts.lastFailInit) {
     for (const k of Object.keys(failed)) {
       if (k === '_ver') continue;
@@ -47,6 +177,12 @@ function startDomTranslator(opts) {
   }
   let collectTimer = null;
   if (typeof document === 'undefined' || !document.body) return;
+
+  // ── 右键菜单：只用 Vortex 官方 registerAction（index.js: mods-action-icons 300/301/302）──
+  // 0.16.3 曾在这里自建 DOM 浮层（contextmenu + preventDefault + 自画 div），
+  // 结果 preventDefault 挡不住 Vortex 的 React 菜单 → 原生菜单和自画浮层同时弹出，
+  // 且「重新翻译此名/保留此英文」与官方「翻译此模组/这个名字保留英文」功能重复。
+  // 已整段移除：任何右键交互都不许在 DOM 层接管。
 
   // ── 实时状态（设置页的「实时队列」面板直接读这个对象）──
   const live = opts.statusRef || {};
@@ -66,12 +202,7 @@ function startDomTranslator(opts) {
 
   // 启动自检：清洗假翻译（译文=原文 / 译文不含中文），否则对应文本永久卡在英文
   {
-    let cleaned = 0;
-    for (const k of Object.keys(cache)) {
-      if (keepSet.has(k)) continue;          // 显式要求保持英文的，不算假翻译
-      const v = cache[k];
-      if (!v || v === k || !CJK.test(v)) { delete cache[k]; cleaned++; }
-    }
+    const cleaned = cleanStaleCache(cache, keepSet, CJK);
     if (cleaned > 0) { log('info', 'dom cache self-clean', { cleaned }); if (save) save(); }
   }
 
@@ -97,7 +228,6 @@ function startDomTranslator(opts) {
   // 通知 / 弹窗是 React 控件区：这里的元素常常绑着点击回调（不只是跳转），整块重建会把
   // 它们换掉，React 回来更新时找不到节点就陷入重渲染循环（Vortex 2.9.0 更新通知的下载
   // 按钮就是这个情况）。所以在这片区域里，链接也一并当交互元素，只改文字、不重建 DOM。
-  const UI_INTERACTIVE_SEL = '[class*="notification"],[class*="toast"],[class*="modal"],[class*="dialog"]';
   // 但 changelog / 简介这类内容区常常就显示在弹窗里，里面的链接是纯外链，而且整块翻
   // 译文才连贯 —— 命中内容区就维持原样，不加严，免得长文翻译质量倒退。
   // 只保留「确定是纯内容区」的四个。原来还挂着 note / summary / preview 三个，
@@ -145,7 +275,8 @@ function startDomTranslator(opts) {
   }
 
   function normText(s) {
-    return String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
+    // 先剥零宽再折叠空白，与 index.js 的 normKey 逐字节同口径（组 9 对拍）
+    return String(s == null ? '' : s).replace(ZW_RE, '').replace(/\s+/g, ' ').trim();
   }
 
   /** 最小 HTML 实体解码。serialize 的 esc() 把 & < > 转义成实体送给模型，
@@ -182,6 +313,38 @@ function startDomTranslator(opts) {
   const queue = new Set();
   const queueMeta = new Map();          // src -> { ts, visible }
   const pendingBySrc = new Map();       // src -> Set<el>  等待回填的元素（块级）
+  // 诊断（P-NAME-05）：闸门认得出是模组名、却查不到译文 → 这行会一直是英文。
+  // 把「屏幕上真实显示的那串文本」原样记下来，才有据可查它是 fileInfo.name、
+  // 压缩包整串、还是 `英文 - 中文` 拼装名。零副作用，只写日志，上限 40 条去重。
+  const nameMissSeen = new Set();
+  function logNameMiss(t, el) {
+    if (nameMissSeen.size >= 40 || nameMissSeen.has(t)) return;
+    nameMissSeen.add(t);
+    try {
+      const row = el && el.closest ? el.closest('.mod-table-row,[class*="table-row"],[class*="mod-row"]') : null;
+      const rowTxt = row ? String(row.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 90) : '';
+      log('info', 'name miss', { t: String(t).slice(0, 110), row: rowTxt });
+    } catch (e) { /* 日志失败不影响翻译 */ }
+  }
+
+  // 同一条失败原因（模型连不上 / 返回不是 JSON 数组）会在每个批次各打一条 warn，
+  // 8 天刷出 238 条同名记录 —— 而它偏偏是唯一记录「模型为什么翻不动」的通道，
+  // 不能降成 debug，只能按 err 前缀聚合：同前缀 60 秒内只记首次，窗口过后再记一次
+  // 并带上这段时间里被折叠掉的次数（repeat）。真信号一条不丢，刷屏砍掉。
+  const BATCH_WARN_WINDOW = 60 * 1000;
+  const batchWarnSeen = new Map();      // err前缀 -> { at, n }
+  function logBatchWarn(meta) {
+    const key = String((meta && meta.err) || 'no-err').slice(0, 40);
+    const now = Date.now();
+    const prev = batchWarnSeen.get(key);
+    if (prev && now - prev.at <= BATCH_WARN_WINDOW) { prev.n++; return; }
+    const folded = prev ? prev.n : 0;
+    batchWarnSeen.set(key, { at: now, n: 1 });
+    const out = Object.assign({}, meta);
+    if (folded > 0) out.repeat = folded;
+    log('warn', 'dom batch detail', out);
+  }
+
   let flushTimer = null;
   let saveTimer = null;
   let flushing = false;
@@ -201,6 +364,32 @@ function startDomTranslator(opts) {
   const WRITE_PATIENCE = 6;
   const PINGPONG_COOL_MS = 60000;       // 熔断后的冷却时长，到点再给一次机会
   let pingPong = 0;                     // 被熔断的节点总数（面板可看）
+
+  /** 拉锯熔断唯一实现（node / name / attr / block / author / applyUnit 六个入口共用）。
+   *  返回 true = 这次改写放行；false = 已熔断，调用方必须放弃本次写入。
+   *  冷却而不是永久放弃：拉锯多半是「那阵子在高频重渲染」，60 秒后摘标记、清计数，
+   *  再给一次机会；还在拉锯就再冻一轮。
+   *  kind 只进日志口径（'write ping-pong cooled (name)'），测试按它分辨是哪条路径。 */
+  function coolIfPingPong(el, key, kind) {
+    let bucket = writeCount.get(el);
+    if (!bucket) { bucket = new Map(); writeCount.set(el, bucket); }
+    const wc = (bucket.get(key) || 0) + 1;
+    bucket.set(key, wc);
+    if (wc <= WRITE_PATIENCE) return true;
+    try { el.setAttribute('data-zh-skip', '1'); } catch (e) { /* ignore */ }
+    try {
+      setTimeout(() => {
+        try { el.removeAttribute('data-zh-skip'); } catch (e) { /* ignore */ }
+        const b = writeCount.get(el);
+        if (b) b.delete(key);
+      }, PINGPONG_COOL_MS);
+    } catch (e) { /* ignore */ }
+    pingPong += 1;
+    if (pingPong === 1 || pingPong % 20 === 0) {
+      log('warn', 'write ping-pong cooled (' + kind + ')', { n: pingPong, sec: PINGPONG_COOL_MS / 1000, sample: String(key).slice(0, 60) });
+    }
+    return false;
+  }
   // 2) 补扫退避：连续补扫次数越多，间隔越长，杜绝 120ms 一次的自持全树重扫
   let burst = 0;
   let lastBurstAt = 0;
@@ -224,6 +413,26 @@ function startDomTranslator(opts) {
   }
 
   /** 不该翻的东西：颜色值、版本号、文件大小、CSS 类名、纯数字、下载文件名、本地路径… */
+  /** 半句碎片（结构未稳）：悬挂 "(" 未配对、或裸虚词结尾。
+   *  来源：React 并发渲染把一句话撕成两段的中间态（实测 "File permission errors (" 单独成节点）。
+   *  单独送翻既翻不出东西又会让整批失败 → 宁可留一轮英文，等结构补齐再翻。
+   *  问号/句号收尾的完整句（"What are you waiting for?"）不算——虚词表要剥标点后再判，
+   *  且带终止标点的句子视为完整。 */
+  function isHalfSentence(s) {
+    const t = String(s == null ? '' : s).trim();
+    if (!t) return false;
+    // 括号未配对（悬挂）："(" 比 ")" 多 → 中间态
+    let open = 0, close = 0;
+    for (const ch of t) { if (ch === '(') open++; else if (ch === ')') close++; }
+    if (open > close) return true;
+    // 终止标点收尾视为完整句（"What are you waiting for?" / "Done."）
+    if (/[?.!…:;,]$/.test(t)) return false;
+    const words = t.split(/[^A-Za-z'-]+/).filter(Boolean);
+    const last = words.length ? words[words.length - 1].replace(/[''-]+$/, '') : '';
+    if (last && DANGLING_WORDS.test(last)) return true;
+    return false;
+  }
+
   function isNoise(s) {
     if (/^#[0-9a-f]{3,8}$/i.test(s)) return true;
     if (/^[vV]?\d+(\.\d+)+([-a-z0-9.]*)?$/i.test(s)) return true;
@@ -238,10 +447,18 @@ function startDomTranslator(opts) {
     if (/^(--|var\()/.test(s)) return true;
     if (/^(https?:|www\.)/i.test(s)) return true;
     if (/^[A-Za-z]:[\\/]/.test(s)) return true;
-    if (/\d{4}-\d{2}-\d{2}T|\.(zip|7z|rar)$/i.test(s)) return true;
+    // 日期戳 / 压缩包后缀：以前一律当噪音丢掉。但下载页整行就是这个形态
+    //   `Stellar Blade Vortex Extension 1.0.4 1.0.8-2025-10-19T15-42-60E1a5f8f9.zip`
+    // → 整串被吞、一条都不翻（用户实测：下载列表全英文）。
+    // 改成「能剥出名字骨架就放行」，由 handleFileNameNode 剥尾查短名译文（零模型）；
+    // 剥不出骨架（`1.2.3.zip`、纯 hash）仍然当噪音。
+    if (/\d\d\d\d-\d\d-\d\dT|\.(zip|7z|rar)$/i.test(s)) return !fileStemOf(s);
     if (!/\s/.test(s) && /^[A-Z]{2,}[a-z]/.test(s)) return true;      // REFramework 类驼峰专名
     if (!/\s/.test(s) && /^[a-z]{1,6}[A-Z]{2,}/.test(s)) return true;  // inZOI 这类小写开头的专名
     if (!/\s/.test(s) && s.length < 16 && /^(?=.*\d)[a-z0-9]+$/.test(s)) return true;
+    // 全小写无空格长串 = 内部标识符（witcher3menumodroot 18 字符实测）。
+    // configurations 只有 14 → 不拦；带空格的普通短语（mod skill slot pages）不拦。
+    if (!/\s/.test(s) && s.length >= 16 && /^[a-z0-9]+$/.test(s)) return true;
     return false;
   }
 
@@ -278,6 +495,8 @@ function startDomTranslator(opts) {
     const plain = s.replace(/<\/?i\d+>/g, ' ').replace(/\{\{\d+\}\}/g, ' ').replace(/\s+/g, ' ').trim();
     if (!plain || !/[A-Za-z]{2,}/.test(plain)) return false;
     if (isNoise(plain)) return false;
+    // P1-1：悬挂括号 / 裸虚词结尾的半句不入队（React 撕裂中间态）
+    if (isHalfSentence(plain)) return false;
     if (!/[A-Za-z]{2,}/.test(plain)) return false;
     return true;
   }
@@ -295,6 +514,14 @@ function startDomTranslator(opts) {
     // 2.9.0 健康检查改版新增的两条动态文案（{{count}}/{{modName}} 渲染后是实际值）
     [/^Install\s+selected\s*\((\d+)\)$/i, (m) => `安装所选（${m[1]}）`],
     [/^Missing\s+mod\s+may\s+be\s+required\s+for:\s*(.+)$/i, (m) => `可能缺少 ${m[1]} 所需的模组`],
+    // 健康检查的兄弟句式（2026-10-26 用户截图 + 自查发现）：同名句在可点击行
+    // （祖先命中 NO_BLOCK_SEL）永远贴不进，真正翻它的是 handlePrefixSentence
+    // （节点级前缀替换）。这里的存在价值：拦住整块送模型（不可控且烧 token），
+    // 并把流程引到节点级。输出格式与 handlePrefixSentence 统一（同一句无论哪种
+    // DOM 形态显示同一译文）。
+    [/^Missing\s+required\s+mods?\s+for:\s*(.+)$/i, (m) => (/^missing required mods\s+for:/i.test(m[0]) ? '缺少多个必需模组：' : '缺少必需模组：') + m[1]],
+    // P0-2 作者行：前缀照翻，作者名（用户可控内容）原样保留
+    [/^Created by (.+)$/i, (m) => `创建者：${m[1]}`],
     [/^(\d[\d,]*)\s+mods?\s+enabled\.?$/i, (m) => `已启用 ${m[1]} 个模组`],
     [/^(\d[\d,]*)\s+mods?\s+disabled\.?$/i, (m) => `已停用 ${m[1]} 个模组`],
     [/^(\d[\d,]*)\s+mods?\s+deployed\.?$/i, (m) => `已部署 ${m[1]} 个模组`],
@@ -485,6 +712,11 @@ function startDomTranslator(opts) {
       const nel = document.createElement(tag);
       for (const a of Array.from(node.attributes)) {
         if (/^on/i.test(a.name) || /^data-/i.test(a.name)) continue;
+        // 协议白名单（P2-d）：on*/data-* 之外再拦一道 scheme。译文是模型输出、
+        // 原属性是页面内容，两边都不是我们控制的，javascript: / data: 一旦
+        // 被 setAttribute 回去就是可执行属性（Vortex 界面点一下就中招）。
+        const val = String(a.value == null ? '' : a.value);
+        if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(val) && !/^(?:https?|mailto):/i.test(val)) continue;
         try { nel.setAttribute(a.name, a.value); } catch (e) { /* ignore */ }
       }
       for (const c of Array.from(node.childNodes)) nel.appendChild(fix(c));
@@ -686,14 +918,45 @@ function startDomTranslator(opts) {
     return out.length > 1 ? out : [src];
   }
 
-  function applyUnit(el, zh, map, slots) {
+  /** 伪标签序列结构是否未稳（`<i1>a</i2>` 这种 id 不配对的）。
+   *  只比「开闭数量相等」的旧版会放行它，而回填时 restore() 按 id 取槽位 ——
+   *  id 一错，整块内容就串到另一段上（P3-d）。 */
+  function unstableSentence(s) {
+    const re = /<(\/?)(i\d+)>/g;
+    const stack = [];
+    let m;
+    while ((m = re.exec(String(s == null ? '' : s)))) {
+      const id = m[2];
+      if (m[1] === '/') {
+        if (stack.length === 0 || stack[stack.length - 1] !== id) return true;
+        stack.pop();
+      } else {
+        stack.push(id);
+      }
+    }
+    return stack.length > 0;
+  }
+
+  function applyUnit(el, zh, map, slots, gate) {
     if (!zh || zh === (el.textContent || '')) return false;
+    // 译文里的伪标签 id 必须配对：<i1>a</i2> 回填会把槽位错到另一段，
+    // 宁可不贴（保持英文），也不能把两块内容缝在一起
+    if (/<i\d+>|<\/i\d+>/.test(zh) && unstableSentence(zh)) return false;
+    // 熔断收口到 applyUnit 入口（审计 P0-1）：pattern / longblock / pending 三个
+    // 「直通」调用点以前各自绕开熔断，React 高频重渲染下照样能自持循环。
+    if (gate && !coolIfPingPong(el, gate.key, gate.kind)) return false;
     // ① 优先原地回填：结构一个节点都不动（React 安全），链接与样式也天然保住
-    if (slots && slots.length > 0 && applyInPlace(el, zh, slots)) {
-      el.setAttribute('data-zh-block', '1');
-      el.removeAttribute('data-zh-key');
-      scheduleSave();
-      return true;
+    if (slots && slots.length > 0) {
+      if (applyInPlace(el, zh, slots)) {
+        el.setAttribute('data-zh-block', '1');
+        el.removeAttribute('data-zh-key');
+        scheduleSave();
+        return true;
+      }
+      // 有槽位却贴不进去（模型没按伪标签格式回 / 结构与序列化时对不齐）→ 宁可不贴。
+      // restore() 是整棵 removeChild + innerHTML 重建，模型往返期间 React 插进来的
+      // 按钮/输入框会连棵消失，节点引用也全被换掉 —— 审计 P0-2 实测形态。
+      return false;
     }
     // ② 结构对不上才重建 —— 但只在内容容器里做，且这块不能是我们不认识的 React 区域
     if (!isContentBox(el)) return false;
@@ -723,9 +986,12 @@ function startDomTranslator(opts) {
   function reviveIfVisible(src, el) {
     const n = failed[src];
     if (n === undefined || n === 0) return true;
-    // 还在可重试区间：交给 retrySweep 按退避走。见光就复活会把退避变成摆设，
-    // 滚动一次列表就能让一批条目反复重试。
-    if (n > 0 && n <= MAX_TRY) return false;
+    // 还在可重试区间：退避由 retrySweep 掌控（到点发 pass 票据才放行）。
+    // 计数保留 —— 删了计数就永远停在首轮，累加不到 MAX_TRY+1，必失败条目变永动机（P0-1）。
+    if (n > 0 && n <= MAX_TRY) {
+      if (sweepPass.has(src)) { sweepPass.delete(src); return true; }
+      return false;
+    }
     // n === -1（不可译）或 > MAX_TRY（已放弃）：只有用户真的盯着这段英文看，才值得再给一次
     if (!el || !inViewport(el)) return false;
     const rv = reviveCount.get(src) || 0;
@@ -775,6 +1041,9 @@ function startDomTranslator(opts) {
 
   function processBlock(el) {
     if (!el || !el.isConnected) return false;
+    // 多行 PRE/CODE（review4-M3）：整块折叠会把换行全吃掉，代码块直接变一行天书，
+    // 根本不送翻 —— 走到这的 PRE 只可能是 walk 层没拦住的边角（如被 span 包住的 PRE）
+    if (RAW_TAGS.has(el.tagName)) return false;
     if (el.getAttribute('data-zh-block') === '1') {
       // React 重渲染会把内容还原成英文，但标记还留着 → 会永久卡英文，这里摘掉重来
       const cur = el.textContent || '';
@@ -797,6 +1066,10 @@ function startDomTranslator(opts) {
     const { src, map, slots } = serialize(el);
     if (!src) return false;
 
+    // 压缩包文件名整块（下载页行）：退回节点级，由 handleFileNameNode 剥尾贴名（零模型）。
+    // 整块送模型既烧调用，还会让模型去「翻译」时间戳和 hash。
+    if (fileStemOf(src)) return 'nodelevel';
+
     // 显式要求保持英文的名字（gamenames-keep.json）：打标记后直接走，不送翻、不记失败
     if (keepSet.has(src) || keepSet.has(normText(src))) {
       try { el.setAttribute('data-zh-key', '1'); } catch (e) { /* ignore */ }
@@ -806,7 +1079,25 @@ function startDomTranslator(opts) {
     // 超长块（整段更新日志动辄几千字符，单次送模型必截断）→ 切片翻译再拼
     if (src.length > MAX_LEN) return processLongBlock(el, src, map, slots);
 
+    // pattern 白名单必须先于 okUnit（2026-10-26 真机实录）：健康检查
+    // 「Missing required mod for: <i1>重制版可错过任务增强功能</i1>」的模组名
+    // 来自 Vortex 状态树，React 首渲染即中文 → 整块含 CJK → okUnit 早退判死，
+    // pattern 在后面永远轮不到，前缀节点也被 handleTextNode 的 false 短路
+    // 永久困在英文。pattern 是人工维护的句式白名单，命中即可翻，无需 okUnit 把关；
+    // keepSet（保留英文）与 fileStemOf（文件名通道）优先级仍在其前面。
+    // 贴不上（slots 配平失败/非内容容器）时降节点级 —— 让前缀节点去查词典
+    // 前缀键（pack.json "Missing required mod for:"），模组名节点是中文无需处理。
+    const pat = patternHit(src);
+    if (pat) {
+      if (!canBlockReplace(el)) return 'nodelevel';
+      return applyUnit(el, pat, map, slots, { key: src, kind: 'pattern' }) ? true : 'nodelevel';
+    }
+
     if (!okUnit(src)) return false;
+
+    // 身份行守卫（review4-H2）：`<i1>{{2}}</i1>BigBizkit` 这种「伪标签+占位符+裸产品名」
+    // 窄形态是下载页拼出来的身份行，不是可翻文本 —— 送翻必产垃圾，直接跳过
+    if (/^<i\d+>\s*\{\{\d+\}\}\s*<\/i\d+>\s*[A-Za-z0-9._-]{1,32}\s*$/.test(src)) return false;
 
     // 词库优先（0 token）。块级串带伪标签时，词库里存的往往是纯文本原文
     // （更新日志/简介都是这样）→ 去掉标签再查一次，命中就直接换，不调模型
@@ -824,44 +1115,21 @@ function startDomTranslator(opts) {
     // 时若有内联子元素，就退回节点级逐段写 —— 否则这类块会永远停在英文
     const fallback = () => (slots.length > 1 ? 'nodelevel' : false);
     if (hit) {
+      // 顺序不能反（审计 P3-a）：先判这块能不能整块重建，**再**记拉锯账。
+      // 反过来写的话，每次「不能重建」的块也记一次数，普通虚拟列表复用几次节点
+      // 就把计数顶爆、白挨一次熔断（60 秒不贴译文）。
+      if (!canBlockReplace(el)) return 'nodelevel';
       // 拉锯熔断（块级路径）：命中缓存/词库就立刻回填，而 React 重渲染可能把译文还原成英文，
       // 于是「回填→还原→再回填」自持 —— 每轮还要全树重扫，在下载/进度这类高频重渲染界面
       // 上能把 renderer 一个核吃满（Vortex 2.9.0 更新下载实测卡死）。同一元素+同一原文
       // 反复回填超过上限就判定拉锯，打跳过标记彻底退出。
-      let bucket = writeCount.get(el);
-      if (!bucket) { bucket = new Map(); writeCount.set(el, bucket); }
-      const wc = (bucket.get(src) || 0) + 1;
-      bucket.set(src, wc);
-      if (wc > WRITE_PATIENCE) {
-        // 冷却而不是永久放弃：拉锯多半是「那阵子在高频重渲染」，等它停了这块还是该翻的。
-        // 60 秒后摘掉标记、清空计数再给一次机会；还在拉锯就再冻一轮。
-        try {
-          el.setAttribute('data-zh-skip', '1');
-          setTimeout(() => {
-            try { el.removeAttribute('data-zh-skip'); } catch (e) { /* ignore */ }
-            bucket.delete(src);
-          }, PINGPONG_COOL_MS);
-        } catch (e) { /* ignore */ }
-        pingPong += 1;
-        if (pingPong === 1 || pingPong % 20 === 0) {
-          log('warn', 'write ping-pong cooled', { n: pingPong, sec: PINGPONG_COOL_MS / 1000, sample: src.slice(0, 60) });
-        }
-        return false;
-      }
-      // 危险块守卫（命中缓存这条路径以前漏了）：applyUnit 会 removeChild 掉整块子节点再
-      // 用译文重建，块里只要含 button / input / [role=button] 这类 React 自己管的交互元素，
-      // 节点就被换掉了 —— React 下次 insertBefore 找不到它记得的节点，点一下就陷入重渲染
-      // 循环（Vortex 2.9.0 更新通知里的下载按钮就是这个情况：按钮已经翻成中文，点它界面
-      // 立刻卡死、CPU 吃满）。所以命中缓存同样要先过这道闸，过不了就退回节点级改文本。
-      if (!canBlockReplace(el)) return 'nodelevel';
+      if (!coolIfPingPong(el, src, 'block')) return false;
       const done = applyUnit(el, hit, map, slots);
       if (done) live.hits++;
       return done ? true : fallback();
     }
 
-    const pat = patternHit(src);
-    if (pat && canBlockReplace(el)) return applyUnit(el, pat, map, slots) ? true : fallback();
-    if (pat) return 'nodelevel';
+    // （pattern 检查已前移至 okUnit 之前 —— 见上方注释，2026-10-26）
 
     if (!canBlockReplace(el)) return 'nodelevel';    // 危险块交给节点级
     enqueue(src, el);
@@ -897,12 +1165,111 @@ function startDomTranslator(opts) {
     }
     live.queued = queue.size;
     if (!all) return false;
-    return applyUnit(el, got.join(''), map, slots);
+    return applyUnit(el, got.join(''), map, slots, { key: src, kind: 'longblock' });
+  }
+
+  // ── 名字闸门（D1/D2/D3）──────────────────────────────────────────
+  // 模组名的译文只来自状态层 cache.json（nameTranslationOf，已过验收），
+  // DOM 层只读不写 domCache；查不到就按 step2 老行为——不贴、也不送模型
+  // （送模型正是 domCache 里那些带引号缝合怪译文的来源）。
+
+  /** 记录「这段文本长得像模组名」（供 unfinishedName 事后补翻诊断） */
+  function noteNameCandidate(t, el) {
+    if (!t || t.length < 3 || t.length > 160) return false;
+    if (!LATIN_NAME_RE.test(t)) return false;
+    if (nameCandidates.size < 500) nameCandidates.set(t, el);
+    return true;
+  }
+
+  /** 闸门：是模组名就不许走普通文本路（不进模型、不写 domCache）。
+   *  F1：`<游戏名> Vortex Extension` 是扩展显示名不是模组名（同名不同物），
+   *  拦下来反而一个写者都没有（cache.json 无此键 → 不贴；prune 又删 domCache →
+   *  永久英文），必须放行去送模型。 */
+  function blockedByName(t) {
+    if (/\bvortex\s+extension$/i.test(String(t == null ? '' : t).trim())) return false;
+    if (!nameGate) return false;
+    try { return !!nameCheck(t); } catch (e) { return false; }
+  }
+
+  /** 闸门查询（带 try/catch：状态树异常时不能炸掉整条翻译）。
+   *  nameGate 恒返 {hit, epoch} —— `!!nameGate(t)` 在 hit 为 null 时也恒真，
+   *  必须解包 .hit（fix-1025-dom 的 mock 就是这个形状）。 */
+  function nameCheck(t) {
+    try { const g = nameGate(t); return g && g.hit ? g.hit : null; } catch (e) { return null; }
+  }
+
+  /** 贴名的译文（kill switch 内检，D3） */
+  function namePasteOf(t) {
+    if (cfg && cfg.domWriteNames === false) return null;
+    if (!nameTranslationOf) return null;
+    try { return nameTranslationOf(t); } catch (e) { return null; }
+  }
+
+  /** 这段文本是不是已知模组名（processNode 的兜底：贴不上也不送模型）。
+   *  同样解包 .hit：nameGate 返 {hit:null} 时 `!!` 会把整页文本都判成名字。 */
+  function nameKnown(t) {
+    if (!nameGate) return false;
+    try { const g = nameGate(t); return !!(g && g.hit); } catch (e) { return false; }
+  }
+
+  /** 贴名主路径：只写 nodeValue，不碰状态库、不写 domCache（D1），
+   *  与词库/缓存命中共用 coolIfPingPong（拉锯熔断单一实现）。 */
+  function handleNameNode(node, raw, t, el) {
+    const zn = namePasteOf(t);
+    if (!zn) return false;
+    if (!coolIfPingPong(el, t, 'name')) return false;
+    const next = raw.replace(t, () => zn);
+    if (next === raw) return false;
+    writing = true; node.nodeValue = next; endWrite(); live.hits++;
+    return true;
+  }
+
+  /** 压缩包文件名贴名（0.16.3 续16）：剥骨架 → 查短名译文 → 尾巴原样拼回。
+   *  `Stellar Blade Vortex Extension 1.0.4 1.0.8-2025-10-19T15-42-60E1a5f8f9.zip`
+   *    → `剑星 Vortex 扩展 1.0.4 1.0.8-2025-10-19T15-42-60E1a5f8f9.zip`
+   *  只读 cache.json（D1 单一缓存源），零模型调用；查不到返回 false，交回原逻辑。 */
+  function handleFileNameNode(node, raw, t, el) {
+    const stem = fileStemOf(t);
+    if (!stem) return false;
+    // 缓存里只存「干净骨架」的键，而真机文件名尾部常粘着 fileId / 括号年份：
+    //   `Resident Evil 4 (2023) Vortex Extension 913 1.0.1 …zip`
+    // 拿整段骨架直接查必然落空 → 落空就交给模型 → 模型把版本尾巴揉进中文
+    // （实测 `扩展包913` / `扩展包241` / `扩展包1.0.4`）。逐级退化再查一次。
+    const cands = [stem];
+    const push = (x) => { const v = String(x || '').trim(); if (v && cands.indexOf(v) < 0) cands.push(v); };
+    const noNum = stem.replace(/[\s_\-.]+(\d{1,8})$/i, '');
+    const noParen = stem.replace(/\s*\([^)]*\)\s*$/, '');
+    push(noNum); push(noParen); push(noNum.replace(/\s*\([^)]*\)\s*$/, ''));
+    let zn = '';
+    let hit = '';
+    for (const c of cands) { const v = namePasteOf(c); if (v) { zn = v; hit = c; break; } }
+    if (!zn) return false;
+    const at = t.indexOf(hit);
+    if (at < 0) return false;
+    // 骨架后紧跟的 fileId 不是名字的一部分。Nexus 文件名格式是
+    //   `<名字> <fileId> <版本> <日期T时-分Z> <hash>.zip`
+    // 留着它就是 `剑星 Vortex 扩展包1324 1.0.9 …` 这种数字粘连
+    // （fileStemOf 只在算骨架时剥掉 fileId，尾巴是从原串切下来的，不剥就还在）。
+    // 只吃「3 位以上连续数字、且前后还是分隔符」—— `1.0.9` 的 1 后面是点，不会误伤；
+    // `Cyberpunk 2077` 的 2077 在骨架里、不在 tail 开头，也不会误伤。
+    // 替换成空串（不是空格）：fileId 前后各有一个分隔符，吃掉 fileId 后剩下的那个
+    // 正好顶位，替成空格会拼出 `扩展包  1.0.9` 双空格。
+    const tail = t.slice(at + hit.length).replace(/^([\s_\-.]*)(\d{3,})(?=[\s_\-.])/, '');
+    // 译文与尾巴之间必须留一个空格：中文紧贴数字就是 `扩展包1.0.4` 这种连体。
+    const next = raw.replace(t, () => zn + (tail && !/^\s/.test(tail) ? ' ' + tail : tail));
+    if (next === raw) return false;
+    if (!coolIfPingPong(el, t, 'file')) return false;
+    writing = true; node.nodeValue = next; endWrite(); live.hits++;
+    return true;
   }
 
   /** 节点级：按钮文本、容器直挂文本、超长块 */
   function processNode(node, raw, t, el) {
-    const hit = lookup(t) || (() => { const b = shellInner(t); return b ? lookup(b) : null; })();
+    // 名字译文优先（D1：来自状态层 cache.json，经验收；查不到就按老行为走）。
+    // kill switch：cfg.domWriteNames === false 时整档回退，一律不贴。
+    // 命中后与词库/缓存命中共用同一套拉锯熔断（coolIfPingPong 单一实现）。
+    const zn = namePasteOf(t);
+    const hit = zn || lookup(t) || (() => { const b = shellInner(t); return b ? lookup(b) : null; })();
     if (hit) {
       // 拉锯熔断：命中缓存/词库就会立刻改写，而 React 重渲染又可能把译文还原成英文，
       // 于是「写完→还原→再写」自持循环 —— 每循环一次还要全树重扫，在下载/进度这类
@@ -910,26 +1277,27 @@ function startDomTranslator(opts) {
       // 就判定拉锯，给它打跳过标记彻底退出（不再扫描、不再改写）。
       // 计数键必须是「元素 + 原文」而不是文本节点：React 重渲染（以及设置 textContent）
       // 会重建 text node，按节点记数的话每轮都是新节点、计数永远归 1，熔断永远不触发。
-      let bucket = writeCount.get(el);
-      if (!bucket) { bucket = new Map(); writeCount.set(el, bucket); }
-      const wc = (bucket.get(t) || 0) + 1;
-      bucket.set(t, wc);
-      if (wc > WRITE_PATIENCE) {
-        try { el.setAttribute('data-zh-skip', '1'); } catch (e) { /* ignore */ }
-        pingPong += 1;
-        if (pingPong === 1 || pingPong % 20 === 0) {
-          log('warn', 'write ping-pong stopped', { n: pingPong, sample: t.slice(0, 60) });
-        }
-        return false;
-      }
+      if (!coolIfPingPong(el, t, 'node')) return false;
       // 第二参数用回调：直接传字符串的话，译文里的 $& / $` / $1 会被当成替换模式展开，
       // 该段文字会被吞掉半截，而且结果还会进缓存，重扫也修不回来。
       const next = raw.replace(t, () => hit);
       if (next !== raw) { writing = true; node.nodeValue = next; endWrite(); live.hits++; scheduleSave(); return true; }
       return false;
     }
-    if (cfg.collectMode) collected.add(t);
+    // 采集是 Set，天然去重，但**没有上限**：开着采集模式长期挂机，
+    // collected 会一直涨到几 MB（审计 E5）。到了上限就停采，只报一次，
+    // 不静默也不报错——素材够用了，再攒下去只是把 collected.json 撑爆。
+    if (cfg.collectMode) {
+      if (collected.size >= COLLECT_MAX) {
+        if (!collectFull) { collectFull = true; log('warn', 'collect limit reached', { max: COLLECT_MAX }); }
+      } else {
+        collected.add(t);
+      }
+    }
     if (cache[t] !== undefined) return false;
+    // 闸门说是模组名但贴不上（没有合格译文）→ 不送模型：名字由状态层队列翻译，
+    // 这里送模型只会产出 domCache 垃圾（0.16.2 实录：带引号的缝合怪译文）。
+    if (nameKnown(t)) { logNameMiss(t, el); return false; }
     if (!reviveIfVisible(t, el)) return false;
     if (!isTranslatable(t, el)) return false;
     if (queueMeta.has(t)) return false;
@@ -940,7 +1308,7 @@ function startDomTranslator(opts) {
   }
 
   /** 作者行：只翻前缀（By / Created by / Uploaded by），作者名原样保留 */
-  function handleAuthor(node, raw, t) {
+  function handleAuthor(node, raw, t, el) {
     const m = t.match(/^(created by|uploaded by|by)\s+([\s\S]+)$/i);
     if (!m) return false;   // 纯作者名不翻
     const prefixZh = /^created by$/i.test(m[1]) ? '创建者：' : (/^uploaded by$/i.test(m[1]) ? '上传者：' : '作者：');
@@ -949,6 +1317,35 @@ function startDomTranslator(opts) {
     // 「创建者：Created by Foo$&Bar」这种重复粘连文本并写进 DOM + 缓存。
     const next = raw.replace(t, () => prefixZh + m[2]);
     if (next === raw) return false;
+    if (el && !coolIfPingPong(el, t, 'author')) return false;
+    writing = true; node.nodeValue = next; endWrite(); scheduleSave();
+    return true;
+  }
+
+  // 词典前缀句（2026-10-26 健康检查实录，探针定案）：「Missing required mod(s) for: <模组名>」
+  // 的模组名由 React 从状态树渲染（中文），且整行是可点击项（祖先命中 NO_BLOCK_SEL，
+  // 探针同区域的 Download 句也被 canBlockReplace 降级为旁证）→ 块级永远降节点级；
+  // 而节点文本 = 前缀+模组名整串，词典全等查不中 → 永久英文。这里按「固定前缀+余串」
+  // 节点级替换（handleAuthor 同款写回路径，那条已被 Download 句真机验证）：
+  // 前缀用固定译文，余串（模组名，已是中文）原样保留，零误伤。
+  // 自查补（同日）：2.9.0 兄弟句「Missing mod may be required for:」同病同修，
+  // 译文格式与 pattern 输出保持一字不差。
+  function handlePrefixSentence(node, raw, t, el) {
+    let prefixZh = null;
+    let rest = null;
+    let m = /^(missing required mods? for:)\s*([\s\S]+)$/i.exec(t);
+    if (m) {
+      prefixZh = /^missing required mods for:/i.test(m[1]) ? '缺少多个必需模组：' : '缺少必需模组：';
+      rest = m[2];
+    } else {
+      m = /^missing mod may be required for:\s*([\s\S]+)$/i.exec(t);
+      if (m) { prefixZh = '可能缺少'; rest = m[1] + ' 所需的模组'; }
+    }
+    if (!prefixZh) return false;
+    // replacer 函数防 $& 展开：余串是模组名（用户可控内容），同 handleAuthor 的教训
+    const next = raw.replace(t, () => prefixZh + rest);
+    if (next === raw) return false;
+    if (el && !coolIfPingPong(el, t, 'prefix')) return false;
     writing = true; node.nodeValue = next; endWrite(); scheduleSave();
     return true;
   }
@@ -961,6 +1358,8 @@ function startDomTranslator(opts) {
     const el0 = node.parentElement;
     if (!el0) return false;
     if (SKIP_TAGS.has(el0.tagName)) return false;
+    // 文本的直爹就是 PRE/CODE（review4-M3）：折叠即丢换行，根本不送翻
+    if (RAW_TAGS.has(el0.tagName)) return false;
     if (isZhSkip(el0)) return false;
     if (keepSet.has(t)) {
       try { el0.setAttribute('data-zh-key', '1'); } catch (e) { /* ignore */ }
@@ -968,7 +1367,27 @@ function startDomTranslator(opts) {
     }
 
     // 作者行优先：永远走节点级前缀替换，绝不整块替换（作者名不许翻）
-    if (el0.closest && el0.closest('[class*="author"],[class*="uploader"]')) return handleAuthor(node, raw, t);
+    if (el0.closest && el0.closest('[class*="author"],[class*="uploader"]')) return handleAuthor(node, raw, t, el0);
+    // 词典前缀句其次（2026-10-26）：健康检查「Missing required mod(s) for: X」整串在
+    // 一个文本节点里且整行可点击（祖先 NO_BLOCK_SEL）→ 块级降级、词典全等 MISS，
+    // 只有这里能救。放在名字闸门之前：整句不是模组名，零冲突。
+    if (/^missing (?:required mods?|mod may be required) for:/i.test(t)) {
+      if (handlePrefixSentence(node, raw, t, el0)) return true;
+    }
+
+    // 下载页压缩包文件名：剥骨架查短名（零模型）。必须排在名字闸门之前 ——
+    // 闸门命中后是 `return handleNameNode(...)`，贴不上就整条放弃，这里永远轮不到。
+    if (handleFileNameNode(node, raw, t, el0)) return true;
+    // 是压缩包整串但查不到干净骨架的译文 → 到此为止，绝不交给通用通道。
+    // 整串送模型必然把 fileId / 版本尾巴揉进中文：实测 `剑星 Vortex 扩展包1324 1.0.9 …`
+    // `生化危机4 (2023) Vortex 扩展包913 1.0.1 …`（2026-10-25 用户截图）。
+    // 那比保持英文更糟 —— 中文里夹着数字，看着像「翻好了」，实际是垃圾，
+    // 而且会被写进 domCache 永久固化（缓存优先于剥尾通道，新算法再没机会跑）。
+    if (fileStemOf(t)) return true;
+
+    // 名字闸门优先于块级/节点级：是模组名就走贴名路（只读 cache.json，D1），
+    // 既不进模型也不写 domCache；贴不上就保持英文（与 step2 老行为一致）。
+    if (noteNameCandidate(t, el0) && blockedByName(t)) return handleNameNode(node, raw, t, el0);
 
     const blk = leafBlockOf(node);
     if (blk) {
@@ -1029,9 +1448,13 @@ function startDomTranslator(opts) {
     if (cfg && cfg.translateAttrs === false) return 0;
     let els;
     try { els = root.querySelectorAll(ATTRS.map((a) => `[${a}]`).join(',')); } catch (e) { return 0; }
+    // querySelectorAll 只查子孙，root 自己的属性（列表行直接把 title 挂在根节点上）会漏
+    const all = [];
+    if (root.getAttribute && ATTRS.some((a) => root.getAttribute(a))) all.push(root);
+    for (let i = 0; i < els.length && all.length < 1500; i++) all.push(els[i]);
     let count = 0;
-    for (let i = 0; i < els.length && i < 1500; i++) {
-      const el = els[i];
+    for (let i = 0; i < all.length; i++) {
+      const el = all[i];
       if (el.closest && el.closest('[class*="author"],[class*="uploader"],[data-zh-skip]')) continue;
       if (isZhSkip(el)) continue;
       for (const attr of ATTRS) {
@@ -1039,15 +1462,23 @@ function startDomTranslator(opts) {
         if (!raw) continue;
         const t = raw.trim();
         if (!t || t.length > MAX_LEN) continue;
+        // 名字分支：模组名只贴 cache.json 译文（D1），没有就不动、不送模型
+        const zn = namePasteOf(t);
+        if (zn) {
+          if (zn && coolIfPingPong(el, t, 'attr')) { el.setAttribute(attr, raw.replace(t, () => zn)); count++; }
+          continue;
+        }
         const hit = lookup(t);
         if (hit) {
-          el.setAttribute(attr, raw.replace(t, () => hit));
-          count++;
-        } else if (isTranslatable(t) && cache[t] === undefined && !queueMeta.has(t) && reviveIfVisible(t, el)) {
+          // 词库命中但被熔断：就地停手，绝不掉进下面的入队分支（审计 ④）——
+          // 熔断语义是「这块别再动了」，再送模型白烧调用还破坏熔断账。
+          if (coolIfPingPong(el, t, 'attr')) { el.setAttribute(attr, raw.replace(t, () => hit)); count++; }
+        } else if (isTranslatable(t) && cache[t] === undefined && !queueMeta.has(t) && reviveIfVisible(t, el) && !nameKnown(t)) {
           queue.add(t);
           queueMeta.set(t, { ts: Date.now(), visible: inViewport(el) });
           live.queued = queue.size;
         }
+        else if (isTranslatable(t) && cache[t] === undefined && nameKnown(t)) logNameMiss(t, el);
       }
     }
     return count;
@@ -1079,7 +1510,7 @@ function startDomTranslator(opts) {
           try { el.removeAttribute('data-zh-key'); } catch (e) { /* ignore */ }
           continue;
         }
-        if (applyUnit(el, stripShell(src, zh), cur.map, cur.slots)) {
+        if (applyUnit(el, stripShell(src, zh), cur.map, cur.slots, { key: src, kind: 'pending' })) {
           n++;
         } else {
           // 回填失败（结构对不齐 / 不在 CONTENT_SEL 不允许重建）：
@@ -1203,7 +1634,11 @@ function startDomTranslator(opts) {
           // 值得重试；以前两类都按「照抄」处理，第二次就判 -1 永久封杀，用户看到「这段永远不翻」。
           const rejected = !!(res && res._rejects && res._rejects.has(t));
           const prev = failed[t];
-          failed[t] = (!rejected && (reviveCount.get(t) > 0 || (prev && prev > 0))) ? UNTRANSLATABLE : 1;
+          // 拒收（占位符丢了 / 伪标签坏了 / BBCode 坏了）= 输出不合规，与网络失败同权重累加，
+          // 有上界（MAX_TRY+1 后永久放弃）；只有「真照抄」才可能升级成 UNTRANSLATABLE。
+          failed[t] = rejected
+            ? Math.min((prev && prev > 0 ? prev : 0) + 1, MAX_TRY + 1)
+            : (reviveCount.get(t) > 0 || (prev && prev > 0)) ? UNTRANSLATABLE : 1;
           lastFail.set(t, Date.now()); refused++;
           if (echoSamples.length < 3) echoSamples.push(String(t).slice(0, 40));
           return;
@@ -1234,7 +1669,7 @@ function startDomTranslator(opts) {
       if (saveFail && (refused > 0 || ok > 0 || failedN > 0)) saveFail(failed);
       if (failedN > 0 || refused > 0) {
         // 带上原因：refused=模型照抄原文；null=请求/解析失败（err 里是真实异常）
-        log('warn', 'dom batch detail', {
+        logBatchWarn({
           ok, refused, echo: echoSamples, nullN: failedN, nullSample: failSamples.slice(0, 3),
           err: (res && res.__err) || '',
         });
@@ -1341,6 +1776,13 @@ function startDomTranslator(opts) {
           if (el && el.getAttribute && el.getAttribute('data-zh-block') === '1' && CJK.test(m.target.nodeValue || '')) continue;
           if (handleTextNode(m.target, null)) dirty++;
         }
+      } else if (m.type === 'attributes') {
+        // P1-4：页面静止时改 title/alt/aria-label 也要能翻（Vortex 实测有这类动态属性）。
+        // 自激由 writing 标志挡：handleAttrs 写属性期间本回调直接不进（L1502）。
+        if (m.target && m.target.nodeType === 1) {
+          if (SKIP_TAGS.has(m.target.tagName)) continue;
+          if (handleAttrs(m.target)) dirty++;
+        }
       } else if (m.type === 'childList') {
         for (const node of m.addedNodes) {
           if (node.nodeType === 3) { if (handleTextNode(node, null)) dirty++; }
@@ -1355,7 +1797,7 @@ function startDomTranslator(opts) {
     if (dirty > 0) scheduleSave();
     scheduleFlush(dirty > 0 ? 200 : 150);
   });
-  mo.observe(document.body, { childList: true, subtree: true, characterData: true });
+  mo.observe(document.body, { childList: true, subtree: true, characterData: true, attributes: true });
 
   // 启动时立刻同步扫一遍（不等定时器，避免首屏闪英文）
   writing = true;
@@ -1372,7 +1814,10 @@ function startDomTranslator(opts) {
     live.pingPong = pingPong;         // 面板可看：被拉锯熔断的节点数 / 当前补扫档位 / 扫描被截断次数
     live.burst = burst;
     live.walkTruncated = walkTruncated;
-    if (!docDirty) return;            // 页面没变过：不重扫（队列该推的上面已经推了）
+    // 续扫断点：页面没变、也没有被截断的续扫，才真的歇。
+    // 只有 docDirty 一个条件时，截断的那轮会把 resumeNode 留着但门控不让进，
+    // 第 8000 条之后的文本要等外部 DOM 变化才被处理（0.16.3 续 10 实录）。
+    if (!docDirty && !resumeNode) return;
     docDirty = false;
     try {
       const n = walk(document.body) + handleAttrs(document.body) + applyPending();
@@ -1399,7 +1844,9 @@ function startDomTranslator(opts) {
     }
     if (ready.length === 0) return;
     const batch = ready.slice(0, 40);
-    batch.forEach((k) => delete failed[k]);
+    // 发「放行票」而不是删计数：计数留着才能累加到 MAX_TRY+1 永久放弃；
+    // 票据入队时核销，没入队（页面静止/docDirty 无变化）就留着等下一轮。
+    batch.forEach((k) => sweepPass.add(k));
     if (saveFail) saveFail(failed);
     // 光删计数没用：这些条目要重新被「发现」才会入队。rescan 现在有 docDirty 门控，
     // 页面静止（弹窗开着、列表不动）时不会自己跑，所以这里必须主动置脏。
@@ -1433,4 +1880,5 @@ function startDomTranslator(opts) {
   log('info', 'dom translator started', { dict: Object.keys(lex).length, cache: Object.keys(cache).length, mode: 'block' });
 }
 
-module.exports = { startDomTranslator, RETRY_MAX };
+// fileStemOf 导出：index.js 的 fileBaseName 已改为调它（同一判据只允许一份实现）。
+module.exports = { startDomTranslator, RETRY_MAX, fileStemOf };

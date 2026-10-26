@@ -18,6 +18,8 @@ let COLLECT_PATH = path.join(DATA_DIR, 'collected.json');
 let FAIL_PATH = path.join(DATA_DIR, 'failCache.json');
 let LOG_PATH = path.join(DATA_DIR, 'translator.log');
 let SEED_SKIP_PATH = path.join(DATA_DIR, 'seed-skip.json');   // 用户点过「清空缓存」后别再灌种子
+let NAME_FAIL_PATH = path.join(DATA_DIR, 'nameFail.json');    // 模组名 give-up 记账（烧模型的有界退让）
+let WORD_PATH = path.join(DATA_DIR, 'wordCache.json');        // 词级补翻词表（Gwent → 昆特牌）
 // 以下是随包发布的静态资源，永远读扩展目录
 const SEED_PATH = path.join(EXT_DIR, 'domCache.seed.json');
 const GAME_NAMES_PATH = path.join(EXT_DIR, 'gamenames.json');
@@ -29,9 +31,69 @@ const PACK_PATH = path.join(EXT_DIR, 'pack.json');
 const CJK = /[\u4e00-\u9fa5\u3400-\u4dbf]/;
 const LATIN = /[A-Za-z]/;
 
+// 模组名 give-up 记账上限：同一名字试满这么多次就不再烧模型（TTL 过后的旧账重新计数）
+const NAME_FAIL_MAX = 3;
+const NAME_FAIL_TTL = 7 * 24 * 3600 * 1000;
+
+// 版别标记短语表（用户 2026-10-24 拍板：ULTRA Plus → 超强版）：整词短语替换，零模型调用。
+// 模型对「大写 + 空格」的版别标记经常照抄，而 residueWords 把全大写的 ULTRA 当专名放行、
+// 只留 Plus 当残留 → 词级补翻只能补出半个。边界用「非字母数字」：连写（ULTRAPLUS）不换。
+// 词级补翻提示词：一次送一批残留英文词，按行对应返回。
+const WORD_PROMPT = [
+  '你是游戏模组名翻译助手。下面每行是一个需要翻译的英文单词或短语，出自游戏模组名。',
+  '请逐行给出对应简体中文，行数与顺序一一对应，不要输出解释、编号或引号。',
+  '专有名词（模组名、工具名、作者名）没有通用译法时可保留英文原文。',
+].join('\n');
+
+// seed 质检（P3-1）：整值被引号壳包裹的译文是坏的（模型把输出又包了一层引号），
+// 灌进 domCache 会让界面显示 “下载” 这种带壳文本。原文自己以引号开头时放行
+// （"Show hidden games" → “显示隐藏游戏”… 是合法译文，壳在原文里）。
+const seedEntryOk = (k, v) => {
+  const s = String(v == null ? '' : v).trim();
+  const kk = String(k == null ? '' : k).trim();
+  if (!s || !kk) return false;
+  if (s === kk) return false;                        // 假翻译：译文与原文一字不差
+  if (!/[\u4e00-\u9fff]/.test(s)) return false;      // 译文里一个汉字都没有（内联判据：本函数自包含，不引 CJK）
+  if (/^["'“”‘’]/.test(kk)) return true;             // 原文以引号开头（功能名句式）：放行
+  // 整值被引号/括号壳包住 → 壳，拒（原文自带方括号的不算，见 [HP] bar → [血量]条；
+  // 花括号不算壳 —— {{otherMod}} … {{thisMod}} 这类占位符开头的译文是合法的）
+  if (s.length >= 2 && /^["'“”‘’\[(]/.test(s) && /["'“”‘’\])]$/.test(s)) return false;
+  // 占位符必须一个不少（写法差异宽容：{{ count }} 与 {{count}} 算同一个 ——
+  // 只对齐内容、不比对空格；pack 里两种写法都有，严格按字面比对会误杀好条目）
+  const holesOf = (t) => (String(t).match(/\{\{\s*[^{}\s][^{}]*?\s*\}\}/g) || [])
+    .map((h) => '{{' + h.slice(2, -2).replace(/\s+/g, '') + '}}').sort().join('\u0001');
+  if (holesOf(kk) !== holesOf(s)) return false;
+  // 伪标签编号必须一致
+  const it = (kk.match(/<i\d+>/g) || []).sort().join(',');
+  const iv = (s.match(/<i\d+>/g) || []).sort().join(',');
+  if (it !== iv) return false;
+  // 弯引号不配对（未安装 “X 这种半句）
+  const lq = (s.match(/[“‘]/g) || []).length, rq = (s.match(/[”’]/g) || []).length;
+  if (lq !== rq) return false;
+  // BBCode 同一标签重复出现 = 拼接坏的痕迹（缺失[br][/br][br][/br]）
+  const tc = {};
+  for (const t of (s.match(/\[[^\]]+\]/g) || [])) { const l = t.toLowerCase(); tc[l] = (tc[l] || 0) + 1; }
+  for (const n of Object.values(tc)) if (n >= 2) return false;
+  return true;
+      };
+
+// 用户点过「清空缓存」后别再灌种子（同版本内生效；跨版本升级照样灌 ——
+// 升级时清空正是为了扔旧译文，塞回来等于没清）。
+// （下一行的缩进是 audit2 组 2 的区间切片标记，勿动）
+      const seedSkip = () => {
+  const s = readJson(SEED_SKIP_PATH, null);
+  return !!(s && (!s.ver || s.ver === extVerOf()));
+};
+
 let React = null;
 let contextRef = null;
 let va = null;
+// 自动翻译钩子：init 阶段 context.api 还没就绪，Vortex 会拒绝（"extension uses api in
+// init function"），偏偏 onStateChange 是**静默失效**——不报错、监听器也不挂上。
+// 0.16.3 实测：日志里 "auto translate scheduled" 一次都没出现过，等于这个开关从生下来就是死的。
+// 所以这里只存函数，真正 onStateChange 挪到 autostart 段（api 可用后）。
+let autoHookRef = null;
+let autoHookBound = false;
 // 默认配置：新用户没有 config.json 时也能开箱即用（否则 enabled undefined 会被「已在设置中关闭」拦截）
 const DEFAULT_CFG = {
   enabled: true,
@@ -46,14 +108,49 @@ const DEFAULT_CFG = {
   collectMode: false,
   domTranslate: true,
   translateAttrs: true,
+  domWriteNames: true,   // DOM 层贴模组名缓存译文的总开关（false = 整档回退 step2 行为）
   terms: [],
 };
 let cfg = JSON.parse(JSON.stringify(DEFAULT_CFG));
 let cache = {};
 let domCache = {};
 let failCache = {};
+let nameFail = {};    // 模组名 give-up 记账：键 → {n, ts, model}（试满 NAME_FAIL_MAX 不再烧模型）
+let wordCache = {};   // 词级补翻词表：英文词 → 中文（跨会话，落在数据目录）
+/** 词级固定译名（0.16.3 续 18）：官方中文译名不许模型猜。
+ *  实测三条「半中半英」全出在这一层 ——
+ *    `GwentCardSwap 1.3`      → `Gwent卡牌交换模组`   （驼峰词被当专名照抄）
+ *    `Summon and Mount Roach` → `召唤并骑乘roach…`    （模型自己写成小写，躲过残留检测）
+ *    `Auto Apply Oils Reborn` → `自动应用 Oils 重生…`  （4 字母词被 `<5` 门槛跳过）
+ *  这里只在启动时并进 wordCache，`refineByWords` 命中即零模型替换。
+ *  大小写必须逐条列：wordCache 查表是大小写敏感的（`roach` ≠ `Roach`）。
+ *  注意：这张表**不能**放进 config.json —— 老用户的配置文件已存在，加进去也不会生效。 */
+const WORD_FIXES = {
+  Gwent: '昆特牌', gwent: '昆特牌',
+  Roach: '萝卜', roach: '萝卜',
+  Oils: '剑油', oils: '剑油', Oil: '剑油', oil: '剑油',
+  // 巫师 3 五法印：全是 4~5 字母，正好卡在旧的「≥5 字符」盲区上
+  Igni: '伊格尼', igni: '伊格尼',
+  Quen: '昆恩', quen: '昆恩',
+  Aard: '阿尔德', aard: '阿尔德',
+  Yrden: '亚登', yrden: '亚登',
+  Axii: '亚克席', axii: '亚克席',
+  // 主要人物官方译名（模型有时给「杰洛特」，有时照抄 Geralt）
+  Geralt: '杰洛特', geralt: '杰洛特',
+  Yennefer: '叶奈法', yennefer: '叶奈法',
+  Ciri: '希里', ciri: '希里',
+  Triss: '特莉丝', triss: '特莉丝',
+  Dandelion: '丹德里恩', dandelion: '丹德里恩',
+  // 通用模组后缀（高频，模型有时翻「重生」有时照抄 Reborn）
+  Reborn: '重生', reborn: '重生',
+  // 版别短语：原 EDITION_PHRASES 唯一条目（审计 ③ 死链拆除后挪到这里走遮蔽通道）。
+  // 词级补翻（refineByWords 逐词查表）用不上短语键 —— 残留词拆分后是 ULTRA / Plus
+  // 各查各的；短语键只服务 wordFixTerms 的整词遮蔽（fuzzy gi，大小写都能中）。
+  'ULTRA Plus': '超强版',
+};
 let termExact = null;
 let gameKeep = [];      // 明确保持英文的名字（gamenames-keep.json）
+let keepNameSet = new Set();  // 同上，小写集合（residueWords 判「品牌词不算残留」用）
 let runtimeTerms = null; // 游戏名对照表（运行时，绝不写回 config.json）
 let domStarted = false;  // DOM 层是否已启动（它是一次性注入的，启停不对称）
 let startDomRef = null;  // 由 main() 赋值的启动函数，供设置页「打开实时翻译」时补启
@@ -99,7 +196,13 @@ function useDataDir(dir) {
   COLLECT_PATH = path.join(dir, 'collected.json');
   FAIL_PATH = path.join(dir, 'failCache.json');
   LOG_PATH = path.join(dir, 'translator.log');
+  // 换了日志文件就必须让轮转计数重新 stat —— 否则 logBytes 还记着上一个目录那个文件的
+  // 体积：新目录的日志可能才几 KB 就被判超 1MB 白轮转一次，或者反过来早已几 MB 却永不轮转。
+  logBytes = -1;
   SEED_SKIP_PATH = path.join(dir, 'seed-skip.json');
+  NAME_FAIL_PATH = path.join(dir, 'nameFail.json');
+  WORD_PATH = path.join(dir, 'wordCache.json');
+  USER_KEEP_PATH = path.join(dir, 'userKeep.json');
   try { fs.mkdirSync(dir, { recursive: true }); } catch (e) { /* ignore */ }
 }
 
@@ -107,7 +210,7 @@ function useDataDir(dir) {
 function migrateFromExtDir() {
   if (DATA_DIR === EXT_DIR) return 0;
   let n = 0;
-  for (const name of ['config.json', 'cache.json', 'domCache.json', 'collected.json', 'failCache.json']) {
+  for (const name of ['config.json', 'cache.json', 'domCache.json', 'collected.json', 'failCache.json', 'nameFail.json', 'wordCache.json', 'userKeep.json']) {
     const dest = path.join(DATA_DIR, name);
     const src = path.join(EXT_DIR, name);
     try {
@@ -126,11 +229,1393 @@ function migrateFromExtDir() {
  *  Vortex 的 known 游戏名里有 13 个把空格写成了制表符（"Fallout://tNew Vegas"），
  *  不归一化的话 termExact 精确查表永远落空。 */
 function normKey(s) {
-  return String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
+  // 先剥零宽再折叠空白：'10\u200b mod\u200b updates' 要归一成 '10 mod updates'，
+  // 而 \s 不认零宽字符，顺序反了会留下粘住的词。
+  // 零宽字面量与 dom-translator.js 的 ZW_RE 必须逐字符一致（namepaste 组 9 对拍）；
+  // 这里刻意内联而不引用模块级常量 —— 测试沙箱只抽函数，引用外部变量会 ReferenceError。
+  return String(s == null ? '' : s).replace(/[\u200b-\u200d\u2060\ufeff]/g, '').replace(/\s+/g, ' ').trim();
 }
 
 function extVerOf() {
   try { return (JSON.parse(fs.readFileSync(path.join(EXT_DIR, 'info.json'), 'utf8')).version) || ''; } catch (e) { return ''; }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// 名字闸门全家桶（0.16.3 重建）
+//
+// 背景：Vortex 是 Electron，模组名是 DOM 文本节点实时渲染，没有更底层字库可换。
+// 下载页「未安装 / 同名另一版本」那行 UI 读 modInfo.nexus.fileInfo.name（英文），
+// 状态层写的 modInfo.name 界面根本不显示 → 那一行只能由实时层贴。
+//
+// 三条设计不变式（modname-namepaste-test.js 43 条钉住）：
+//   D1 单一缓存源：贴名的数据只来自 nameTranslationOf（cache.json），DOM 层不写 domCache
+//      —— 两个写者抢同一个位置的事故（step2 实录）不许重演；
+//   D2 精确对应：1.8 的行只拿 1.8 的译文，缓存只有 1.9 时 1.8 行保持英文，零跨版本兜底；
+//   D3 kill switch：cfg.domWriteNames === false 时一律不贴，可整档回退 step2 行为。
+// ═══════════════════════════════════════════════════════════════════════
+
+/** 剥掉块级序列化用的伪标签（<i1> / {{1}}），拿纯文本 */
+function stripPseudo(s) {
+  return String(s == null ? '' : s)
+    .replace(/<\/?i\d+>/g, '')
+    .replace(/\{\{\d+\}\}/g, '');
+}
+
+/** 名字用的纯文本：剥伪标签 + 空白折叠（normKey 与 DOM 侧 normText 同一口径） */
+function plainForName(s) {
+  return normKey(stripPseudo(s));
+}
+
+/** 界面显示名（可能已经是译文）——右键点到中文名时反查英文原名用 */
+function displayNameOf(mod) {
+  const a = (mod && mod.attributes) || {};
+  return String(a.customFileName || a.logicalFileName || a.name || a.modName || a.fileName || '').trim();
+}
+
+/** 译文里残留的英文词（没翻掉的部分）。
+ *  连续大写＝专名（UE4SS / SkyUI / REFramework / VAXIS）不算残留；
+ *  版本号（1.5 / v1.5 / 2023）不算；词库明确保留的（Vortex / Nexus Mods）不算；
+ *  split 不拆数字（`Ue4ss` 是一个词，拆成 Ue/ss 两个都不算残留就漏判了）；
+ *  只认「大写开头且 ≥5 字母」的词（0.16.3 续 13 阈值下调带出的两个误伤：
+ *    `v.1.5` 的 v + `Plus` 4 字母曾被当漏翻 → 整行反复重翻最后落定全英文；
+ *    `roach` 5 字符小写词曾被词级补翻成「蟑螂」——普通英文小写词不是模组名残留）。
+ *  反向边界照旧钉死：`Ue4ss`/`Gwent`（大写开头 5 字母）必须算残留，
+ *  `UE4SS`（连续大写）/`SkyUI` 放行。 */
+function residueWords(name) {
+  const s = String(name == null ? '' : name).replace(/_+/g, ' ');
+  const out = [];
+  const seen = new Set();
+  for (const w of s.split(/[^A-Za-z0-9]+/)) {
+    if (!w || w.length < 2) continue;
+    if (/^v?\d/i.test(w)) continue;                      // 版本号（v1.5 / 1.5 / 5.01）、fileId（913）
+    if (/[A-Z]{2,}/.test(w)) continue;                   // 连续大写＝专名（VAXIS / UE4SS / ULTRA）
+    if (w.length < 4) continue;                          // 最短 4：Oils / Quen / Igni / Aard / Axii 全在这一档
+    // 0.16.3 续 18：小写普通词不再是免检牌。`召唤并骑乘roach功能` 里的 roach 是模型
+    // 自己写成小写的（原文 Roach），旧规则 `!/^[A-Z]/ → continue` 让它彻底隐身 ——
+    // residue/modNameOk/healWorthy 三个判据全判「合格」，永远不会被救。
+    // 代价是英文虚词可能被当残留，用一张短词黑名单挡掉（约定俗成不翻的那批）。
+    if (/^(?:with|from|into|mod|mods|pack|plus|also|only|full|more|next|best|this|that|your|when|then|than|over|under)$/i.test(w)) continue;
+    const lw = w.toLowerCase();
+    if (keepNameSet && keepNameSet.has(lw)) continue;    // 品牌词保留英文
+    if (seen.has(lw)) continue;
+    seen.add(lw);
+    out.push(w);
+  }
+  return out;
+}
+
+// ---------- 品牌/工具名遮蔽（0.16.3 续 12：只信词库，结构推断默认关闭） ----------
+// 用户拍板（2026-10-25）：品牌/工具名只走词库 gamenames-keep.json（187 条，公开榜单来源），
+//   命中 → 遮蔽不翻、只翻剩下的字；未命中 → 全量翻译。词库外出口＝右键「这个名字保留英文」。
+// 结构推断 structuralBrandsOf 实测 31 个常见模组名命中 27 ＝ 87% 误伤
+//   （Better Combat Manager 保留 Combat、Weight Manager 保留 Weight），已用总开关关死；
+//   改回 true 之前必须重跑 probe-brand.js。
+// 遮罩不是「藏起来」：打成『固定译名』标记送模型，模型按提示词原样保留，译后原样还原
+//   （translate-core 的 applyTerms mask/unmask；『』内不参与后续匹配，防嵌套）。
+
+/** 多词工具尾的合法品牌头：只有这些头才配拆 Mod Manager（Weather Mod Manager 不拆 —— P2-a） */
+const BRAND_HEAD_COMMON = /^(?:fluffy|frosty|ultraplus)$/i;
+/** 工具尾（多词三个 + 单词六个）。多词分支仅当头是已知品牌头；单词分支要求头带驼峰或数字 */
+const BRAND_TAIL_COMMON = /^(?:mod\s+manager|mod\s+browser|mod\s+toolkit|manager|mods|tool|tools|loader|suite)$/i;
+/** 结构推断用的工具尾全集。probe-brand 27/31 误伤率依赖它不含 armor/water/storm/damage */
+const TOOL_TAIL_EN = /^(?:manager|mods|mod|modder|tool|tools|editor|merger|loader|launcher|patcher|generator|installer|updater|converter|compiler|injector|optimizer|cleaner|scanner|viewer|browser|wrapper|bridge|adapter|plugin|addon|extension|framework|library|studio|kit|suite|engine|extender|organizer|system|patch|swapper|distributor|helper)$/i;
+/** 中文工具尾：词级补翻时识别「已经翻成中文的尾巴」，不当成漏翻 residue */
+const TOOL_TAIL_ZH = /(?:管理器|管理工具|模组管理|模组管理器|工具|加载器|框架|插件|组件|套件|编辑器|优化器|补丁|修复|增强|扩展|合集|安装包|助手|引擎|系统|生成器|安装程序|更新程序|转换器|编译器|扫描器|查看器|浏览器|包装器|桥接|适配器|整理器|交换器|分发器|合并器)$/;
+/** 结构品牌推断总开关：87% 误伤率，默认关闭（只信词库） */
+const USE_STRUCTURAL_BRAND = false;
+
+/** 名字 → 遮罩规格。en 是要原样保留的部分（品牌头或整名），zh 恒等于 en。
+ *  后缀扫描，不做噪音正则：从第二个词起找工具尾 ——
+ *    ① 多词工具尾（Mod Manager / Mod Browser / Mod Toolkit）：仅当头是已知品牌头才拆，
+ *       真机长键（Fluffy Mod Manager 818 3.084 2026-09-22T08-00Z Ilz9HtdUr）扫描到
+ *       第一处多词尾就命中，fileId/版本/时间戳噪音天然被跳过；
+ *    ② 单词工具尾（Manager / Mods / Tool / Tools / Loader / Suite）：仅当头带驼峰或数字才拆，
+ *       Nexus Mods / Trophy Manager / Divine Tool / Frosty Tool Suite 一律整名；
+ *    ③ 尾巴不是工具名（Wrye Bash / Address Library / Script Merger）→ 整名。
+ *  自包含：只引用两个 BRAND 常量（测试沙箱按最小注入集抠函数，多一个自由变量就 ReferenceError）。 */
+function brandMaskSpec(name) {
+  const s = String(name == null ? '' : name).trim();
+  if (!s) return { en: '', zh: '' };
+  const words = s.split(/\s+/);
+  if (words.length >= 3) {
+    for (let i = 1; i <= words.length - 2; i++) {
+      if (BRAND_TAIL_COMMON.test(words[i] + ' ' + words[i + 1]) && BRAND_HEAD_COMMON.test(words.slice(0, i).join(' '))) {
+        const en = words.slice(0, i).join(' ');
+        return { en: en, zh: en };
+      }
+    }
+  }
+  if (words.length >= 2) {
+    for (let i = 1; i < words.length; i++) {
+      if (BRAND_TAIL_COMMON.test(words[i]) && /[a-z][A-Z]|\d/.test(words[0])) {
+        const en = words.slice(0, i).join(' ');
+        return { en: en, zh: en };
+      }
+    }
+  }
+  return { en: s, zh: s };
+}
+
+/** 与遮蔽粒度一致：返回这个名字里要原样保留的 token（品牌头或整名） */
+function brandTokenOf(name) {
+  return brandMaskSpec(name).en;
+}
+
+/** 精确匹配：整个名字就在保英文词库里（大小写不敏感） */
+function isKnownBrand(s) {
+  const t = String(s == null ? '' : s).trim().toLowerCase();
+  if (!t || !keepNameSet) return false;
+  return keepNameSet.has(t);
+}
+
+/** 名单名识别（容忍真机长键）：逐级缩短试词前缀，命中中间那份名单名 */
+function isKnownBrandName(s) {
+  const t = String(s == null ? '' : s).trim();
+  if (!t) return false;
+  if (isKnownBrand(t)) return true;
+  const words = t.split(/\s+/);
+  for (let n = words.length - 1; n >= 1; n--) {
+    if (isKnownBrand(words.slice(0, n).join(' '))) return true;
+  }
+  return false;
+}
+
+/** 这个名字里必须保留英文的品牌头（residueWords 豁免 / 词级补翻跳过用）。
+ *  只有词库名（含真机长键）才产出；普通模组名一律空 —— P2-a，
+ *  weight / weather / potion 不许因为长得像就被灌进白名单。 */
+function keptBrandsOf(name) {
+  const s = String(name == null ? '' : name).trim();
+  if (!s || !isKnownBrandName(s)) return [];
+  const spec = brandMaskSpec(s);
+  if (spec.en && spec.en !== s) return [spec.en];
+  const words = s.split(/\s+/);
+  for (let n = words.length; n >= 1; n--) {
+    const head = words.slice(0, n).join(' ');
+    if (isKnownBrand(head)) return [head];
+  }
+  return spec.en ? [spec.en] : [];
+}
+
+/** 把名单名的品牌头登记进 keepNameSet（residueWords 据此豁免，Fluffy 不会变残留）。
+ *  幂等；非名单名一律 no-op（Some Random Mod 1.2 / Wobbly Mod Manager 不登记）。 */
+function registerKeptBrands(name) {
+  const s = String(name == null ? '' : name).trim();
+  if (!s || !keepNameSet || !isKnownBrandName(s)) return;
+  const spec = brandMaskSpec(s);
+  if (spec.en) keepNameSet.add(spec.en.toLowerCase());
+}
+
+/** 结构品牌推断（这就是 87% 误伤率的来源，默认关闭）：
+ *  名字以通用工具尾结尾 → 把头当作品牌。probe-brand 31 样本命中 27 条全是普通词。
+ *  typeof 守卫：probe 沙箱不注入开关时仍走激进分支，否则直接 ReferenceError。 */
+function structuralBrandsOf(name) {
+  const s = String(name == null ? '' : name).trim();
+  if (!s) return [];
+  if (typeof USE_STRUCTURAL_BRAND !== 'undefined' && !USE_STRUCTURAL_BRAND) return [];
+  const words = s.split(/\s+/);
+  if (words.length < 2) return [];
+  for (let i = 1; i < words.length; i++) {
+    if (!BRAND_TAIL_COMMON.test(words.slice(i).join(' '))) continue;
+    const head = words.slice(0, i).join(' ');
+    if (head && !TOOL_TAIL_EN.test(head)) return [head];
+  }
+  return [];
+}
+
+/** 品牌遮蔽术语表：喂给 translate-core（brand:true 不计 40 条提示词上限 —— P2-e）。
+ *  词库整表 + 用户右键保留；整名不拆、名单名只出品牌头，去重后全部带 brand 标记。 */
+/** 固定译名**硬遮蔽**（2026-10-26 真机）：模型会把 `Roach` 翻成「蟑螂」、`Oils` 翻成
+ *  「油质」、`GwentCardSwap` 里的 Gwent 直接保留英文。翻错之后 `modNameOk` 还判它合格
+ *  —— 译文里没有英文残留了 —— 于是永久固化，`refineByWords` 也无从下手（它只换看得见的词）。
+ *  唯一可靠的办法：翻译前就把这些词遮成 `『萝卜』`，模型只能原样带回来，unmask 直接落地。
+ *  与品牌遮蔽（brandMaskTerms）的区别：品牌遮成**英文原名**，这里遮成**固定中文译名**。
+ *  `Oil` / `oil` 不进遮蔽：3 个字母，`Boil` / `Coil` / `Spoil` / `Soil` 全会被误遮；
+ *  它留在 WORD_FIXES 里给 refineByWords 用就够了（那条路是按词判定的）。 */
+/** 通用英文词（模型本来就会翻，长文本里裸送不会夹英文）：只进模组名遮蔽通道。
+ *  没有这道隔离，「Change engine oils regularly」会被遮成「更换发动机剑油」
+ *  （2026-10-26 本地模型 A/B 实测，wordfix-ui-test）。域内专名（法印/人物/Gwent/
+ *  Roach）绝不进这张表 —— 裸送 ui/html 必夹英文（Igni 与 Quen 实录）。 */
+const WORD_FIX_MOD_ONLY = new Set(['oils', 'reborn']);
+
+function wordFixTerms() {
+  const out = [];
+  const seen = new Set();
+  const skip = new Set(['oil']);
+  for (const en of Object.keys(WORD_FIXES)) {
+    const k = en.toLowerCase();
+    if (skip.has(k)) continue;
+    if (seen.has(k)) continue;      // Roach / roach 只留一条：fuzzy 是 gi 匹配，大小写都能中
+    seen.add(k);
+    out.push({ en, zh: WORD_FIXES[en], fuzzy: true, modOnly: WORD_FIX_MOD_ONLY.has(k) });
+  }
+  return out;
+}
+
+/** 词库版本戳：WORD_FIXES 遮蔽表内容的指纹（djb2）。表一变戳就变，
+ *  下次启动触发一次漂移对账（见 auditGlossaryDrift）。 */
+function glossaryStampOf(terms) {
+  const sig = (terms || []).map((t) => t.en + '→' + t.zh).sort().join('|');
+  let h = 5381;
+  for (let i = 0; i < sig.length; i++) h = ((h * 33) ^ sig.charCodeAt(i)) >>> 0;
+  // 'wfg2'：前缀带版本。v1 只写不验曾让「已落戳但收养回灌」的条目永久逃审，
+  // 改戳前缀强制全体用户重审一次；配合下方「有漂移不落戳」策略自收敛。
+  return 'wfg2' + h.toString(36);
+}
+
+/** 词库漂移对账（纯函数，零模型）：找出「译文缺固定译名」的缓存条目。
+ *  遮蔽是翻译时的硬保证——名字里含可遮蔽词，走词库后的译文**必然**含固定
+ *  译名（unmask 原样落地）。缺了 = 这条译文是词库定型/更新之前翻的
+ *  （词库前 Roach 被翻成「蟑螂」，结构合格、自愈判 ok，永远轮不到自动修，
+ *  只能用户右键重翻 —— 等于词库改进全靠手动，2026-10-26 用户点破）。
+ *  判据与遮蔽同源（同一个 applyTerms mask），绝不另写第二套边界规则。
+ *  只看值是中文的条目：保英文名条目值是英文，天然跳过；
+ *  Oil/oil 不在 wordFixTerms 里（防 Boil/Soil 误遮），自然也不参与对账。 */
+function auditGlossaryDrift(cache, terms, applyTermsFn, cjkRe) {
+  const stale = [];
+  let checked = 0;
+  if (!cache || typeof cache !== 'object') return { checked, stale };
+  for (const k of Object.keys(cache)) {
+    if (!k || k.charAt(0) === '_') continue;
+    const v = cache[k];
+    if (typeof v !== 'string' || !v || !cjkRe.test(v)) continue;
+    checked++;
+    const masked = String(applyTermsFn(k, terms, 'mask') || '');
+    const expects = (masked.match(/『([^』]+)』/g) || [])
+      .map((s) => s.slice(1, -1))
+      .filter((s, i, a) => a.indexOf(s) === i);
+    if (!expects.length) continue;
+    const missing = expects.filter((zh) => v.indexOf(zh) === -1);
+    if (missing.length) stale.push({ k: k, missing: missing.join('/') });
+  }
+  return { checked, stale };
+}
+
+/** 单条漂移判定（对账的复用入口，判据零分叉）：英文名 en 的中文译文 zh
+ *  是否缺「可遮蔽词的固定译名」。供状态层收养入口做闸——
+ *  2026-10-26 实录：对账删了漂移键，dl 收养又把状态层里同款旧译文灌回缓存，
+ *  自动翻译一看「有缓存」全跳过，修复等于没发生。 */
+function glossaryDrifted(en, zh) {
+  if (!en || !zh || typeof zh !== 'string' || !CJK.test(zh)) return false;
+  return auditGlossaryDrift({ [en]: zh }, wordFixTerms(), core.applyTerms, CJK).stale.length > 0;
+}
+
+function brandMaskTerms() {
+  const out = [];
+  const seen = new Set();
+  const names = (typeof gameKeep !== 'undefined' && Array.isArray(gameKeep) ? gameKeep.slice() : []);
+  if (typeof userKeepList === 'function') {
+    try {
+      for (const n of userKeepList()) names.push(n);
+    } catch (e) { /* 用户表读不到不影响词库部分 */ }
+  }
+  for (const n of names) {
+    if (typeof n !== 'string' || !n.trim()) continue;
+    const spec = brandMaskSpec(n);
+    if (!spec.en) continue;
+    const k = spec.en.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push({ en: spec.en, zh: spec.zh, brand: true });
+  }
+  return out;
+}
+
+/** 名字里出现的品牌词（cache 启动清洗用：品牌被硬译成中文的条目删掉重翻）。
+ *  全大写品牌（LOOT / UE4SS / HDT-SMP）大小写敏感 —— 否则 Boss 会命中 BOSS，
+ *  译文不含 BOSS → 每次启动删一次 → 死循环；其余大小写不敏感（模型爱改大小写）。
+ *  边界用显式 lookaround 不用 \b：下划线是 JS 词字符，UE4SS_v3.1.0 会漏匹配。 */
+function brandsInName(name) {
+  const s = String(name == null ? '' : name);
+  if (!s || typeof gameKeep === 'undefined' || !Array.isArray(gameKeep)) return [];
+  const out = [];
+  for (const n of gameKeep) {
+    if (typeof n !== 'string' || !n.trim()) continue;
+    const t = n.trim();
+    const letters = t.replace(/[^A-Za-z]/g, '');
+    const caps = letters.length >= 2 && letters === letters.toUpperCase();
+    const re = new RegExp('(?<![A-Za-z0-9])' + t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?![A-Za-z0-9])', caps ? '' : 'i');
+    if (re.test(s)) out.push(t);
+  }
+  return out;
+}
+
+/** 品牌被硬译：原文里的品牌词在译文里一个都不剩。
+ *  判据只对「原文确实含品牌词」成立——没有品牌词的条目永远返回 false，
+ *  不会误伤普通模组名。seed 质检与状态库清洗共用这一份（同一判据不许写两遍）。 */
+function brandLost(src, out) {
+  const brands = brandsInName(src);
+  if (!brands.length) return false;
+  const low = String(out == null ? '' : out).toLowerCase();
+  return !brands.some((t) => low.indexOf(String(t).toLowerCase()) !== -1);
+}
+
+/** 保英文词的大小写还原：模型爱把 UE4SS 抄成 Ue4ss，按英文原名的形态改回来。
+ *  只动 keep 表里的词；原文里没有对应形态的词不碰（普通英文词留给验收管）。 */
+function restoreKeepCase(en, zh) {
+  const src = String(en == null ? '' : en);
+  let out = String(zh == null ? '' : zh);
+  if (!src || !out || !keepNameSet) return out;
+  const canon = {};
+  for (const w of src.split(/[^A-Za-z0-9]+/)) {
+    if (!w || w.length < 2) continue;
+    canon[w.toLowerCase()] = w;
+  }
+  out = out.replace(/[A-Za-z][A-Za-z0-9]*/g, (m) => {
+    const lw = m.toLowerCase();
+    if (!keepNameSet.has(lw)) return m;
+    const c = canon[lw];
+    return c && c !== m ? c : m;
+  });
+  return out;
+}
+
+/** 重建保英文名单 + 装配品牌遮蔽术语。mergeRuntimeTerms 的唯一实现体，
+ *  启动 / 设置页保存 / 右键保留英文 三条路都收敛到这里（测试沙箱里它是空实现）。 */
+function rebuildKeepNames() {
+  keepNameSet = new Set(gameKeep.filter((x) => typeof x === 'string' && x.trim()).map((x) => x.trim().toLowerCase()));
+  // 约定俗成保留英文的短词（0.16.3 续 18）：它们不是漏翻，是本来就不翻。
+  // 放在这里而不是 gamenames-keep.json —— 那份是公开榜单来源，不该混进通用词。
+  for (const n of ['plus', 'ultra', 'nextgen', 'next gen', 'hd', 'dlc', 'mod', 'mods', 'pack', 'ui']) keepNameSet.add(n);
+  const userKept = (typeof userKeepList === 'function' ? userKeepList() : []).filter((x) => typeof x === 'string' && x.trim());
+  for (const n of userKept) keepNameSet.add(String(n).trim().toLowerCase());
+  for (const n of gameKeep.concat(userKept)) registerKeptBrands(n);
+  // P3-4：术语表里 zh===en 的条目是「保持英文」的另一种写法，也并进保英文名单
+  //（否则 refineByWords 会把 Vortex 这类词硬译成中文，与品牌遮蔽机制打架）
+  for (const t of (runtimeTerms || []).concat((cfg && cfg.terms) || [])) {
+    if (!t) continue;
+    const en = String(t.en || '').trim().toLowerCase();
+    const zh = String(t.zh || '').trim().toLowerCase();
+    if (zh === en) keepNameSet.add(en);
+  }
+  cfg.gameTerms = (runtimeTerms || []).concat(brandMaskTerms(), wordFixTerms());
+}
+
+/** 品牌被硬译的存量缓存清掉（「剑星 Vortex 扩展包 → 星辰之刃漩涡扩展模组」那批旧账）：
+ *  整名就是品牌的条目 —— 译文必须原样带着这个 token（大小写敏感，否则放过了 Ue4ss）；
+ *  名字里含品牌词的条目 —— 译文至少保住其中一个（大小写不敏感，模型爱改大小写）。
+ *  两条都不占的删掉，让自愈/重翻重来。 */
+function purgeBrandTranslations() {
+  let dropped = 0;
+  const byLower = new Map();
+  for (const n of (typeof gameKeep !== 'undefined' ? gameKeep : [])) {
+    if (typeof n === 'string' && n.trim()) byLower.set(n.trim().toLowerCase(), n.trim());
+  }
+  for (const k of Object.keys(cache)) {
+    if (!k || k.charAt(0) === '_') continue;
+    const v = cache[k];
+    if (typeof v !== 'string' || !CJK.test(v)) continue;
+    const orig = byLower.get(String(k).trim().toLowerCase());
+    if (orig) {
+      if (String(v).indexOf(brandTokenOf(orig)) !== -1) continue;
+    } else {
+      const brands = brandsInName(k);
+      if (!brands.length) continue;
+      const lowV = String(v).toLowerCase();
+      if (brands.some((t) => lowV.indexOf(t.toLowerCase()) !== -1)) continue;
+    }
+    delete cache[k];
+    dropped++;
+  }
+  if (dropped) {
+    if (saveJson(CACHE_PATH, cache, 'brand cache purge')) log('info', 'brand cache purged', { n: dropped });
+  }
+}
+
+/** `<游戏名> Vortex Extension` → `<游戏官方译名> Vortex 扩展包`（零模型，审计 v4 #5）。
+ *
+ *  为什么不能交给模型：Vortex 扩展包的显示名就是这个形态，整句送翻会被自由发挥 ——
+ *  实测「Stellar Blade Vortex Extension」→「恒星之刃：漩涡扩展包」：国内译名「剑星」
+ *  丢了、品牌词 Vortex 被硬翻成「漩涡」。这不是模型差，是名字本身不该整句送翻：
+ *  它的结构是 `<游戏名> + Vortex Extension`，游戏译名词库里现成有 746 条。
+ *  这里直接按词库拼，写进 cache.json，让 DOM 贴名通道（fileStemOf 剥尾巴 → 查表）能命中。
+ *
+ *  幂等：已有合格译文的不动；游戏名查不到词库的不动（交回原逻辑）。
+ *  返回补种条数。 */
+function seedExtensionNames(state) {
+  const st = state || (contextRef.api && contextRef.api.getState ? contextRef.api.getState() : null);
+  if (!st || !termExact) return 0;
+  const seen = new Set();
+  const grab = (v) => {
+    const s = String(v == null ? '' : v).trim();
+    if (!s || s.length > 120) return;
+    if (!/\bvortex\s+extension$/i.test(s)) return;
+    if (CJK.test(s)) return;                    // 已经是中文 → 不是要补的
+    seen.add(s);
+  };
+  try {
+    const modsRoot = ((st.persistent || {}).mods) || {};
+    for (const g of Object.keys(modsRoot)) {
+      const table = modsRoot[g] || {};
+      for (const id of Object.keys(table)) {
+        const a = (table[id] || {}).attributes || {};
+        grab(a.customFileName); grab(a.logicalFileName); grab(a.name);
+      }
+    }
+  } catch (e) { /* 状态树形状变了也不影响下载侧 */ }
+  try {
+    const files = (((st.persistent || {}).downloads) || {}).files || {};
+    for (const id of Object.keys(files)) {
+      const mi = (files[id] || {}).modInfo || {};
+      grab(mi.name);
+      grab((((mi.nexus || {}).fileInfo) || {}).name);
+    }
+  } catch (e) { /* ignore */ }
+  let n = 0;
+  for (const en of seen) {
+    const cur = String(nameCacheOf(en) == null ? '' : nameCacheOf(en)).trim();
+    // 「<游戏名> Vortex Extension」：左端必须非空，右端必须是 extension 整词
+    const m = en.match(/^(.+?)[\s:：\-–—]+vortex\s+extension$/i);
+    if (!m) continue;
+    const game = String(m[1]).trim();
+    if (!game) continue;
+    let zh = '';
+    try { zh = termExact.get(normKey(game).toLowerCase()) || ''; } catch (e) { zh = ''; }
+    if (!zh || !CJK.test(zh)) continue;         // 词库查不到游戏译名 → 不拼（不猜）
+    // 词库里 `inZOI` 写成 `inZOI (云族裔)`，已经带原文了就直接接，不再补一遍英文
+    const out = zh + ' Vortex 扩展包';
+    if (out.length > 80) continue;
+    // 已有译文里带着游戏官方译名 → 认为可接受，不动（尊重人工/模型的结果）。
+    // 否则强制覆盖：纯中文的坏译文（`恒星之刃：漩涡扩展包`）在 residueWords 眼里
+    // 「没有英文残留」＝ 合格，modNameOk 拦不住它 —— 这正是审计 v4 P1-1 那条漏网。
+    if (cur === out || (cur && cur.indexOf(zh) >= 0)) continue;
+    const ckSeed = cacheKeyOf(en);
+    // cacheKeyOf 拒绝中文/空键时返回 ''，此时不写（写出 '' 键等于制造一条永远读不到的垃圾）
+    if (ckSeed) cache[ckSeed] = out;
+    n++;
+  }
+  if (n > 0) {
+    if (saveJson(CACHE_PATH, cache, 'extension names seed')) log('info', 'extension names seeded', { n });
+  }
+  return n;
+}
+
+/** 缓存死账通道（0.16.3 续 18）——专治「半中半英」里最难的那一类。
+ *  死角长这样：状态层（modInfo.fileInfo.name / customFileName）**还是英文**，
+ *  译文只存在于 cache.json，而 cache.json 里那条就是坏的。三个通道全都够不着：
+ *    ① healStale* 系列：第一行 `if (!CJK.test(cur)) continue` —— 状态是英文，直接跳过；
+ *    ② 批量重翻：`needsTranslate` 要求「纯英文」才送模型，状态是英文但缓存有译文，
+ *       DOM 直接贴缓存，模型永远拿不到这条；
+ *    ③ refineByWords：只吃中文显示串，而这条在状态层不存在中文。
+ *  结果就是永久固化（实测 `Gwent卡牌交换模组 1.3版` / `召唤并骑乘roach…`）。
+ *
+ *  判据三层，全部零模型：
+ *    a) 译文含汉字，且 residueWords 非空；
+ *    b) modNameOk 判不合格；
+ *    c) 残留词必须在**英文原键里出现过**（大小写不敏感）—— 源感知，杜绝
+ *       「模型故意保留的英文」被误删（`Plus` / `ULTRA` 这类不在键里就动都不动）。
+ *  能靠 wordCache 修的直接改；修不了且属于重伤（`badlyUnfinished`）的删掉让模型重来；
+ *  轻伤修不了的留着不动 —— 删掉只会让界面退回英文，比半中半英更糟。 */
+async function healStaleCacheEntries() {
+  // ① 脏键清理：含 ISO 日期戳的缓存键一定是「状态键被当原名」的产物，
+  // 正常模组名不会有 `2026-10-03T17-14Z`。这类键的译文必然是「把 fileId、更新日期、
+  // 随机 id 一起翻进中文」的垃圾，而且会通过 nameCacheOf 反过来盖掉干净键的译文
+  // （2026-10-26 真机：`Clean Water` 和 `Clean Water 13392 1 2026-10-03T17-14Z …`
+  // 两份键同时存在，界面上赢的是脏的那份）。先清掉，后面的判据才有干净基准。
+  let dirtyKeys = 0;
+  for (const k of Object.keys(cache)) {
+    if (!k || k.charAt(0) === '_') continue;
+    if (!/\d\d\d\d-\d\d-\d\dT\d\d[-:]\d\d/.test(k)) continue;
+    delete cache[k];
+    dirtyKeys++;
+  }
+  if (dirtyKeys > 0) {
+    if (saveJson(CACHE_PATH, cache, 'dirty cache keys drop')) log('info', 'dirty cache keys dropped', { n: dirtyKeys });
+  }
+  // 键压平后做子串匹配：`GwentCardSwap 1.3` → `gwentcardswap13`，能对上残留词 `Gwent`。
+  // 按空格分词是不行的 —— 驼峰词 `GwentCardSwap` 切不出 `gwent`（实测漏掉这一条）。
+  const flatKey = (en) => String(en == null ? '' : en).toLowerCase().replace(/[^a-z0-9]+/g, '');
+  const hits = [];
+  for (const k of Object.keys(cache)) {
+    if (!k || k.charAt(0) === '_') continue;
+    const v = cache[k];
+    if (typeof v !== 'string' || !v || !CJK.test(v)) continue;
+    const res = residueWords(v);
+    if (!res.length) continue;
+    if (modNameOk(v)) continue;
+    const flat = flatKey(k);
+    if (!res.some((w) => flat.indexOf(String(w).toLowerCase()) >= 0)) continue;  // 源里没有 → 不是漏翻
+    hits.push(k);
+  }
+  if (!hits.length) return dirtyKeys;
+  let fixed = 0;
+  let dropped = 0;
+  for (const k of hits) {
+    const before = cache[k];
+    let after = before;
+    try { after = await refineByWords(before); } catch (e) { after = before; }
+    if (after && after !== before && modNameOk(after)) {
+      cache[k] = after;
+      fixed++;
+      log('info', 'stale cache fixed', { key: k, from: before, to: after });
+    } else if (badlyUnfinished(before)) {
+      delete cache[k];
+      dropped++;
+      log('info', 'stale cache dropped', { key: k, was: before });
+    }
+  }
+  if (fixed || dropped) {
+    saveJson(CACHE_PATH, cache, 'stale cache drop');
+  }
+  log('info', 'stale cache healed', { seen: hits.length, fixed, dropped, dirtyKeys });
+  return fixed + dropped + dirtyKeys;
+}
+
+/** 状态库清洗：品牌词被硬译进显示名（`蓬松模组管理器`）的条目还原成英文原名。
+ *  为什么必须单独做一次：customFileName 是**存进去的死文本**，品牌遮蔽只保护「新翻译」
+ *  那一条路；当年还没有词库时写进状态的坏译文不会自己变回来，界面就一直显示它，
+ *  看上去像「词库没生效」。判据用 brandLost（品牌词一个不剩）；合格译文
+ *  （`Fluffy 模组管理器`）品牌词还在，不动。
+ *  还原值是英文原名而不是本地拼装：宁可直接显示英文，也不给一个半对半错的缝合名。 */
+function restoreBrandNames(state) {
+  const modsRoot = ((state || {}).persistent || {}).mods || {};
+  let n = 0;
+  for (const gameId of Object.keys(modsRoot)) {
+    const table = modsRoot[gameId] || {};
+    for (const modId of Object.keys(table)) {
+      const mod = table[modId];
+      if (!mod) continue;
+      const a = mod.attributes || {};
+      const cur = String(a.customFileName || '').trim();
+      if (!cur || !CJK.test(cur)) continue;              // 已经是英文/空的不用管
+      let en = '';
+      try {
+        const list = englishBaseNameOf(mod, modId);
+        en = (Array.isArray(list) && list[0]) || '';
+      } catch (e) { en = ''; }
+      if (!en || CJK.test(en)) continue;
+      if (!brandLost(en, cur)) continue;
+      if (dispatch('customFileName', gameId, modId, en)) {
+        n++;
+        log('info', 'brand name restored', {
+          modId: String(modId).slice(0, 40), from: cur.slice(0, 40), to: en.slice(0, 40),
+        });
+      }
+    }
+  }
+  return n;
+}
+
+// ---------- 名字译文验收（三规则 + 半成品拦截） ----------
+// 目标不是「翻得完美」，是「坏结果不落地」：不达标的译文不写状态、不贴屏，
+// 最坏结局是保持英文原文（Vortex 天然状态，零危害）。
+// R1 译文里必须真的翻成了中文（整串照抄英文 = 拒）
+// R2 用引号把整串包起来、又没多翻几个字的缝合怪 = 拒（实测 `“GwentCardSwap 1.3”版本`）
+// R3 原文照抄 + ≤2 个汉字凑数 = 拒（同 R2 家族，引号变体之外的兜底）
+// R4 译文残留 ≥12 字符长英文串且原文里也有它 = 拒（半拉子，如 `ModSkillSlotPages 重制版 1.8`；
+//    短词不算 —— `Half Done 重制版 3.0` 这种放行）
+// 双模：两参＝「原文 vs 译文」对判；单参＝自判「这个显示名本身是不是合格译文」
+//   （healWorthy / 一键重翻的判据 / 测试契约全是单参）。单参时 src 取 zh 自身，
+//   跳过「译文=原文」守卫，R2/R3/R4 全部退化成自比较，再补一条残留规则（见下）。
+// 这是全项目唯一一份验收实现：nameAcceptable / cacheLooksDone 都只是它的别名，
+// 不许再抄第二份（同一判据两份实现的亏，0.16.3 吃过）。
+function modNameOk(raw, out) {
+  const single = out === undefined;
+  const src = String(raw == null ? '' : raw).trim();
+  const zh = single ? src : String(out == null ? '' : out).trim();
+  if (!src || !zh) return false;
+  if (!single && zh === src) return false;
+  if (!CJK.test(zh)) return false; // R1
+  // 注意：两个正则都要以 `(` 开头 —— 测试沙箱的源码抽取器不认「空格后接正则」，
+  // 会把字符类里的引号当成字符串起点，切片直接越界（实测 modNameOk 被抽成 522 行）。
+  if ((/^[“”"'‘'「『《]/.test(zh)) && (/[””"'’'」』》]$/.test(zh)) && zh.length <= src.length + 6) return false; // R2
+  const asciiOf = (s) => (String(s).match(/[A-Za-z0-9._]+/g) || []).join('');
+  const aSrc = asciiOf(src);
+  const aZh = asciiOf(zh);
+  const cjkN = (zh.match(/[\u4e00-\u9fa5\u3400-\u4dbf]/g) || []).length; // 必须带 g：非全局 match 只回第一个
+  // R3 只在两参模式生效：单参自判时 src 就是 zh，「原文照抄 + ≤2 汉字凑数」退化成
+  // 「≤2 汉字就拒」，会把 `样例42` 这种合法短译名误杀（probe 组 6 实录）——
+  // 单参模式下真有照抄残留由下面的残留规则管（Remastered版 / Gwent卡牌12 都拦得住）。
+  if (!single && aSrc && aZh.length >= aSrc.length * 0.9 && cjkN <= 2) return false; // R3
+  const runs = zh.match(/[A-Za-z][A-Za-z0-9._]{11,}/g) || [];
+  if (runs.some((r) => src.indexOf(r) !== -1)) return false; // R4
+  // 单参自判的补充规则：残留英文词里有「真词」（≥4 字母）就不算翻好。
+  //   'VAXIS血迹物理效果v1.5.zip' 的 zip（3 字母）放行 —— 文件尾巴不是漏翻；
+  //   'Wobbly 模组管理器' 的 Wobbly、'缺失的Gwent卡牌…' 的 Gwent 拒
+  //   （0.16.3 续 12：未登记品牌词照常算残留，出口是右键「这个名字保留英文」）。
+  //   专名（连续大写）/版本号/词库保留词 residueWords 已经滤掉，这里只管剩下的。
+  if (single) {
+    for (const w of residueWords(zh)) if (w.length >= 4) return false;
+  }
+  return true;
+}
+
+/** 兼容名（applyTranslation 等老调用点 + accept-test 沙箱）——别在这里抄规则 */
+function nameAcceptable(raw, out) {
+  return modNameOk(raw, out);
+}
+
+/** 缓存译文验收：贴屏/自愈/查表前的同一道闸（D1：贴名的数据也必须过验收）。
+ *  双模（与 modNameOk 同思路）：两参 = 「原文 vs 译文」对判；
+ *  单参 = 自判「这个值本身是不是完整译文」—— 半拉子 `ModSettings 重制版 1.0`
+ *  两参能过（ASCII 占比低），单参过不了（有残留词），而查表/自愈要的是后者。 */
+function cacheLooksDone(raw, zh) {
+  const single = zh === undefined;
+  const v = single ? String(raw == null ? '' : raw).trim() : String(zh == null ? '' : zh).trim();
+  if (!v || !CJK.test(v)) return false;
+  return single ? modNameOk(v) : modNameOk(raw, v);
+}
+
+/** 一对 (原文, 译文) 的判定 + 理由（日志/诊断用）。双模：
+ *   两参 = 「原文 vs 译文」对判（老行为，回 {ok, reason}）；
+ *   单参 = 自判「这个显示名本身是不是合格译文」（回理由串 —— 探针复本与
+ *   hit.judge 都用它：nameJudge(zh) === 'ok' 是「状态层这行翻好了」的唯一口径，
+ *   再各写一份判据必然漂移，0.16.3 已经吃过两次）。 */
+function nameJudge(raw, zh) {
+  const single = zh === undefined;
+  const src = String(raw == null ? '' : raw).trim();
+  const out = single ? src : String(zh == null ? '' : zh).trim();
+  const bad = (reason) => (single ? reason : { ok: false, reason });
+  if (!src || !out) return bad('empty');
+  if (!single && out === src) return bad('same');
+  if (!CJK.test(out)) return bad('no-cjk');
+  if (!(single ? modNameOk(src) : modNameOk(src, out))) return bad('unfinished');
+  return single ? 'ok' : { ok: true, reason: 'ok' };
+}
+
+// ---------- 状态层签名表（nameGate 的数据源） ----------
+// 10 秒 TTL：Vortex 状态树在高频重写（下载进度），每轮全扫太贵；
+// 但模组装卸又要尽快反映，10 秒是「界面响应」与「CPU」之间的折中。
+//
+// 三条通道（按优先级）：
+//   ① byShort 精确：plainForName 全等（下划线保留 —— 下载行的 DOM 文本常带
+//      `SomeUniqueName_Here` 这种原样文件名，归一成空格就查不到）；
+//   ② 同族：文本 token ⊆ 条目 token 且文本含该条目一个长「族特征词」
+//      （≥10 字母；单 token 文本要求 ≥12 —— `审判之眼：死神的遗言 Remastered`
+//      这种「中文名 + 通用词 Remastered」实测会被子集规则误杀，6165 条 pack.json
+//      全量预演钉死的边界）。版本号不算 token，所以 1.8 的行能命中 1.9 的条目；
+//   ③ 什么都不沾 → 不是名字（界面文案绝大多数死在这一步，且不遍历 items）。
+//
+// 单 token 名（UE4SS / REFramework）只走①：签名通道对它们没有意义，
+// 短词进同族通道就是误伤（`UE4SS Proxy`、`Hair Color` 都是这么来的）。
+//
+// bySig / re 只是给观测探针（modname-probe-test）用的复本：按「同族不同版本
+// 共享签名」把 items 归组，生产代码只读 byShort/longIdx，re 懒构建零成本。
+//
+// 所有助手一律内联为局部闭包：测试沙箱只抽列出的函数，引用没被抽的模块级
+// 助手会 ReferenceError，再被 nameGate 的 try/catch 吞成「闸门不命中」。
+let nameProbeCache = null;
+let nameProbeAt = 0;
+let nameProbeLogged = false;
+
+function nameProbeIndex(state) {
+  const now = Date.now();
+  if (nameProbeCache && now - nameProbeAt < 10000) return nameProbeCache;
+  const items = [];
+  const seen = new Set();
+  // 名字用纯文本：剥伪标签 + 空白折叠（与 plainForName 同口径，保留下划线）
+  const shortOf = (s) => plainForName(String(s == null ? '' : s)).toLowerCase();
+  // 归一化：下划线当空格（token 切分用），版本号/时间戳尾巴由调用方处理
+  const normOf = (s) => shortOf(s).replace(/_+/g, ' ').replace(/\s+/g, ' ').trim();
+  const toksOf = (s) => {
+    const out = [];
+    for (const w of normOf(s).split(/[^a-z0-9]+/)) {
+      if (!w) continue;
+      if (/^v?\d+(\.\d+)*[a-z]?$/i.test(w)) continue;   // 版本号不进 token
+      out.push(w);
+    }
+    return out;
+  };
+  // mods 表键 `<名字> <fileId> <版本> <时间戳> <随机id>`：属性里没有英文名时
+  // （合集 / 无属性模组）按时间戳锚定剥出名字（名字本身可含空格）。
+  const nameFromModKey = (key) => {
+    const parts = String(key == null ? '' : key).trim().split(/\s+/);
+    for (let i = parts.length - 1; i >= 0; i--) {
+      if (/^\d\d\d\d-\d\d-\d\dT[\d:Z.-]+$/i.test(parts[i])) return parts.slice(0, Math.max(0, i - 2)).join(' ');
+    }
+    return parts.slice(0, Math.max(1, parts.length - 2)).join(' ');
+  };
+  // 下载文件名 → 族基名：唯一实现是 dom-translator 的 fileStemOf（S-1 合并）。
+  // 以前这里有一份自己的循环正则，两处判据双向不一致：
+  //   剥不掉空格分隔的尾巴（`名字 版本 版本-日期-hash.zip` 整串进签名表）
+  //   反过来把 `1.2.3.zip` 剥成 `1`、`a1b2c3d4e5f6.zip` 原样返回当名字。
+  // requireArchive:false —— 下载记录的 fileName 不一定带 .zip 后缀（手动装的目录）。
+  // 沙箱注不到 domTranslator 时退化为「只去后缀」，宁可少剥也不能抛（见文件头沙箱约定）。
+  // ★守卫必须写成 `typeof domTranslator !== 'undefined'`：裸写 `domTranslator && …`
+  //   在 new Function 沙箱里是 ReferenceError（typeof 的豁免只对 typeof 形式有效），
+  //   会被 catch 吞掉 → 静默退化成兜底，测试测的就不是真实现（0.16.3 续17 踩过）。
+  const fileBaseName = (fn) => {
+    const raw = String(fn == null ? '' : fn).trim();
+    if (!raw) return '';
+    if (typeof domTranslator !== 'undefined' && domTranslator
+      && typeof domTranslator.fileStemOf === 'function') {
+      try {
+        const stem = String(domTranslator.fileStemOf(raw, { requireArchive: false }) || '');
+        if (stem) return stem;
+      } catch (e) { /* 退化到下面 */ }
+    }
+    return raw.replace(/\.(zip|7z|rar)$/i, '').trim();
+  };
+  // zh = 状态层现值（displayNameOf / modInfo.name），judge/state 都取它
+  const push = (en, kind, ref, zh) => {
+    const s = String(en == null ? '' : en).trim();
+    if (!s || s.length < 3 || s.length > 200) return;
+    const lw = s.toLowerCase();
+    if (seen.has(lw)) return;
+    seen.add(lw);
+    items.push({ en: s, kind, ref, zh: String(zh == null ? '' : zh).trim(), norm: normOf(s), toks: toksOf(s) });
+  };
+  try {
+    const modsRoot = ((state || {}).persistent || {}).mods || {};
+    for (const gameId of Object.keys(modsRoot)) {
+      const table = modsRoot[gameId] || {};
+      for (const modId of Object.keys(table)) {
+        const mod = table[modId] || {};
+        const ref = { gameId, modId };
+        const a = mod.attributes || {};
+        // englishBaseNameOf 返候选数组（originalName / logicalFileName / 键派生…）；
+        // 全部进签名表——DOM 文本可能是其中任何一个形态（实测下载行带下划线原名）。
+        const ens = englishBaseNameOf(mod, modId) || [];
+        const list = (Array.isArray(ens) ? ens : [ens]).map((s) => String(s == null ? '' : s).trim()).filter(Boolean);
+        const en = list[0] || nameFromModKey(modId);
+        const disp = String(displayNameOf(mod) || '').trim();
+        push(en, mod.type === 'collection' ? 'collection' : 'mod', ref, disp);
+        for (const c of list) push(c, mod.type === 'collection' ? 'collection' : 'mod', ref, disp);
+        const lf = String(a.logicalFileName || '').trim();
+        if (lf && lf.toLowerCase() !== en.toLowerCase()) push(lf, 'mod', ref, disp);
+      }
+    }
+    // 下载记录：P1-a —— 判据字段是 nexus.fileInfo.name，签名表必须同源，
+    // 否则「状态层已是中文 → 被 CJK 判据丢弃 → 闸门假 → 贴名路走不到 →
+    // 退通用文本路写 domCache（违反 D1）」。
+    // modInfo.name 与 fileInfo.name 都推 'download'（probe 组 3：只有 modInfo.name
+    // 的记录也必须是 download）；fileName 剥名后推 'download-file'。
+    const files = (((state || {}).persistent || {}).downloads || {}).files || {};
+    for (const dlId of Object.keys(files)) {
+      const d = files[dlId] || {};
+      const mi = d.modInfo || {};
+      const ref = { dlId };
+      const fi = String((mi.nexus && mi.nexus.fileInfo && mi.nexus.fileInfo.name) || '').trim();
+      const mn = String(mi.name || '').trim();
+      const disp = mn || fi;
+      if (fi) push(fi, 'download', ref, disp);
+      if (mn) push(mn, 'download', ref, mn);
+      if (d.fileName) {
+        const base = fileBaseName(d.fileName);
+        if (base) push(base, 'download-file', ref, disp);
+      }
+    }
+  } catch (e) {
+    if (!nameProbeLogged) { nameProbeLogged = true; log('warn', 'name probe failed', { err: String(e && e.message || e) }); }
+  }
+  // ── 通道索引 ──
+  const byShort = new Map();   // plain 全等（保留下划线）→ items[]
+  const bySig = new Map();     // 族签名（版本无关）→ items[]（探针复本用）
+  const shortExact = new Set();// 单 token 名的 plain 全等集合（短名护栏）
+  const longIdx = new Map();   // ≥10 字母 token → items[]（同族反查）
+  const sigAdd = (map, key, it) => {
+    if (!key) return;
+    const k = key.toLowerCase();
+    const arr = map.get(k);
+    if (arr) { if (arr.indexOf(it) < 0) arr.push(it); } else map.set(k, [it]);
+  };
+  // 短名全等通道：整名（单 token）入表要过「含数字或驼峰」门 ——
+  // `Hair`/`Body`/`Map` 这种 4 字母普通词进去，界面文案整句就被判成名字不翻了；
+  // 长名（≥8 字母）直接进，`UE4SS` 靠数字进，`SkyUI` 靠驼峰进。
+  const addShort = (flat, item) => { shortExact.add(String(flat).toLowerCase()); };
+  for (const item of items) {
+    const arr = byShort.get(item.norm);
+    if (arr) { if (arr.indexOf(item) < 0) arr.push(item); } else byShort.set(item.norm, [item]);
+    if (item.toks.length === 1) {
+      const flat = item.en;
+      if (flat.length >= 8) addShort(flat, item);
+      if (flat.length < 8 && (/\d/.test(flat) || /[a-z][A-Z]/.test(flat))) addShort(flat, item);
+      // 单 token 只有长名才进签名：`Remastered`（10 字母）这种通用词进去，
+      // 「Remastered Edition Notes」整句就被探针复本判成名字（probe 组 4a）
+      if (item.toks[0].length >= 12) sigAdd(bySig, item.norm, item);
+    } else {
+      sigAdd(bySig, item.norm, item);
+      const tj = item.toks.join(' ');
+      if (tj && tj !== item.norm) sigAdd(bySig, tj, item);
+      // 前缀签名：含 ≥10 字母 token 的前缀（同族共享，探针复本按最长者取代表）
+      for (let i = 1; i < item.toks.length; i++) {
+        const pre = item.toks.slice(0, i);
+        if (pre.some((w) => w.length >= 10)) sigAdd(bySig, pre.join(' '), item);
+      }
+    }
+    for (const tk of item.toks) if (tk.length >= 10) {
+      const la = longIdx.get(tk);
+      if (la) { if (la.indexOf(item) < 0) la.push(item); } else longIdx.set(tk, [item]);
+    }
+  }
+  const findBest = (text) => {
+    const s = plainForName(String(text == null ? '' : text));
+    if (!s) return null;
+    const shortHits = byShort.get(s.toLowerCase());
+    if (shortHits && shortHits.length) return { it: shortHits[0], cands: shortHits.length };
+    const tt = toksOf(s);
+    if (!tt.length) return null;
+    const tset = new Set(tt);
+    const pool = [];
+    for (const tk of tset) {
+      if (tk.length < 10) continue;
+      const arr = longIdx.get(tk);
+      if (!arr) continue;
+      for (const c of arr) if (pool.indexOf(c) < 0) pool.push(c);
+    }
+    let best = null;
+    let n = 0;
+    for (const c of pool) {
+      let sub = true;
+      for (const x of tset) if (c.toks.indexOf(x) < 0) { sub = false; break; }
+      if (!sub) continue;
+      // 单 token 文本只认 ≥12 字母的长名（中文名 + 通用词尾巴放行）
+      if (tt.length < 2 && tt[0].length < 12) continue;
+      n++;
+      if (!best || c.en.length > best.en.length) best = c;
+    }
+    return best ? { it: best, cands: n } : null;
+  };
+  const isName = (s) => findBest(s) !== null;
+  const match = (text) => {
+    const r = findBest(text);
+    if (!r) return null;
+    return { en: r.it.en, kind: r.it.kind, isName: true, judge: nameJudge(r.it.zh), state: r.it.zh, cands: r.cands, ref: r.it.ref };
+  };
+  const idx = { items, isName, match, bySig, byShort, shortExact, re: null };
+  // re 懒构建：只有探针复本读它，生产零成本；空签名表回 null（gate2 组 8 钉住）
+  Object.defineProperty(idx, 're', {
+    enumerable: false,
+    get() {
+      if (idx.__re === undefined) {
+        const keys = Array.from(bySig.keys()).sort((a, b) => b.length - a.length);
+        idx.__re = keys.length
+          ? new RegExp('(?<![A-Za-z0-9])(' + keys.map((k) => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')(?![A-Za-z0-9])', 'i')
+          : null;
+      }
+      return idx.__re;
+    },
+  });
+  nameProbeCache = idx;
+  nameProbeAt = now;
+  return nameProbeCache;
+}
+
+/** 闸门：这段 DOM 文本是不是一个模组名（→ 走贴名路，不进模型、不写 domCache）。
+ *  恒返 {hit, epoch}：hit = {en, kind, isName, judge, state, cands, ref} 或 null。
+ *  F1（续14）：`<游戏名> Vortex Extension` 是扩展显示名不是模组名（同名不同物），
+ *  拦下来反而一个写者都没有（cache.json 无此键 → 不贴；prune 又删 domCache →
+ *  永久英文），必须放行去送模型。 */
+function nameGate(text) {
+  const t = String(text == null ? '' : text).trim();
+  let idx = null;
+  try { idx = nameProbeIndex(contextRef.api.getState()); } catch (e) { idx = null; }
+  if (!t || t.length < 3 || t.length > 200) return { hit: null, epoch: nameProbeAt };
+  if (/\bvortex\s+extension$/i.test(t)) return { hit: null, epoch: nameProbeAt };
+  let hit = null;
+  if (idx) { try { hit = idx.match(t); } catch (e) { hit = null; } }
+  return { hit, epoch: nameProbeAt };
+}
+
+// ---------- 名字查译文（状态层 cache.json 是唯一名字译文源，D1） ----------
+// 精确键 → 归一化键（空白折叠，10 秒 TTL 索引）→ cacheLooksDone 验收；查不到返回 null。
+// DOM 层拿到 null 就按老行为走（没有译文就不贴），绝不为此送模型。
+let nameNormIdx = null;
+let nameNormIdxAt = 0;
+// 索引 TTL 刻意声明在这个区间里：dlname/namepaste 的测试沙箱按「let nameNormIdx」
+// 到「badlyUnfinished」整段切片，常量写在区间外它们会 ReferenceError；
+// 而 audit2/refresh/audit4 各自在前缀里声明了同名常量 + 只抽函数声明，不会重复。
+const NAME_NORM_IDX_TTL = 10000;
+function nameTranslationOf(text) {
+  const t = String(text == null ? '' : text).trim();
+  if (!t || !cache) return null;
+  // 字典一律走 hasOwnProperty：普通对象的 cache['toString'] 会把函数当译文写进页面
+  const direct = (k) => (k && Object.prototype.hasOwnProperty.call(cache, k) ? cache[k] : undefined);
+  let v = direct(t);
+  const now = Date.now();
+  const idxOf = () => {
+    if (!nameNormIdx || now - nameNormIdxAt > 10000) {
+      nameNormIdx = new Map();
+      for (const k of Object.keys(cache)) nameNormIdx.set(normKey(k), k);
+      nameNormIdxAt = now;
+    }
+    return nameNormIdx;
+  };
+  // ② 归一化键（空白折叠）
+  if (v === undefined) {
+    const k2 = idxOf().get(normKey(t));
+    if (k2 !== undefined) v = cache[k2];
+  }
+  // ③ 规范键 —— **必须在 normKey 之后补这一级**。
+  //    写侧（applyTranslation / applyDownloadTranslation / 下载补缓存）一律用
+  //    `canonicalName` 存键：`SwordFXRemaster` → `Sword FXRemaster`，
+  //    `ModSettingsMenuFix` → `Mod Settings Menu Fix`，`VAXIS_B_x.zip` → `VAXIS B x`。
+  //    而屏幕上是**原串**（驼峰连写、下划线、带 .zip）。读侧以前只做 ①②，
+  //    这两种形态 normKey 都归不到一起 → 键明明在缓存里却查不到，
+  //    表现就是「已卸载行、下载行永远是英文」。
+  //    这是 P-NAME-05 的直接原因：不是没翻，是读了不算。
+  if (v === undefined && typeof canonicalName === 'function') {
+    const ck = canonicalName(t);
+    if (ck && ck !== t) {
+      v = direct(ck);
+      if (v === undefined) {
+        const k3 = idxOf().get(normKey(ck));
+        if (k3 !== undefined) v = cache[k3];
+      }
+    }
+  }
+  if (typeof v !== 'string' || !v || v === t) return null;
+  if (!cacheLooksDone(t, v)) return null;
+  return v;
+}
+
+/** 归一化索引（10 秒 TTL）：normKey(k) → k。贴名/自愈/重翻共用同一份。 */
+function nameNormIndex() {
+  const now = Date.now();
+  if (!nameNormIdx || now - nameNormIdxAt > NAME_NORM_IDX_TTL) {
+    nameNormIdx = new Map();
+    for (const k of Object.keys(cache)) nameNormIdx.set(normKey(k), k);
+    nameNormIdxAt = now;
+  }
+  return nameNormIdx;
+}
+
+/** 脏键清洗：`VAXIS_Blood_Physics_v1.5.zip` → `VAXIS Blood Physics v1.5`
+ *  （下载行/本地文件名的形态与缓存键差一个后缀和下划线，不清就永远查不到）。 */
+function cleanKeyForm(raw) {
+  let s = String(raw == null ? '' : raw).trim();
+  if (!s) return '';
+  s = s.replace(/\.(zip|7z|rar)$/i, '');
+  s = s.replace(/_+/g, ' ');
+  return normKey(s);
+}
+
+/** 规范名字键 —— **唯一**的名字身份算法。
+ *
+ *  缓存键、送模型的 raw、失败记账键、DOM 查询用的键，全部由它算出来。
+ *  为什么要收成一个：Vortex 给同一个模组存了 7 个名字字段
+ *  （customFileName / logicalFileName / name / originalName / fileName / modName / 表键），
+ *  形态各不相同（整串键 `Clean Water 13392 1 2026-10-03T17-14Z GpMW8t9md`、带 .zip、
+ *  下划线、驼峰）。0.16.3 之前每个环节各自决定用哪个字段、各自清洗一次，
+ *  于是只要两处口径不一致就出 bug ——
+ *    ① 送模型用整串     → 模型把 fileId/日期/hash 翻进中文（元数据污染）
+ *    ② 写缓存用干净骨架、查询用整串 → 清空缓存重翻后界面查不到，停在英文
+ *    ③ 失败不记账       → 翻不过的条目每次收集都重来（无限重试）
+ *  这三个是同一个病，只是从三个地方冒出来。
+ *
+ *  与 cleanKeyForm 的分工（**别合并**）：
+ *    cleanKeyForm 只剥后缀 / 下划线换空格 / 折叠空白，它被
+ *    `versionTailOf(cleanKeyForm(raw))` 依赖来取版本尾巴 —— 往里加剥日期，
+ *    「借同族译文」的版本精确判断立刻失效（D2 红线）。
+ *    canonicalName 才是「这个名字的身份」，可以把整串键彻底剥干净。
+ *
+ *  正则不用 {n} 量词：测试沙箱按花括号配平切函数体。 */
+function canonicalName(text) {
+  let s = String(text == null ? '' : text);
+  // 零宽字符先去掉，再把空白折叠成单空格
+  s = s.replace(/[\u200b-\u200d\u2060\ufeff]/g, '').replace(/\s+/g, ' ').trim();
+  if (!s) return '';
+  // 压缩包后缀不是名字。**必须支持出现在中间**：
+  // `VAXIS_Blood_Physics_v1.4.zip 13506 1.4 2026-10-07T20-54Z hw6Xp1` 这形态是
+  // 下载行的标准键（Vortex 直接把 localPath 里的文件名当名字），只剥行尾就剩个
+  // `.zip` 卡在中间，与缓存键 `VAXIS Blood Physics v1.4` 永远对不上（v9 组 3 实测）。
+  s = s.replace(/\.(zip|7z|rar)(?![A-Za-z0-9])/gi, ' ').replace(/\s+/g, ' ').trim();
+  // `<名字> <fileId> <版本> <日期T时-分Z> <hash>`：日期戳锚定，
+  // 切掉它前面的「fileId + 版本」两段、以及它之后的全部。
+  // 名字自带的版本（`ModSkillSlotPages Remaster 1.7a`、`Enemy Scaling Offset 1.2.0`）
+  // 在名字段里，不受影响。
+  const at = s.search(/\d\d\d\d-\d\d-\d\dT\d\d[-:]\d\d/);
+  if (at > 0) {
+    const seg = s.slice(0, at).trim().split(' ').filter(Boolean);
+    if (seg.length >= 3) s = seg.slice(0, seg.length - 2).join(' ');
+  }
+  // 下划线是文件名的分词符，不是名字的一部分
+  s = s.replace(/_+/g, ' ');
+  // 驼峰拆词：ModSkillSlotPages → Mod Skill Slot Pages。
+  // **只在小写字母后接大写处拆**（不含数字）：`UE4SS` 这种「缩写+数字+缩写」的
+  // 专名一旦按数字后接大写拆成 `UE4 SS`，模型就敢把 SS 翻成别的词
+  // （2026-10-26 端到端演练实测：UE4SS 被拆坏，它还是保英文名单里的条目）。
+  // 同理 REFramework / CWSO / VAXIS / UE5 全部原样保留。
+  s = s.replace(/([a-z])([A-Z])/g, '$1 $2');
+  return s.replace(/\s+/g, ' ').trim();
+}
+
+/** 缓存键一次性规范化（升级迁移）。**不做这个，改键就是一次事故**：
+ *  读/写/删三侧现在都按 canonicalName 取键，而旧 cache.json 里是原串键
+ *  （`ModSkillSlotPages Remaster 1.7a`、`Clean Water 13392 1 2026-…`）。
+ *  不迁移 → 升级后所有旧译文突然查不到 → 界面整体退回英文，
+ *  用户看到的现象跟「缓存被清空」一模一样，只会被当成模型坏了（0.16.3 反复复发的坑）。
+ *  冲突（两个旧键规范化后重合）时保留先到的非空译文，绝不合并拼接。
+ *  返回改名的键数；只在 >0 时由调用方落盘。 */
+function normalizeCacheKeys(dict) {
+  if (!dict || typeof dict !== 'object') return 0;
+  const keys = Object.keys(dict);
+  let n = 0;
+  for (const k of keys) {
+    if (!Object.prototype.hasOwnProperty.call(dict, k)) continue;
+    if (!k || k.charAt(0) === '_') continue;        // 元信息键（_ver 之类）不是名字
+    if (/^[a-z]+:/.test(k)) continue;               // sh:/dl: 前缀键装的是显示名，不许归一化
+    const ck = typeof cacheKeyOf === 'function' ? cacheKeyOf(k) : k;
+    if (!ck || ck === k) continue;
+    const v = dict[k];
+    const has = Object.prototype.hasOwnProperty.call(dict, ck);
+    const prev = has ? dict[ck] : undefined;
+    const pv = typeof prev === 'string' ? prev.trim() : '';
+    const nv = typeof v === 'string' ? v.trim() : '';
+    if (!has || (!pv && nv)) dict[ck] = v;
+    delete dict[k];
+    n++;
+  }
+  return n;
+}
+
+/** 缓存写入键 = 规范键。所有 `cache[...] = 译文` 都必须经这里，
+ *  这样「写」和 `nameCacheOf` 的「读」永远是同一个算法算出来的键。
+ *
+ *  ★ 返回 `''` = **拒绝写入**（空键 / 中文键）。调用方必须判空，直接
+ *  `cache[cacheKeyOf(x)] = y` 会在 x 是中文时写出一个 `''` 键，同样是垃圾。
+ *
+ *  为什么中文键必须拒绝（2026-10-26 审查反馈 #2，二次污染入口）：
+ *  cache 的键必须是**英文原名**。读侧 `nameTranslationOf` 查中文时取到的是自己
+ *  （v === t），会按「没翻」返回 null —— 所以中文键永远贴不上屏，纯占地方。
+ *  更危险的是它会重开「键不对称」那个事故：`downloadTargetOf` 在
+ *  `fileInfo.name` 缺失时 base 会退化成中文显示名（`base = en && !CJK.test(en) ? en : disp`），
+ *  那一支以前会把「中→中」写进缓存。中文键一旦混进来，读侧第三级的
+ *  `canonicalName` 对中文不做拆词，键照样对不上 —— 下一次「同源」事故从这里进。 */
+function cacheKeyOf(text) {
+  const raw = String(text == null ? '' : text).trim();
+  if (!raw) return '';
+  let key = raw;
+  if (typeof canonicalName === 'function') {
+    const c = canonicalName(raw);
+    if (c) key = c;
+  }
+  // CJK 正则用 typeof 守卫：audit2 / v9 的老沙箱只抽了本函数、没注 CJK 常量。
+  const cjk = typeof CJK !== 'undefined' ? CJK : /[\u4e00-\u9fa5\u3400-\u4dbf]/;
+  if (cjk.test(key)) return '';
+  return key;
+}
+
+/** 缓存删除键 = 规范键 + 原串键。删除是读写之外的**第三个**入口，
+ *  必须和 `cacheKeyOf` / `nameCacheOf` 用同一套算法 —— 它们三者一起才是
+ *  「单一缓存源」。漏了删除侧就是 0.16.3 那个「还原为英文点了没反应」：
+ *  写进去的是规范键 `Clean Water`，删除删的是原串键 `Clean Water 13392 1 …`，
+ *  规范键原封不动 → 重启 8 秒后 applyCachedSilently 又按缓存把中文贴回去。
+ *  返回删掉的条数。沙箱里没注 cacheKeyOf 时自动退化成精确键删除（老行为）。 */
+function dropTranslation(text) {
+  const t = String(text == null ? '' : text).trim();
+  if (!t || !cache) return 0;
+  const ck = typeof cacheKeyOf === 'function' ? cacheKeyOf(t) : t;
+  const keys = ck && ck !== t ? [ck, t] : [t];
+  let n = 0;
+  for (const k of keys) {
+    if (k && Object.prototype.hasOwnProperty.call(cache, k)) { delete cache[k]; n++; }
+  }
+  return n;
+}
+
+/** 名字缓存统一入口（P1-3）：四处入口（自愈/重翻/下载收集/启动套缓存）都走它。
+ *  查找序：**规范键** → 原串精确键（旧缓存兼容）→ 清洗键（去后缀/下划线）→ 归一化索引。
+ *  值必须本身是合格译文（单参自判）—— 闸门上线前写进去的半拉子
+ *  （`ModSettings 重制版 1.0`）有键也不当译文，走模型重翻（dlname 组 4）。
+ *  刻意不建缓存索引的模块级依赖：refresh/audit4 沙箱抽它时没注 nameNormIndex。 */
+function nameCacheOf(raw) {
+  const t = String(raw == null ? '' : raw).trim();
+  if (!t || !cache) return null;
+  let v;
+  // ① 规范键 —— 主路径。所有写入口（applyTranslation / applyDownloadTranslation /
+  //    healStaleDisplayNames）都按 canonicalName 存，查询必须用同一个算法，
+  //    否则「写进去查不到」= 清空缓存重翻后界面停在英文（2026-10-26 端到端演练 25/30）。
+  //    typeof 守卫：refresh/audit4 的老沙箱只抽了本函数，没注 canonicalName。
+  if (typeof canonicalName === 'function') {
+    const ck = canonicalName(t);
+    if (ck && Object.prototype.hasOwnProperty.call(cache, ck)) v = cache[ck];
+  }
+  // ② 原串精确键（旧缓存兼容；沙箱没有 canonicalName 时这就是主路径）
+  if (v === undefined && Object.prototype.hasOwnProperty.call(cache, t)) v = cache[t];
+  // ③ 清洗键（去后缀 / 下划线换空格 / 折叠空白）
+  if (v === undefined) {
+    const clean = cleanKeyForm(t);
+    if (clean && clean !== t && Object.prototype.hasOwnProperty.call(cache, clean)) v = cache[clean];
+  }
+  if (v === undefined) {
+    // 归一化兜底：只差空白/零宽的键（10 秒 TTL 索引，勿退化成线性扫 ——
+    // 下载收集对每条记录都调本函数，5195 条 × 几千键就是上亿次 normKey）。
+    // typeof 守卫：refresh/audit4 的沙箱只抽了部分函数，没注 nameNormIndex；
+    // 生产里它一定在（就在本函数上方声明）。
+    if (typeof nameNormIndex === 'function') {
+      const k2 = nameNormIndex().get(normKey(t));
+      if (k2 !== undefined) v = cache[k2];
+    }
+  }
+  if (typeof v !== 'string' || !v) return null;
+  if (!cacheLooksDone(v)) return null;   // 单参自判：半拉子不当译文
+  return v;
+}
+
+// ---------- F2：domCache 里的模组名条目必须清掉（D1 单一缓存源） ----------
+// 名字的译文只在 cache.json；domCache 里出现模组名条目，说明旧版本/旧路径写过它，
+// 留着就有两个写者抢同一个位置。启动时清一遍。
+// 扩展名（<游戏名> Vortex Extension）不是模组名：状态层从不管它，译文只能来自 domCache，
+// 一旦被当模组名删掉就永久英文（续14 实录：一次启动删掉 3 条）→ 豁免必须排在
+// isName 判定**之前**，排在后面等于没跳过。
+function pruneDomCacheNames() {
+  let idx = null;
+  try { idx = nameProbeIndex(contextRef.api.getState()); } catch (e) { return 0; }
+  if (!idx || !idx.items.length) {
+    // 状态树还没加载好（启动竞态，常态）：一条都不删，安排一次有界重试。
+    // 没有这一轮就是「prune 空跑 → domCache 里的名字条目活到下次重启」，
+    // 而它们正是双写者（D1）的源头。上限 6 次 × 5 秒，防死循环。
+    if (domCachePruneTries < 6) {
+      domCachePruneTries++;
+      try {
+        setTimeout(() => { try { pruneDomCacheNames(); } catch (e) {} }, 5000);
+      } catch (e) {}
+    }
+    return 0;
+  }
+  domCachePruneTries = 0;   // 状态就绪：重置计数（之后每次调用都能再重试）
+  let gone = 0;
+  for (const k of Object.keys(domCache)) {
+    if (k === '_ver') continue;
+    const plain = plainForName(k);
+    if (!plain) continue;
+    // F2 豁免（必须排在 isName 之前）：`<游戏名> Vortex Extension` 这类扩展显示名。
+    // 用户机上装了**同名**的扩展包 mod，签名表里有同一串 → isName 判真 →
+    // prune 会把扩展名的译文当模组名删掉，而扩展名的译文只有 domCache 一个来源
+    // （状态层从不管扩展显示名），删掉就是永久英文。
+    // 0.16.3 续17：再加「剥尾形态」—— 下载行整串文件名剥出骨架后也可能是它。
+    if (/\bvortex\s+extension$/i.test(plain)) continue;
+    if (typeof domTranslator !== 'undefined' && domTranslator
+      && typeof domTranslator.fileStemOf === 'function') {
+      try {
+        const stem = String(domTranslator.fileStemOf(plain) || '');
+        if (stem && /\bvortex\s+extension$/i.test(stem)) continue;
+      } catch (e) { /* 剥不出来 → 按原逻辑走 */ }
+    }
+    if (!idx.isName(plain)) continue;
+    delete domCache[k];
+    gone++;
+  }
+  if (gone > 0) {
+    if (saveJson(DOM_CACHE_PATH, domCache, 'dom cache prune')) log('info', 'pruned mod names from dom cache', { n: gone });
+  }
+  return gone;
+}
+
+// ---------- F4：同族多版本的译文统一（骨架 + 本条版本号） ----------
+// 一个模组分 1.7a / 1.8 / 1.9 多行时，各行的译文必须是同一骨架 + 各自版本号，
+// 否则用户看到同一个模组三四种叫法。红线：**取不到版本尾巴就绝不覆盖** ——
+// `CWSO 1.4.9 (Asi)` 这种以括号结尾的，旧代码拿同族骨架（1.4.5）整句盖回来，
+// cache 里两条键值变得一字不差（「宁可不统一，绝不跨版本覆盖」）。
+function versionTailOf(s) {
+  const t = String(s == null ? '' : s).trim();
+  const m = t.match(/(?:^|[\s_\-–—(（])(v?\d+(?:\.\d+)*[a-z]?)$/i);
+  return m ? m[1] : '';
+}
+
+/** 族特征 token（版本号不算）：`Mod X 1.8` 与 `Mod X 1.9` 同族 */
+function familyTokens(name) {
+  const out = [];
+  for (const w of String(name == null ? '' : name).replace(/_+/g, ' ').split(/[^A-Za-z0-9]+/)) {
+    if (!w) continue;
+    if (/^v?\d+(\.\d+)*[a-z]?$/i.test(w)) continue;
+    out.push(w.toLowerCase());
+  }
+  return out;
+}
+
+function sameFamily(a, b) {
+  const fa = familyTokens(a);
+  const fb = familyTokens(b);
+  if (!fa.length || fa.length !== fb.length) return false;
+  for (let i = 0; i < fa.length; i++) if (fa[i] !== fb[i]) return false;
+  return true;
+}
+
+/** 译文去皮：砍掉尾巴上的版本号（`模组技能槽页面重制版1.9` → `模组技能槽页面重制版`）。
+ *  先剥「数字紧跟 版本」形态的冗余后缀（`灵敏移动1.7.1版本` → `灵敏移动1.7.1`，
+ *  否则同族骨架分裂成三种、多数派统一失效 —— audit2 组 1 实录）；
+ *  只认数字在前的形态，`显示历史版本` 这种正文咬不到。 */
+function nameSkin(zh) {
+  return String(zh == null ? '' : zh).trim()
+    .replace(/(v?\d+(?:\.\d+)*[a-z]?)(?:版本|version)$/i, '$1')
+    .replace(/v?\d+(?:\.\d+)*[a-z]?$/i, '')
+    .trim();
+}
+
+/** 同族多版本译名统一（audit2 组 1 钉死四条）：
+ *  ① 译文尾巴上冗余的「版本」后缀归零（原文没有 version 字样时）——
+ *     `灵敏移动1.7.1版本` → `灵敏移动1.7.1`；只认「数字紧跟 版本」的形态，
+ *     防 `显示历史版本` 这种把正文咬掉的情况；
+ *  ② 同族缓存译文骨架唯一 → 拉回多数派（`响应式移动1.7.0` → `灵敏移动1.7.0`）；
+ *  ③ 骨架冲突（≥2 种译法）→ 一个字都不动（不猜）；
+ *  ④ 无同族 → 只做①。
+ *  红线照旧：取不到版本尾巴就绝不覆盖（`CWSO 1.4.9 (Asi)` 以括号结尾，宁可不统一）。
+ *  只能引用 cache/CJK/keepNameSet + 下面几个助手：audit2 组 1 的沙箱只注了这些。 */
+function unifyFamilyName(raw, out) {
+  const src = String(raw == null ? '' : raw).trim();
+  const orig = String(out == null ? '' : out).trim();
+  if (!src || !orig) return out;
+  let zh = orig;
+  const ver = versionTailOf(src);
+  // 红线：取不到版本尾巴就绝不覆盖（CWSO 1.4.9 (Asi) 以括号结尾，宁可不统一）
+  if (!ver) return out;
+  // ① 「版本」后缀归零（原文自己没有 version 字样时，译文尾巴上那个是冗余的）
+  if (!/version|版本/i.test(src)) {
+    const m = zh.match(/(v?\d+(?:\.\d+)*[a-z]?)(?:版本|version)$/i);
+    if (m) zh = zh.slice(0, m.index) + m[1];
+  }
+  // ② 同族骨架统一
+  {
+    const tok0 = (familyTokens(src)[0] || '').toLowerCase();
+    const skins = [];
+    const seenSkin = new Set();
+    if (tok0) {
+      for (const k of Object.keys(cache)) {
+        // 廉价预筛：同族要求首 token 相同，先比前缀再走 sameFamily（免去每个键的数组分配）
+        if (k.toLowerCase().indexOf(tok0) !== 0) continue;
+        if (!sameFamily(src, k)) continue;
+        // 骨架来源必须是完整译文：半拉子（'ModSettings 重制版 1.0'）的骨架会把
+        // 好译文往沟里带（dlname 组 4 实录：统一后英文词又回到译文里）
+        const val = String(cache[k] == null ? '' : cache[k]).trim();
+        if (!val || !modNameOk(val)) continue;
+        const sk = nameSkin(val);
+        if (!sk || seenSkin.has(sk)) continue;
+        seenSkin.add(sk);
+        skins.push(sk);
+      }
+    }
+    if (skins.length === 1) {
+      const unified = skins[0] + ver;
+      // 拼出来还得过验收：拼坏了就原样返回，绝不为了统一写出更差的结果
+      if (unified !== zh && modNameOk(src, unified)) zh = unified;
+    }
+    // 骨架冲突（≥2 种）→ 不动（不猜）
+  }
+  return zh === orig ? out : zh;
+}
+
+/** 残留 ≥12 字符：重伤档（自愈时可以用更激进的手段） */
+function badlyUnfinished(display) {
+  const res = residueWords(display);
+  let n = 0;
+  for (const w of res) n += w.length;
+  return n >= 12;
+}
+/** 自愈门槛（P1-c）：轻伤也要救，但轻伤只准词级补翻，绝不拿缓存里另一份译文整句覆盖
+ *  （整句覆盖就是「剑星 Vortex 扩展包 → 星辰之刃漩涡扩展模组」事故的来源）。 */
+function healWorthy(display) {
+  const d = String(display == null ? '' : display).trim();
+  if (!d || !CJK.test(d)) return false;
+  const res = residueWords(d);
+  if (!res.length) return false;
+  let n = 0;
+  for (const w of res) n += w.length;
+  // 显示名本身已经是合格译文 → 不用救（单参自判；两参 (d,d) 会恒假，那是死代码）
+  if (modNameOk(d)) return false;
+  // 门槛 5 → 4（0.16.3 续 18）：residueWords 的最短词现在是 4 字符，
+  // 而 modNameOk 早就在 `w.length >= 4` 上判不合格 —— 两边不同源会让
+  // 「Oils」这类 4 字母残留处于「判不合格但永远不去救」的僵持态。
+  return badlyUnfinished(d) || n >= 4;
+}
+
+/** DOM 层探针：这个显示名是不是「翻了一半」的（供日志/后续词级补翻）。
+ *  口径与状态层同一份 residueWords，参数序 (raw, display) 与 gate2 组 3 一致，
+ *  返布尔（测试契约：=== true / === false 严格比较）。
+ *  残留检查排在 modNameOk 之前：`胸部丰满的胖 Ashley` 这种人名漏翻，
+ *  modNameOk 两参判它「合格」（R3 只拦 ASCII 占比高的），但残留口径必须拒 ——
+ *  「该翻没翻」与「翻得好不好」是两个问题，这里只问前者。 */
+function unfinishedName(raw, display) {
+  const d = String(display == null ? '' : display).trim();
+  if (!d || !CJK.test(d)) return false;
+  return residueWords(d).length > 0;
+}
+
+// ---------- 名字右键菜单的两个动作 ----------
+// 「保留此英文」：名字进 userKeep.json（跨会话），状态层已翻的还原成英文原名。
+// let 而不是 const：useDataDir 换数据目录时要跟着重算（升级不丢靠的就是它在数据目录）
+let USER_KEEP_PATH = path.join(DATA_DIR, 'userKeep.json');
+let userKeepLoaded = false;
+let userKeepArr = [];
+let keepEnSetRef = null;
+function userKeepList() {
+  if (!userKeepLoaded) {
+    userKeepArr = (readJson(USER_KEEP_PATH, {}) || {}).names || [];
+    userKeepLoaded = true;
+  }
+  return userKeepArr;
+}
+function keepNameEn(text) {
+  let t = String(text == null ? '' : text).trim();
+  if (!t) return { kept: false, restored: 0 };
+  // 屏幕上点到的可能是中文译文：反查回英文原名再记（记中文没有意义）
+  const nk0 = normKey(t);
+  if (!Object.keys(cache).some((k) => normKey(k) === nk0)) {
+    const back = Object.keys(cache).find((k) => normKey(String(cache[k])) === nk0);
+    if (back) t = back;
+  }
+  const list = userKeepList();
+  if (!list.includes(t)) list.push(t);
+  saveJson(USER_KEEP_PATH, { ver: extVerOf(), at: Date.now(), names: list }, 'userKeep add');
+  if (keepEnSetRef) keepEnSetRef.add(t);
+  // 新保留的名字要立刻进 keepNameSet（residueWords 豁免）和品牌遮蔽术语（整名不翻）
+  try {
+    mergeRuntimeTerms(); // 重新算遮蔽表
+  } catch (e) { log('warn', 'rebuild keep names fail', String(e)); }
+  let restored = 0;
+  try {
+    const state = contextRef.api.getState();
+    const modsRoot = (state.persistent || {}).mods || {};
+    for (const gameId of Object.keys(modsRoot)) {
+      const mods = modsRoot[gameId] || {};
+      for (const modId of Object.keys(mods)) {
+        const mod = mods[modId];
+        if (!mod) continue;
+        if (normKey(rawNameOf(mod)) !== normKey(t)) continue;
+        const a = mod.attributes || {};
+        if (a.originalName) { dispatch('customFileName', gameId, modId, a.originalName); restored++; }
+      }
+    }
+  } catch (e) { log('error', 'keepName restore', String(e)); }
+  // 删除走统一算法 dropTranslation（cacheKeyOf）：normKey 比对对不上规范键 ——
+  // 右键传进来的是下载行显示串 VAXIS_Blood_Physics_v1.5.zip，缓存键是规范键（审计 ①）
+  dropTranslation(t);
+  saveJson(CACHE_PATH, cache, 'keepName cache drop');
+  log('info', 'name kept as english', { name: t.slice(0, 60), restored });
+  return { kept: true, restored };
+}
+// 「重新翻译此名」：只清这一条的缓存（模组名缓存 + domCache 里含它的键 + 失败名单），只重翻这一条
+function retranslateName(text) {
+  let t = String(text == null ? '' : text).trim();
+  if (!t) return { queued: 0 };
+  // 屏幕上的可能是中文译文：反查回英文原名（否则清缓存/重翻都对不上号）
+  const nk0 = normKey(t);
+  if (!Object.keys(cache).some((k) => normKey(k) === nk0)) {
+    const back = Object.keys(cache).find((k) => normKey(String(cache[k])) === nk0);
+    if (back) t = back;
+  }
+  const nk = normKey(t);
+  // 缓存删除走统一算法 dropTranslation（审计 ①）；domCache/failCache 的键既可能是
+  // 显示串也可能是规范串，两种针都扫（只扫显示串 t 会漏规范键形态的条目）。
+  dropTranslation(t);
+  saveJson(CACHE_PATH, cache, 'keepName cache drop');
+  const ckt = cacheKeyOf(t);
+  for (const nd of (ckt && ckt !== t ? [t, ckt] : [t])) {
+    Object.keys(domCache).forEach((k) => { if (k.indexOf(nd) !== -1) delete domCache[k]; });
+    Object.keys(failCache).forEach((k) => { if (k.indexOf(nd) !== -1) delete failCache[k]; });
+  }
+  saveJson(DOM_CACHE_PATH, domCache, 'keepName domCache drop');
+  saveJson(FAIL_PATH, failCache, 'keepName failCache drop');
+  const state = contextRef.api.getState();
+  const items = collectTargets(state, null).concat(collectDownloadTargets(state)).filter((it) => normKey(it.raw) === nk);
+  if (!items.length) return { queued: 0, note: '当前列表里没有这个名字' };
+  return translate(items);
+}
+// 右键菜单接管判据：命中的是「已知模组名」才接管，普通界面文本照常弹 Vortex 原生菜单
+function isKnownName(text) {
+  const t = String(text == null ? '' : text).trim();
+  if (!t || t.length < 3 || t.length > 160) return false;
+  const nk = normKey(t);
+  for (const k of Object.keys(cache)) {
+    if (normKey(k) === nk) return true;
+    if (normKey(String(cache[k])) === nk) return true; // 屏幕上是中文译文时也接管
+  }
+  try {
+    const state = contextRef.api.getState();
+    const all = collectTargets(state, null).concat(collectDownloadTargets(state));
+    for (const it of all) if (normKey(it.raw) === nk) return true;
+  } catch (e) {}
+  return false;
 }
 
 /** 字典一律用 null 原型。普通对象的 `cache['toString']` 会拿到 Object.prototype.toString，
@@ -145,14 +1630,93 @@ function readJson(file, fallback) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return fallback; }
 }
 
+/** 同步睡 ms 毫秒。Windows 上 rename 抛 EPERM/EBUSY 多半是瞬时的（杀软扫描完就放手），
+ *  睡一下再试一次比直接降级安全（降级写会失去 rename 的原子性）。
+ *  Atomics.wait 是 Node 里唯一不阻塞事件循环之外的同步 sleep；不支持就算了。 */
+function sleepBlocking(ms) {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch (e) { /* 环境不支持就跳过重试间隔，直接进下一次尝试 */ }
+}
+
+/** 落盘唯一入口。返回 true = 数据确实写到了磁盘。
+ *
+ *  ★ 失败**不能静默**（2026-10-26 审查反馈 #4）：以前 rename 抛异常只 `log` 一句就吞，
+ *  用户攒的译文会悄悄消失，界面上看不出任何异常。Windows 上 rename 会被杀软 /
+ *  同步工具（OneDrive、坚果云）短暂持有目标句柄 → EPERM/EBUSY/EACCES，属于**常见**路径
+ *  而不是异常路径。现在：① 睡 30ms 重试一次；② 仍失败则回退直接覆写目标文件
+ *  （丢原子性，但「可能半截」远好过「整份没写」，且 .tmp 保留完整副本可救）；
+ *  ③ 两条路都失败才记 error 并返回 false，让调用方能看见。 */
 function writeJson(file, data) {
   // 写 .tmp 再 rename：writeFileSync 是「先截断再写」，翻译过程中 domCache.json 每 1.2 秒
   // 被整体重写一次，此刻崩溃/断电就留下半截 JSON，下次读回落 {} → 用户攒的译文全丢。
+  const tmp = file + '.tmp';
+  const shortName = String(file).replace(/^.*[\\/]/, '');
+  let body;
   try {
-    const tmp = file + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8');
-    fs.renameSync(tmp, file);
-  } catch (e) { log('error', 'write fail', String(e)); }
+    body = JSON.stringify(data, null, 2);
+  } catch (e) {
+    log('error', 'write fail: stringify', { file: shortName, err: String(e).slice(0, 120) });
+    return false;
+  }
+  try {
+    fs.writeFileSync(tmp, body, 'utf8');
+  } catch (e) {
+    // 磁盘满 / 无权限 / 目录被删 —— 数据确实没落盘，必须留 error
+    log('error', 'write fail: tmp', { file: shortName, code: (e && e.code) || '', err: String(e).slice(0, 120) });
+    return false;
+  }
+  for (let i = 0; i < 2; i++) {
+    try {
+      fs.renameSync(tmp, file);
+      return true;
+    } catch (e) {
+      const code = (e && e.code) || '';
+      if (i === 0) {
+        log('warn', 'rename busy, retry once', { file: shortName, code });
+        sleepBlocking(30);
+        continue;
+      }
+      log('warn', 'rename fail, fallback to direct write', { file: shortName, code });
+    }
+  }
+  // 回退：直接覆写。目标文件可能被杀软短暂锁着，所以这一路也可能失败。
+  try {
+    fs.writeFileSync(file, body, 'utf8');
+    try { fs.unlinkSync(tmp); } catch (e2) { /* tmp 留着无害，下次覆盖 */ }
+    return true;
+  } catch (e) {
+    log('error', 'write fail: fallback', { file: shortName, code: (e && e.code) || '', err: String(e).slice(0, 120) });
+    return false;
+  }
+}
+
+// ── 备份治理（审计 N2）已拆除（2026-10-26 用户拍板）──────────────────
+// 缓存是**派生数据**：设置页就有「清空全部翻译缓存(强制重翻)」，丢了大不了重翻一遍。
+// 备份它救不回任何不可再生的东西；而唯一一次实证（2 字节空壳备份）恰恰被
+// 「<64 字节不备」这条规则挡在外面 —— 它救不到自己要防的那个场景。
+// 真正不可再生的是用户手点的「保留英文」词表（userKeep.json），备份从没覆盖它。
+// 留痕能力没丢：写盘失败有 saveJson 记 not persisted，缓存被清有
+// cleaned / reset for new version / purged 三类日志。**不要再加回来。**
+
+/** writeJson 的「必留痕」包装。
+ *
+ * writeJson 自己失败时会 log('error')，但它返回 bool，而 13 处调用点写的是
+ * `try { writeJson(...) } catch (e) {}` —— 于是紧跟其后的 log('info', '... purged', {n})
+ * 照样宣布成功。日志里「真写进去了」和「没写进去」长得一模一样，用户攒的译文
+ * 丢得无声无息（审计 N4）。这里统一补一条 warn，让没落盘这件事在日志里看得见。
+ */
+function saveJson(file, data, what) {
+  let ok = false;
+  try {
+    ok = writeJson(file, data);
+  } catch (e) {
+    // writeJson 内部已尽力兜住，能抛到这里说明是它自己都没预料到的错
+    log('error', 'save threw', { what, err: String(e).slice(0, 120) });
+    return false;
+  }
+  if (!ok) log('warn', 'not persisted', { what, file: String(file).replace(/^.*[\\/]/, '') });
+  return ok;
 }
 
 // Vortex 禁止扩展在 init 阶段使用 context.api（报 "extension uses api in init function"）。
@@ -203,13 +1767,14 @@ function toTermList(gameMap) {
 
 /** 配置被从文件重载或保存后，把运行时术语并回去。
  *  cfg.terms 一旦掉回文件里的那 16 条，746 条游戏名对照就从提示词和术语遮蔽里消失，
- *  TW3 这类缩写会静默退回模型猜（译名质量下降且无任何提示）。 */
+ *  TW3 这类缩写会静默退回模型猜（译名质量下降且无任何提示）。
+ *  0.16.3 续 12：保英文名单重建 + 品牌头登记 + 品牌遮蔽术语全部收敛到 rebuildKeepNames
+ *  （沙箱测试只抽函数体，那边 rebuildKeepNames 是空实现 —— 调用必须走这个名字）。 */
 function mergeRuntimeTerms() {
-  if (!runtimeTerms || runtimeTerms.length === 0) return;
-  // 放独立键，不碰用户的 cfg.terms：
-  // ① 保存设置/重载配置时用户的 16 条不会被 746 条覆盖；
-  // ② 746 条不会跟着写进 config.json。
+  // 术语口径（0.16.3 续 11）：gameTerms 与 terms 是两个键 —— terms 掉回文件里
+  // 那 16 条时，746 条游戏名对照不能从提示词和术语遮蔽里消失。
   cfg.gameTerms = runtimeTerms;
+  rebuildKeepNames();
 }
 
 function rawNameOf(mod) {
@@ -231,34 +1796,222 @@ function collectTargets(state, gameIdFilter) {
       const mod = mods[modId];
       if (!mod) continue;
       if (mod.type === 'collection' && !(cfg && cfg.includeCollections)) continue;
-      const raw = rawNameOf(mod);
+      // 不能直接用 rawNameOf 的输出：它优先返回 originalName，而那是 Vortex 安装时
+      // 写进去的**整串键**（`Clean Water 13392 1 2026-10-03T17-14Z GpMW8t9md`）。
+      // 原样送翻，模型会把 fileId / 更新日期 / 随机 id 一起翻进中文，脏串再以 cache
+      // 键的形式留下来盖掉干净键（2026-10-26 真机 12 条：`清洁水源模组 13392 1 …`）。
+      // 净化只在 englishBaseNameOf 里做过 —— 批量翻译（主流程）必须走同一条路，
+      // 否则改了等于没改。typeof 守卫：测试沙箱只抽单个函数体，没注这个就退回原值。
+      const bases = typeof englishBaseNameOf === 'function' ? englishBaseNameOf(mod, modId) : [];
+      const raw = bases[0] || rawNameOf(mod);
+      // 真机长键（Fluffy Mod Manager 818 …）路过时把品牌头登记进白名单，
+      // 否则 residueWords 会把 Fluffy 当残留 → 验收不过 → 补翻成「蓬松」。
+      // typeof 守卫：测试沙箱（dlname BLOCK_A）没抽品牌那簇函数，production 里一定有。
+      if (typeof registerKeptBrands === 'function') registerKeptBrands(raw);
       if (!needsTranslate(raw)) continue;
-      out.push({ gameId, modId, raw, cached: cache[raw] });
+      // F3：整条没有一个可翻的英文词（REFramework / UE4SS / SkyUI）→ 不进队列。
+      // 送模型必然照抄或吐空 → 验收不过 → 记一次假失败，还触发误导提示。
+      if (nothingToTranslate(raw)) continue;
+      // 翻不动就退让：被验收拒满 NAME_FAIL_MAX 次的不再自动重来。
+      // 少了这一句，翻不过的条目每次收集都重新进队列 → 翻 → 被拒 → 下次再来，
+      // 用户看到的就是「怎么点都翻不了、一直提示未通过验收」（2026-10-26 真机）。
+      // typeof 守卫：沙箱只抽本函数，没注这两个。
+      if (typeof isGivenUp === 'function') {
+        const gk = typeof cacheKeyOf === 'function' ? cacheKeyOf(raw) : raw;
+        if (gk && isGivenUp(gk)) continue;
+      }
+      out.push({ gameId, modId, raw, cached: nameCacheOf(raw) });
     }
   }
   return out;
 }
 
+/** 单条下载记录 → 待翻目标。判据字段是 nexus.fileInfo.name（屏幕上那串），
+ *  不是 modInfo.name（状态层写了界面也不显示 —— 续 15 LevelDB 实证）。
+ *  返回 null = 不需要翻。借译文规则（D2）：已安装条目只有在「版本尾巴对得上」时
+ *  才借它的缓存译文，1.3 的行绝不拿 1.5 的译名。 */
+/** 下载行的名字：**只读 modInfo.name**，绝不拿 nexus.fileInfo.name 当判据。
+ *
+ *  ★ 2026-10-26 第二次踩这个坑（PITFALLS P-NAME-03）：上一版为了「对齐界面字段」
+ *  改成 fileInfo.name 优先，结果 raw 变成英文、状态层却被写成中文，
+ *  Vortex 的 processAttributes 拿中文当 fileName 做 fuzzRatio → 写出
+ *  `customFileName = "英文原名 - 中文译文"` 拼装名，整个模组列表炸开。
+ *
+ *  定论（0.16.2 就是对的）：modInfo.name 是安全字段，界面靠 DOM 层从 cache.json 贴。
+ *  状态库只做「我翻过了没有」的判断依据，不承担显示职责。 */
+function downloadShownNameOf(f) {
+  const mi = (f && f.modInfo) || {};
+  const mn = String(mi.name == null ? '' : mi.name).trim();
+  if (mn) return mn;
+  const fi = (((mi.nexus || {}).fileInfo) || {}).name;
+  return String(fi == null ? '' : fi).trim();
+}
+
+/** 写下载行的名字：**只写 modInfo.name**。
+ *
+ *  绝不写 nexus.fileInfo.name —— 那条路径会触发 Vortex 的 processAttributes：
+ *    customFileName = fuzzRatio < 50 ? `${modName} - ${fileName}` : undefined
+ *  一旦 fileInfo.name 是中文、modName 是英文，fuzzRatio 必然 < 50，
+ *  于是每个 mod 的显示名都变成「英文 - 中文」，比不翻更糟，且要手工清。
+ *  界面显示由 DOM 层负责，不归状态库管。 */
+function setDownloadShownName(dlId, zh) {
+  try {
+    contextRef.api.store.dispatch(va.actions.setDownloadModInfo(dlId, 'name', zh));
+    return true;
+  } catch (e) {
+    log('error', 'setDownloadModInfo fail', String(e));
+    return false;
+  }
+}
+
+function downloadTargetOf(f, modsRoot, force) {
+  if (!f) return null;
+  const mi = f.modInfo || {};
+  const disp = downloadShownNameOf(f);
+  if (!disp) return null;
+  // 状态层已经是中文 → 这行翻过了。**什么都不写回状态库**，只把译文补进 cache.json
+  // （DOM 层读它贴屏）。这是 0.16.2 被验证过的老路，也是 2026-10-25 13:08 的结案结论：
+  // 未安装/已卸载行的中文一直来自 DOM 层贴名，改成写状态库是方向性错误。
+  // ★ 写 nexus.fileInfo.name 会触发 Vortex 的 fuzzRatio 拼名，把整个列表变成
+  //   「英文原名 - 中文译文」（PITFALLS P-NAME-03，2026-10-26 第二次踩）。
+  if (CJK.test(disp)) {
+    // 缓存键必须是英文原名；fileInfo.name 是唯一还能拿到原名的字段（只读，不改）
+    const en0 = String((((mi.nexus || {}).fileInfo) || {}).name || '').trim();
+    const baseEn = en0 && !CJK.test(en0) ? en0 : '';
+    if (modNameOk(disp)) {
+      const base = baseEn || disp;
+      const key = typeof cacheKeyOf === 'function' ? cacheKeyOf(base) : base;
+      // 漂移闸（2026-10-26）：对账刚删掉的旧译文，不能从状态层收养回来 ——
+      // 否则删了键、收养又灌回，自动翻译一看「有缓存」全跳过（当日实录）。
+      // 判据与对账同源（glossaryDrifted → auditGlossaryDrift → applyTerms）。
+      if (key && nameCacheOf(base) == null && !glossaryDrifted(base, disp)) cache[key] = disp;
+    }
+    // force = 用户右键亲手点的「翻译此模组」。这时不能因为「状态层已经是中文」
+    // 就返回 null —— 返回 null 会让 translateSelected 的 dlTargets 为空，
+    // 用户看到的就是「手动点翻译没反应」。重翻的 raw 用英文原名（只读 fileInfo.name），
+    // 结果仍然只写回 modInfo.name（安全字段，不触发 fuzzRatio 拼名）。
+    //
+    // 漂移放行（2026-10-26 第三次补链）：状态层中文 + 词库已换代 = 这份旧译文是死账。
+    // 「要翻」的判据是状态层非中文、不查缓存 —— 对账删了缓存键后这里照样 return null，
+    // autoHook/translateAll 永远看不见它（真机实录：audit stale=1、收养闸拦住了回流，
+    // 但 dl name miss 之后整条管线静默，显示纹丝不动）。漂移时与 force 同路放行，
+    // 让它以「未翻条目」身份重进管线，翻完走 applyDownloadTranslation 覆盖 modInfo.name。
+    const drift = !!baseEn && typeof glossaryDrifted === 'function' && glossaryDrifted(baseEn, disp);
+    if (!force && !drift) return null;
+    if (!baseEn) return null;
+    const rawF = typeof canonicalName === 'function' ? canonicalName(baseEn) : baseEn;
+    if (!rawF) return null;
+    return { dlId: undefined, raw: rawF, cached: undefined, f };
+  }
+  if (!needsTranslate(disp)) return null;
+  // 送模型 / 写缓存都用规范键：`ModSkillSlotPages Remaster 1.8` 这种驼峰整串
+  // 模型翻不动本体、只会补个「重制版」尾巴，然后被验收拒掉 → 无限循环
+  // （2026-10-26 真机 7 条全中）。拆成 Mod Skill Slot Pages 才能真翻。
+  // 界面上那串（disp）原样保留给还原/留底用，不进这里。
+  const raw = typeof canonicalName === 'function' ? canonicalName(disp) : disp;
+  if (!raw) return null;
+  let cached = nameCacheOf(raw);
+  // nameCacheOf 未命中返 null（不是 undefined）—— 借译文判断必须覆盖两种「没有」
+  if (cached == null && f.installed && f.installed.modId && f.installed.gameId) {
+    // 借已安装条目的译文：版本尾巴必须严丝合缝，否则不借（零跨版本兜底）
+    try {
+      const m = (modsRoot[f.installed.gameId] || {})[f.installed.modId];
+      if (m) {
+        const b = rawNameOf(m);
+        const dver = versionTailOf(cleanKeyForm(raw));
+        if (b && dver && versionTailOf(b) === dver) {
+          const cv = nameCacheOf(b);
+          if (cv !== undefined && cv !== null) cached = cv;
+        }
+      }
+    } catch (e) { /* 状态形状异常就当作没得借 */ }
+  }
+  // 借不到、屏幕上那串又是压缩包文件名本身 → 看它还剩不剩可翻的东西。
+  // `CWSO-13311-1-4-9-1770000000.zip`：一串缩写 + 编号，送模型只会臆造出个中文名，
+  // 或者把编号翻进中文（2026-10-26 实测 `清洁水源模组 13392 1 …`）。到此为止。
+  // `VAXIS_Blood_Physics_v1.5.zip`：下划线分隔、三个真实英文词，该翻 —— 不能一刀切。
+  // 判据：去掉后缀后没有空格分隔，且非纯数字的段少于 2 个 → 没有可翻的名字。
+  // 必须放在「借译文」之后、且只在没借到时生效（借到译文就不必烧模型）。
+  if (cached == null && /\.(zip|7z|rar)$/i.test(disp)) {
+    const stem = disp.replace(/\.(zip|7z|rar)$/i, '');
+    if (!/\s/.test(stem)) {
+      const words = stem.split(/[_.\-]+/).filter((w) => w && !/^\d+$/.test(w) && /[A-Za-z]/.test(w));
+      if (words.length < 2) return null;
+    }
+  }
+  return { dlId: undefined, raw, cached: cached === null ? undefined : cached, f };
+}
+
 function collectDownloadTargets(state) {
   const files = (state.persistent && state.persistent.downloads && state.persistent.downloads.files) || {};
+  const modsRoot = (state.persistent && state.persistent.mods) || {};
   const out = [];
+  // downloadTargetOf 的「状态层已是中文」分支会往 cache 里补译文（DOM 层贴屏用）。
+  // 那条分支不返回 target，所以没人写盘 —— 补进去的译文以前只活在内存里，
+  // 关掉 Vortex 就没了，下次启动重算。这里统一落一次盘。
+  const cacheBefore = Object.keys(cache).length;
   for (const dlId of Object.keys(files)) {
     const f = files[dlId];
-    const raw = f && f.modInfo && f.modInfo.name;
-    if (!needsTranslate(raw)) continue;
-    out.push({ dlId, raw, cached: cache[raw] });
+    const raw0 = downloadShownNameOf(f);
+    if (typeof registerKeptBrands === 'function') registerKeptBrands(raw0);
+    const t = downloadTargetOf(f, modsRoot);
+    if (!t) continue;
+    const raw = t.raw;
+    // nameCacheOf 未命中返 null；统一成 undefined，让 given-up 豁免判断
+    // （「有缓存就不跳」）对「没有」的两种形态都成立（null 漏判 → given-up 连坐缓存）
+    const good = nameCacheOf(raw) || undefined;
+    // given-up 只挡「烧模型」，不挡「套缓存」—— 旧账连坐缓存正是续 7 那条
+    // 「缓存明明有译文却被跳过」的死路（用户截图实锤）
+    if (isGivenUp(typeof cacheKeyOf === 'function' ? cacheKeyOf(raw) : raw) && good === undefined) continue;
+    out.push({ dlId, raw, cached: t.cached, f });
   }
+  const added = Object.keys(cache).length - cacheBefore;
+  if (added > 0) {
+    saveJson(CACHE_PATH, cache, 'dl cache write');
+    log('info', 'dl cache filled', { added, total: Object.keys(cache).length });
+  }
+
+  // 诊断（P-NAME-05）：哪些下载行「有英文原名、cache 却查不到译文」——这些行只能显示英文。
+  // 打出来是为了确认缺的键长什么样（fileInfo.name 原样？还是得剥压缩包骨架？）。
+  try {
+    const miss = [];
+    for (const dlId of Object.keys(files)) {
+      const f = files[dlId] || {};
+      const mi = f.modInfo || {};
+      const en = String((((mi.nexus || {}).fileInfo) || {}).name || '').trim();
+      if (!en || CJK.test(en)) continue;
+      if (nameTranslationOf(en)) continue;
+      const zh = String(mi.name == null ? '' : mi.name).trim();
+      miss.push({ en: en.slice(0, 60), zh: zh.slice(0, 24) });
+    }
+    if (miss.length) log('info', 'dl name miss', { n: miss.length, sample: miss.slice(0, 15) });
+  } catch (e) { /* 诊断失败不影响主流程 */ }
   return out;
 }
 
 function applyTranslation(item, zh) {
   if (item.dlId) return applyDownloadTranslation(item, zh);
   if (!zh) return false;
-  const clean = String(zh).replace(/^["'\s]+|["'\s]+$/g, '');
+  // let：下面同族统一要把结果写回 clean（const 会抛 TypeError 中断整批 —— dlname 组 4 实录）
+  let clean = String(zh).replace(/^["'\s]+|["'\s]+$/g, '');
   if (!clean) return false;
   // 译文=原文 = 无需翻译（专名/已中文）。不写 Vortex 持久化状态——originalName 和
   // customFileName 都写成原值没有意义，只在缓存里标记「这条处理过了」。
-  if (clean === item.raw) { cache[item.raw] = clean; return true; }
+  if (clean === item.raw) {
+    const ckSame = cacheKeyOf(item.raw);
+    if (ckSame) cache[ckSame] = clean;     // 中文/空键不写（cacheKeyOf 返回 '' 即拒绝）
+    return true;
+  }
+  // 验收三规则：不达标的译文不写状态、不入缓存（最坏结局=保持英文，绝不比原文更差）
+  // 直接调 modNameOk（唯一实现；nameAcceptable 只是它的别名，测试沙箱没抽那个名字）
+  // 拒绝必须走 rejectName：它会记 give-up 账，试满 3 次就不再反复烧模型
+  if (!modNameOk(item.raw, clean)) return rejectName(item.raw, clean, 'mod');
+  // F4：同族多版本统一（骨架 + 本条版本号）；取不到版本尾巴时原样返回，绝不跨版本覆盖
+  const unified = unifyFamilyName(item.raw, clean);
+  if (unified !== clean) {
+    log('info', 'family name unified', { raw: item.raw.slice(0, 60), from: clean.slice(0, 60), to: unified.slice(0, 60) });
+    clean = unified;
+  }
   // dispatch 抛错（action 未注册/状态树异常/初始化竞态）时不写缓存、返回 false：
   // 以前三次 dispatch 无条件写缓存 → 界面还是英文、缓存说翻了，同批次 applied 还虚高。
   // 必需两项（originalName 留底 + customFileName 显示）任一失败就留给下一轮重送
@@ -267,25 +2020,45 @@ function applyTranslation(item, zh) {
   const okCustom = dispatch('customFileName', item.gameId, item.modId, clean);
   if (cfg.writeToNameField) dispatch('name', item.gameId, item.modId, clean);
   if (!okOrig || !okCustom) return false;
-  cache[item.raw] = clean;
+  const ckOk = cacheKeyOf(item.raw);
+  if (ckOk) {
+    cache[ckOk] = clean;
+    clearNameFail(ckOk);       // 成功了就销账，别让 7 天前的败绩继续挡着
+  }
   return true;
 }
 
 /** 下载条目（尚未安装的模组）也翻名字：官方 action setDownloadModInfo */
 function applyDownloadTranslation(item, zh) {
   if (!zh) return false;
-  const clean = String(zh).replace(/^["'\s]+|["'\s]+$/g, '');
+  // let：同族统一写回（与 applyTranslation 同一个坑）
+  let clean = String(zh).replace(/^["'\s]+|["'\s]+$/g, '');
   if (!clean) return false;
   // 译文=原文 = 无需翻译：不写 Vortex 状态，只标记缓存（同 applyTranslation）
-  if (clean === item.raw) { cache[item.raw] = clean; return true; }
-  try {
-    contextRef.api.store.dispatch(va.actions.setDownloadModInfo(item.dlId, 'name', clean));
-    cache[item.raw] = clean;
+  if (clean === item.raw) {
+    const ckSameDl = cacheKeyOf(item.raw);
+    if (ckSameDl) cache[ckSameDl] = clean;   // 中文/空键不写
     return true;
-  } catch (e) {
-    log('error', 'setDownloadModInfo fail', String(e));
-    return false;
   }
+  // 拒绝必须走 rejectName：下载行以前只打日志、不记账，同一个名字每次收集都重来
+  // —— 用户看到的就是「点了也没用、一直提示未通过验收」的无限循环（2026-10-26 真机）。
+  if (!modNameOk(item.raw, clean)) return rejectName(item.raw, clean, 'dl');
+  // F4：同族多版本统一（下载行同样适用；取不到版本尾巴就原样返回）
+  const unified = unifyFamilyName(item.raw, clean);
+  if (unified !== clean) clean = unified;
+  // 写 modInfo.name —— **不是** nexus.fileInfo.name。
+  // 0.16.5 曾按 asar 里 `rowFromDownload` 的字段映射改成写 nexus，理由是「那才是界面渲染的字段」。
+  // 结果是 Vortex 的 `processAttributes` 拿中文 fileName 和英文 modName 算 fuzzRatio，
+  // 必然 < 50，于是给每个 mod 写出 `customFileName = \`${modName} - ${fileName}\``
+  // → 整个列表炸成「英文 - 中文」拼装名（PITFALLS P-NAME-03，已踩两次）。
+  // 界面显示归 DOM 层从 cache.json 贴；状态库只回答「我翻过没有」。
+  if (!setDownloadShownName(item.dlId, clean)) return false;
+  const ckDl = cacheKeyOf(item.raw);
+  if (ckDl) {
+    cache[ckDl] = clean;
+    clearNameFail(ckDl);
+  }
+  return true;
 }
 
 function restoreAll(state) {
@@ -302,7 +2075,10 @@ function restoreAll(state) {
         if (cfg.writeToNameField) dispatch('name', gameId, modId, a.originalName);
         // 缓存里「原名 → 中文」必须一起清：否则重启 8 秒后 applyCachedSilently()
         // 按缓存把中文又写回 customFileName，用户会以为「还原」按钮根本没生效。
-        if (cache[a.originalName] !== undefined) { delete cache[a.originalName]; dropped++; }
+        // 走 dropTranslation 而不是裸 delete：写侧是规范键，删侧删原串键 = 一条都没删掉。
+        dropped += typeof dropTranslation === 'function'
+          ? dropTranslation(a.originalName)
+          : (cache[a.originalName] !== undefined ? (delete cache[a.originalName], 1) : 0);
         n++;
       }
     }
@@ -322,28 +2098,36 @@ function restoreAll(state) {
     }
     for (const dlId of Object.keys(dlFiles)) {
       const f = dlFiles[dlId];
-      const cur = f && f.modInfo && f.modInfo.name;
-      if (!cur || typeof cur !== 'string') continue;
+      // 判据必须是界面真正显示的那串（nexus.fileInfo.name）。读 modInfo.name
+      // 等于在比对一个没人看的字段 —— 译文写成功了这里也永远判定「没翻过」。
+      const cur = downloadShownNameOf(f);
+      if (!cur) continue;
       const orig = rev.get(cur);
       if (orig !== undefined && !needsTranslate(cur)) {
         // 当前显示名不是英文（是我们的译文）→ 写回原名、删缓存映射。
         // needsTranslate 守卫：防「译文恰好是另一个英文名」时把没翻过的条目改坏。
-        try {
-          contextRef.api.store.dispatch(va.actions.setDownloadModInfo(dlId, 'name', orig));
-          n++;
-        } catch (e) {
-          log('error', 'setDownloadModInfo restore fail', String(e));
-          continue;   // 没写成功就不删缓存，下次还能再试
-        }
-        if (cache[orig] !== undefined) { delete cache[orig]; dropped++; }
+        // 写回值优先用记录自带的英文原名：全量重翻后缓存键统一成了规范键
+        // （`Clean Water`），直接拿键当原名会把 Nexus 的 fileId / 版本号一起丢掉。
+        const mi = (f && f.modInfo) || {};
+        // 英文原名只读 nexus.fileInfo.name（我们从没写过它，写它会触发 fuzzRatio 拼名）
+        const ownEn = String(mi.zhSourceName
+          || (((mi.nexus || {}).fileInfo || {}).name) || '').trim();
+        const back = ownEn && !CJK.test(ownEn) ? ownEn : orig;
+        if (!setDownloadShownName(dlId, back)) continue;  // 没写成功就不删缓存，下次还能再试
+        n++;
+        dropped += typeof dropTranslation === 'function'
+          ? dropTranslation(orig)
+          : (cache[orig] !== undefined ? (delete cache[orig], 1) : 0);
       } else if (cache[cur] !== undefined) {
         // 显示名仍是英文但缓存里有映射（翻过又被 Vortex 重置）→ 只清映射，
         // 否则重启后 applyCachedSilently 又会把中文写回来。
-        delete cache[cur]; dropped++;
+        dropped += typeof dropTranslation === 'function'
+          ? dropTranslation(cur)
+          : (cache[cur] !== undefined ? (delete cache[cur], 1) : 0);
       }
     }
   }
-  if (dropped > 0) writeJson(CACHE_PATH, cache);
+  if (dropped > 0) saveJson(CACHE_PATH, cache, 'restore all');
   return n;
 }
 
@@ -366,9 +2150,16 @@ async function translate(list) {
       // 紧接着把 cfg 的键全删了，Object.assign(cfg, 自己) 等于拿到空对象，
       // 后面就会误报「模组名汉化已在设置中关闭」，并且 DOM 层失去全部配置。
       const raw = readJson(CONFIG_PATH, null);
-      const fresh = (raw && typeof raw === 'object') ? raw : JSON.parse(JSON.stringify(DEFAULT_CFG));
-      for (const k of Object.keys(cfg)) delete cfg[k];
-      Object.assign(cfg, fresh);
+      if (raw && typeof raw === 'object') {
+        for (const k of Object.keys(cfg)) delete cfg[k];
+        Object.assign(cfg, raw);
+      } else {
+        // 审计 v10 发现 4：读失败（杀软读锁/文件被占）时**保留内存现值**——
+        // 它就是最近一次成功加载/保存的配置，翻译照常跑。回退 DEFAULT_CFG 会让
+        // baseUrl 变空（发布红线要求出厂为空），本次必报「未配置」全灭 = 偶发
+        // 不可复现的「配置丢了」观感。不碰 cfg 引用，彻底避开上面警告的别名坑。
+        log('warn', 'config read fail; keep runtime cfg', { file: 'config.json' });
+      }
       mergeRuntimeTerms();
     }
     if (!cfg.enabled) {
@@ -389,12 +2180,10 @@ async function translate(list) {
     }
 
     if (pending.length === 0) {
-      writeJson(CACHE_PATH, cache);
+      saveJson(CACHE_PATH, cache, 'translate done');
       notify({ id: nid, type: 'success', message: `模组名汉化：已处理 ${applied} 条（全部命中缓存）` });
       return { applied, failed: 0, cachedOnly: true };
     }
-
-    notify({ id: nid, type: 'info', message: `开始汉化：${pending.length} 条待翻译（模型：${(cfg.provider && cfg.provider.baseUrl) || '?'}）` });
 
     const lanes = Math.max(1, Math.min(10, cfg.concurrency || 5));
     notify({
@@ -403,23 +2192,38 @@ async function translate(list) {
     });
 
     const texts = pending.map((p) => p.raw);
+    // 显式 mode='mod'（审计 v10 发现 1）：模组名批必须走全遮蔽，不能让 isUiBatch
+    // 按批长度猜——批均 >24 字符的真实长名会被误判 ui，modOnly 词条（Oils→剑油/
+    // Reborn→重生）不遮蔽，产出缺固定译名的「合格译文」→ 对账全量词表判漂移 →
+    // 删键重翻 → 再缺 → 循环。遮蔽是硬保证，提示词对照只是模型自觉。
     const results = await core.translateConcurrently(cfg, cache, texts, lanes, (done, total) => {
       if (done % 25 === 0 || done === total) {
         notify({ id: nid, type: 'info', message: `汉化进度 ${done}/${total}` });
       }
-    });
+    }, 'mod');
     for (let k = 0; k < pending.length; k++) {
       if (applyTranslation(pending[k], results[k])) applied++;
       else failed++;
     }
-    writeJson(CACHE_PATH, cache);
+    saveJson(CACHE_PATH, cache, 'translate done');
     log('info', 'done', { applied, failed, lanes });
     if (failed > 0) {
-      notify({
-        id: nid,
-        type: 'warning',
-        message: `汉化完成：成功 ${applied}，失败 ${failed}。多数原因是模型接口没开或地址不对，请到 设置 → 模组名汉化 里点「测试连接」`,
-      });
+      // 只有整批全灭才可能是模型接口没开；部分失败更常见的原因是「模型没翻彻底」
+      // （旧代码一律甩给模型接口：实测成功 30 失败 3 而模型一直好着，用户被误导）
+      const whole = failed >= pending.length;
+      if (whole) {
+        notify({
+          id: nid,
+          type: 'warning',
+          message: `汉化完成：成功 ${applied}，失败 ${failed}。多数原因是模型接口没开或地址不对，请到 设置 → 模组名汉化 里点「测试连接」`,
+        });
+      } else {
+        notify({
+          id: nid,
+          type: 'success',
+          message: `汉化完成：成功 ${applied}，失败 ${failed} 条未通过验收（模型没翻彻底，下次扫描会自动重试）`,
+        });
+      }
     } else {
       notify({ id: nid, type: 'success', message: `汉化完成：成功 ${applied} 条` });
     }
@@ -446,7 +2250,10 @@ function applyCachedSilently() {
     if (t.dlId) { if (applyDownloadTranslation(t, t.cached)) n++; continue; }
     const mod = ((state.persistent || {}).mods || {})[t.gameId] || {};
     const cur = (mod[t.modId] && mod[t.modId].attributes && mod[t.modId].attributes.customFileName) || '';
-    if (cur === cache[t.raw]) continue;
+    // 比的是「要写进去的那份译文」，不是「按 raw 直接取的缓存项」——
+    // 写侧键已统一到 canonicalName，裸取 cache[t.raw] 在旧缓存键下恒为 undefined，
+    // 于是每次启动都白跑一遍 applyTranslation（还会顺手覆盖掉人工改过的显示名）。
+    if (cur === t.cached) continue;
     if (applyTranslation(t, t.cached)) n++;
   }
   if (n > 0) log('info', 'silent cache applied', { n });
@@ -456,7 +2263,16 @@ function applyCachedSilently() {
 
 /** pack.json = 唯一的中文词库（构建期已把能收的译文全烧进来） */
 function readPack() {
-  return readJson(PACK_PATH, {});
+  let raw = null;
+  try { raw = fs.readFileSync(PACK_PATH, 'utf8'); } catch (e) { return {}; }   // 文件不存在是首启正常态
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    // 解析失败不再静默（review4-M2）：静默返 {} 会被上层当「词库为空」，界面悄悄回英文
+    // 还查不到原因。报出来，让 build() 的空包守卫拒写、日志里能看到根因。
+    try { log('error', 'pack.json unparseable, lexicon disabled this session', String(e).slice(0, 120)); } catch (e2) { /* ignore */ }
+    return {};
+  }
 }
 
 /** 摊平成「英文 → 中文」映射，供 DOM 层做零延迟替换 */
@@ -552,6 +2368,869 @@ function scanUntranslated(limit) {
   return out;
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// 名字管线全家桶（0.16.3 重建）：族切词 / 自愈 / 重翻 / 词级补翻 / 右键单修
+//
+// 位置纪律：本块必须整体位于 mergeRuntimeTerms 之后、hitFromDownload 之前 ——
+// dlname 测试沙箱按这两个函数名整段切片（BLOCK_A），translateAllFresh /
+// resetModName 要被包进去；hitFromDownload 是切片收口标记，签名勿改。
+// 本块内不许出现顶层 const（沙箱会重复注入同名常量 → SyntaxError）。
+// ═══════════════════════════════════════════════════════════════════════
+
+/** 整条名字没有一个可翻的英文词（REFramework / UE4SS / SkyUI）→ 不进待翻队列。
+ *  送模型必然「照抄」或吐空 → 验收不过 → 记一次假失败，还会触发
+ *  「多数原因是模型接口没开」的误导提示（实测成功 30 失败 3，模型一直是好的）。
+ *  下划线必须先拆：`VAXIS_Blood_Physics_v1.5` 整串会被 residueWords 当成一个
+ *  token，含连续大写 VAXIS 就整串放行 → 误判「无可翻」。 */
+function nothingToTranslate(name) {
+  const s = String(name == null ? '' : name);
+  if (!s || CJK.test(s)) return false;   // 已含中文的不归它管（交给 needsTranslate）
+  return residueWords(s.replace(/_+/g, ' ')).length === 0;
+}
+
+/** 族特征 token（小写；版本号/fileId/时间戳不算）。
+ *  `ModSkillSlotPages Remaster 1.8` → ['modskillslotpages','remaster'] */
+function modNameTokens(name) {
+  const out = [];
+  for (const w of String(name == null ? '' : name).replace(/_+/g, ' ').split(/[^A-Za-z0-9]+/)) {
+    if (!w) continue;
+    if (/^v?\d+(\.\d+)*[a-z]?$/i.test(w)) continue;
+    // 时间戳碎片：键里的 `2026-10-01T00-00Z` 被切成 01T00 这种，不滤掉会把
+    // `Smooth Map`(10 字符) 的公共前缀撑过 12 → 短名模组被误判同族连坐（refresh 组 10）
+    if (/^\d+[TZ]\d*$/i.test(w)) continue;
+    out.push(w.toLowerCase());
+  }
+  return out;
+}
+
+/** 两条 token 序列的公共前缀长度（按字符）。同族判据：≥12 才认。
+ *  `Smooth Map`(10) / `Clean Water`(11) 这种短主干不许连坐；
+ *  `ModSkillSlotPages Remaster`(27) / CWSO 长名才连坐。 */
+function commonTokenPrefixLen(a, b) {
+  const A = a || [];
+  const B = b || [];
+  let n = 0;
+  const lim = Math.min(A.length, B.length);
+  for (let i = 0; i < lim; i++) {
+    if (A[i] !== B[i]) break;
+    n += A[i].length + 1;   // +1 = 词间空格
+  }
+  return n > 0 ? n - 1 : 0;
+}
+
+/** 族主干 token：先按时间戳锚定剥掉键尾（fileId/版本/随机id），再切词。
+ *  与 modNameTokens 的分工：后者是纯切词（组 10 直接用），本函数管「键形态」。 */
+function stemTokens(key) {
+  const k = String(key == null ? '' : key).trim();
+  const parts = k.split(/\s+/);
+  for (let i = parts.length - 1; i >= 0; i--) {
+    if (/^\d\d\d\d-\d\d-\d\dT[\d:Z.-]+$/i.test(parts[i])) {
+      return modNameTokens(parts.slice(0, Math.max(0, i - 2)).join(' '));
+    }
+  }
+  return modNameTokens(k);
+}
+
+/** 主干反查：缓存里同族（公共前缀 ≥12）且版本号对得上的译文。
+ *  版本对齐防串台：1.8 的行只拿 1.8 的译文（refresh 组 11-6/11-7 钉死）。
+ *  只能引用 cache/CJK + 抽出来的助手：refresh 组 11 的沙箱只注了这些，
+ *  所以验收走**两参** modNameOk（单参会调 residueWords → 那边没注 keepNameSet）。 */
+function findCacheByStem(key) {
+  const k = String(key == null ? '' : key);
+  const st = stemTokens(k);
+  if (!st.length) return '';
+  // 版本对齐用的「本键出现过的版本串」：空白切分保留 `1.8` 整体（缓存键的版本
+  // 尾巴带点，只按非字母数字切会把 1.8 拆成 1/8，对齐永远不命中 —— refresh 11-6 实录），
+  // 再补一份纯字母数字切分（`1-8` 横线式键形）。
+  const words = new Set();
+  for (const w of k.replace(/_+/g, ' ').split(/\s+/)) {
+    const t = String(w || '').trim().toLowerCase();
+    if (!t) continue;
+    words.add(t);
+    for (const w2 of t.split(/[^A-Za-z0-9]+/)) if (w2) words.add(w2);
+  }
+  for (const ck of Object.keys(cache)) {
+    if (commonTokenPrefixLen(st, stemTokens(ck)) < 12) continue;
+    const cv = /(?:^|[\s_\-–—(（])(v?\d+(?:\.\d+)*[a-z]?)$/i.exec(String(ck).trim());
+    if (cv && !words.has(cv[1].toLowerCase())) continue;
+    const v = cache[ck];
+    if (typeof v !== 'string' || !v || !CJK.test(v)) continue;
+    if (!modNameOk(ck, v)) continue;
+    return v;
+  }
+  return '';
+}
+
+/** give-up 记账：同一名字试满 NAME_FAIL_MAX 次就不再烧模型（TTL 过后旧账作废） */
+function isGivenUp(key) {
+  const k = String(key == null ? '' : key);
+  const live = (kk) => {
+    const e = nameFail && nameFail[kk];
+    if (!e || !e.n) return false;
+    if (Date.now() - (e.ts || 0) > NAME_FAIL_TTL) return false;
+    return e.n >= NAME_FAIL_MAX;
+  };
+  if (live(k)) return true;
+  // 兼容旧账：0.16.3 之前记账键是原始名字串（没规范化），键换成 canonicalName 后
+  // 那些账会集体「查不到」→ 该退让的条目又开始无限重试。带前缀的（sh:/dl:）不归一化，
+  // 它们是显示名不是原名，交给 canonicalName 会被剥掉日期/后缀变成另一个键。
+  if (/^[a-z]+:/.test(k) || typeof cacheKeyOf !== 'function') return false;
+  const ck = cacheKeyOf(k);
+  return !!ck && ck !== k && live(ck);
+}
+function bumpNameFail(key, model) {
+  const k = String(key == null ? '' : key);
+  // 空键不记账：`cacheKeyOf` 拒绝中文后可能返回 `''`，若调用方没判空就写出
+  // `nameFail['']` —— 又造一个所有条目共用的桶。与 `clearNameFail` 的判空对齐。
+  if (!k) return 0;
+  const e = (nameFail && nameFail[k]) || { n: 0, ts: 0 };
+  e.n = (e.n || 0) + 1;
+  e.ts = Date.now();
+  if (model) e.model = String(model);
+  nameFail[k] = e;
+  saveJson(NAME_FAIL_PATH, nameFail, 'nameFail bump');
+  return e.n;
+}
+
+/** 成功就销账：否则一条条目失败 3 次后即使后来翻好了，7 天内仍按 given-up 挡着。 */
+function clearNameFail(key) {
+  const k = String(key == null ? '' : key);
+  if (!k || !nameFail) return;
+  // 两种键形态都销：旧账记在原串、新账记在规范键，漏一种就会留下永远查不到的僵尸账
+  const keys = [k];
+  if (!/^[a-z]+:/.test(k) && typeof cacheKeyOf === 'function') {
+    const ck = cacheKeyOf(k);
+    if (ck && ck !== k) keys.push(ck);
+  }
+  let hit = false;
+  for (const kk of keys) {
+    if (nameFail[kk] !== undefined) { delete nameFail[kk]; hit = true; }
+  }
+  if (hit) saveJson(NAME_FAIL_PATH, nameFail, 'nameFail clear');
+}
+
+/** **统一的验收拒绝出口** —— 所有「译文没过验收」都必须走这里，不许各分支自己
+ *  `log + return false`。
+ *
+ *  0.16.3 的实况：`applyTranslation` / `applyDownloadTranslation` 的拒绝分支只打一行日志
+ *  就返回，**一处都没记账**。于是翻不过的条目每次收集都重新进队列 → 翻 → 被拒 →
+ *  不写缓存 → 下次再来，用户看到的就是「一直提示未通过验收、怎么点都翻不了」
+ *  （2026-10-26 真机：`ModSkillSlotPages Remaster 1.8` 连续被拒两次、无任何退让）。
+ *
+ *  记账键用 canonicalName —— 和缓存键同源，不会出现「这个分支记的账那个分支查不到」。
+ *  日志名保持原样（`name translation rejected` / `download name translation rejected`），
+ *  测试按这两个字符串断言。 */
+function rejectName(raw, got, where) {
+  const key = typeof canonicalName === 'function'
+    ? canonicalName(raw)
+    : String(raw == null ? '' : raw).trim();
+  let n = 0;
+  if (key) n = bumpNameFail(key, cfg && cfg.provider && cfg.provider.model);
+  log('warn', where === 'dl' ? 'download name translation rejected' : 'name translation rejected', {
+    raw: String(raw == null ? '' : raw).slice(0, 60),
+    got: String(got == null ? '' : got).slice(0, 60),
+    tries: n,
+  });
+  return false;
+}
+
+/** 驼峰拆词：ModSkillSlotPages → Mod Skill Slot Pages（词级补翻的输入） */
+function camelSplitWord(w) {
+  return String(w == null ? '' : w)
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+    .trim();
+}
+
+/** 词级补翻的模型调用：一批英文词 → 一行一个中文。逻辑与 gate-e2e 的复本对拍。 */
+async function translateWords(words) {
+  const list = (words || []).map((w) => String(w == null ? '' : w).trim()).filter(Boolean);
+  if (!list.length) return [];
+  const p = (cfg && cfg.provider) || {};
+  const base = String(p.baseUrl || '').replace(/\/+$/, '');
+  const model = String(p.model || '');
+  if (!base || !model) return [];
+  const body = JSON.stringify({
+    model,
+    messages: [{ role: 'system', content: WORD_PROMPT }, { role: 'user', content: list.join('\n') }],
+    temperature: 0.2,
+    max_tokens: Math.max(160, list.length * 32 + 80),
+  });
+  const headers = Object.assign({ 'Content-Type': 'application/json' }, p.apiKey ? { Authorization: 'Bearer ' + p.apiKey } : {});
+  try {
+    const r = await core.httpRequest(base + '/chat/completions', 'POST', headers, body, 60000);
+    if (!r || r.status < 200 || r.status >= 300) return [];
+    const j = JSON.parse(r.body);
+    const txt = String((((j.choices || [])[0] || {}).message || {}).content || '').trim();
+    return txt.split(/\r?\n/)
+      .map((s) => s.replace(/^\s*\d+\s*[.、)．]\s*/, '').replace(/^["'\s]+|["'\s]+$/g, '').trim())
+      .filter(Boolean).slice(0, list.length);
+  } catch (e) { return []; }
+}
+
+/** 词级补翻：把译文里残留的英文词逐个翻掉（驼峰词先拆开）。
+ *  只换没翻的那个词，绝不整句重译 —— 整句覆盖就是「剑星」事故的来源。 */
+async function refineByWords(text) {
+  const t = String(text == null ? '' : text);
+  if (!t || !CJK.test(t)) return t;
+  const res = residueWords(t);
+  if (!res.length) return t;
+  const partsOf = (w) => (/[a-z][A-Z]/.test(w) ? camelSplitWord(w).split(/\s+/).filter(Boolean) : [w]);
+  const need = [];
+  const table = Object.create(null);
+  for (const w of res) {
+    const parts = partsOf(w);
+    const miss = [];
+    for (const p of parts) {
+      const hit = wordCache && wordCache[p];
+      if (hit) table[p] = hit; else miss.push(p);
+    }
+    for (const p of miss) need.push(p);
+  }
+  if (need.length) {
+    const zhs = await translateWords(need);
+    for (let i = 0; i < need.length && i < zhs.length; i++) {
+      if (zhs[i]) { wordCache[need[i]] = zhs[i]; table[need[i]] = zhs[i]; }
+    }
+    saveJson(WORD_PATH, wordCache, 'word cache fill');
+  }
+  let out = t;
+  for (const w of res) {
+    const parts = partsOf(w);
+    const all = parts.every((p) => table[p]);
+    if (!all) continue;                       // 有词没翻回来就整个词不动（不留半成品）
+    const rep = parts.map((p) => table[p]).join('');
+    const esc = w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    out = out.replace(new RegExp('(?<![A-Za-z0-9])' + esc + '(?![A-Za-z0-9])', 'g'), rep);
+  }
+  // 中文夹中文的空格去掉：`自动应用 剑油 重生 插件` → `自动应用剑油重生插件`。
+  // 只吃「汉字 + 空格 + 汉字」，`模组技能槽页面重制版 1.8` 这种中文接数字不受影响。
+  out = out.replace(/([\u4e00-\u9fa5])[ \t]+(?=[\u4e00-\u9fa5])/g, '$1');
+  return out;
+}
+
+/** 中文译文 → 英文缓存键（右键时靠它找原名）。并列命中（两条都译成同一个中文）
+ *  时不猜，返回空。非中文输入直接空。 */
+function englishKeyOfZh(zh) {
+  const t = String(zh == null ? '' : zh).trim();
+  if (!t || !CJK.test(t)) return '';
+  let hit = '';
+  let n = 0;
+  for (const k of Object.keys(cache)) {
+    if (String(cache[k] == null ? '' : cache[k]).trim() === t) { n++; if (!hit) hit = k; }
+  }
+  return n === 1 ? hit : '';
+}
+
+/** 选中项归一化：Vortex 传进来的形状有三种（{modIds:[…]} / 单个 id / id 数组） */
+function normSelection(sel) {
+  if (sel == null) return [];
+  if (typeof sel === 'string') return sel ? [sel] : [];
+  if (Array.isArray(sel)) return sel.filter((x) => typeof x === 'string' && x);
+  if (Array.isArray(sel.modIds)) return sel.modIds.filter((x) => typeof x === 'string' && x);
+  return [];
+}
+
+/** 强制重翻（清模组名缓存后从英文原名重翻）。
+ *  KEY 稳定性铁律：送翻输入一律取 r.base（属性里的英文原名），绝不取当前显示名 ——
+ *  显示名可能是半中半英，拿它当 key 就是永动机（续 7 实录）。
+ *  已翻好的条目跳过（skipped 只统计这一类）；半拉子要清要翻。
+ *  下载记录不清缓存：判据是界面显示串，缓存是「显示串 → 译文」的映射，
+ *  清了就白烧模型（given-up + 有缓存的条目正是这么被救回来的）。 */
+async function translateAllFresh(want, dlIds) {
+  if (running) {
+    notify({ type: 'info', message: '汉化正在运行中，请稍候' });
+    return { applied: 0, failed: 0, error: '正在翻译中，请稍候再点' };
+  }
+  if (!cfg || !cfg.enabled) {
+    notify({ type: 'info', message: '模组名汉化已在设置中关闭' });
+    return { applied: 0, failed: 0, error: '模组名汉化已在设置里被关掉了' };
+  }
+  running = true;
+  const nid = 'modname-zh-fresh';
+  try {
+    // 枚举用一次状态快照（变量名刻意不叫 st：契约钉住「不用重新 getState 的显示名」）
+    const state = contextRef.api.getState();
+    const modsRoot = (state.persistent && state.persistent.mods) || {};
+    const list = [];
+    let skipped = 0;
+    let givenUp = 0;
+    let cleared = 0;
+    for (const gameId of Object.keys(modsRoot)) {
+      const table = modsRoot[gameId] || {};
+      for (const modId of Object.keys(table)) {
+        const mod = table[modId] || {};
+        if (mod.type === 'collection' && !(cfg && cfg.includeCollections)) continue;
+        // 当前显示名已是完整译文 → 不重翻（半拉子不跳，要清要翻）
+        const disp = String((mod.attributes || {}).customFileName || '').trim();
+        const bases = englishBaseNameOf(mod, modId);
+        // 但「形式合格」不等于「翻对了」：品牌被硬译的『蓬松模组管理器』有中文、无残留英文，
+        // cacheLooksDone 判它合格 → 永久跳过。品牌丢了必须重翻，否则全量重翻永远碰不到它
+        // （0.16.3 实测：30 条模组跳过 29 条，Fluffy 就是被这道门挡住的）。
+        const brandBad = disp
+          ? brandLost((Array.isArray(bases) && bases[0]) || rawNameOf(mod), disp)
+          : false;
+        // 「显示名已合格」不等于「不用重翻」：缓存被清空后，状态层（customFileName）还是
+        // 中文，只查显示名会把每一条都判成跳过 —— 实测用户点「清空全部翻译缓存(强制重翻)」
+        // 之后 fresh translate 返回 {todo:0,dl:0}，一条都没翻，缓存永远补不回来
+        // （2026-10-25 真机）。判据改成「显示名合格 且 缓存里确有对应条目」才算一致。
+        const cachedHas = bases.some((b) => b && cache[b] !== undefined);
+        if (disp && cacheLooksDone(disp) && !brandBad && cachedHas) { skipped++; continue; }
+        for (const base of bases) {
+          const r = { base };
+          if (!r.base) continue;                    // 找不到原名不猜
+          if (typeof registerKeptBrands === 'function') registerKeptBrands(r.base);
+          if (nothingToTranslate(r.base)) continue;
+          // 翻不动就退让（与 collectTargets 同一判据）。这里**连清缓存都不做** ——
+          // 否则条目既被删了译文、又被拉黑，界面停在英文且永远不再试，比不打补丁更糟。
+          if (typeof isGivenUp === 'function' && isGivenUp(cacheKeyOf(r.base))) { givenUp++; continue; }
+          if (cache[cacheKeyOf(r.base)] !== undefined && typeof dropTranslation === 'function') {
+            dropTranslation(r.base);
+            cleared++;
+          }
+          // 强制重翻：缓存刚被删光，这里恒为空。刻意不走 nameCacheOf 归一化反查——
+          // 那会把旧译文捞回来，违背「全部重翻」的本意（0.16.3 审计 P1-3 例外）
+          list.push({ gameId, modId, raw: r.base, cached: undefined });
+        }
+      }
+    }
+    // 下载记录：判据是界面显示串；有缓存就套（不清），没有才送模型
+    const files = ((state.persistent || {}).downloads || {}).files || {};
+    const dlWanted = dlIds === undefined ? Object.keys(files) : (dlIds || []);
+    const dlList = [];
+    let dlApplied = 0;
+    for (const id of dlWanted) {
+      const f = files[id];
+      if (!f) continue;
+      const t = downloadTargetOf(f, modsRoot);
+      if (!t) continue;
+      const b0 = t.raw;
+      // 判据统一走 nameCacheOf（内部含 cacheLooksDone 验收）—— 下载记录的缓存不清：
+      // 判据是界面显示串，清了就白烧模型（given-up + 有缓存的条目正是这么被救回的）
+      if (b0 && nameCacheOf(b0)) {
+        if (applyDownloadTranslation({ dlId: id, raw: b0 }, nameCacheOf(b0))) dlApplied++;
+        continue;
+      }
+      if (t.cached) {
+        // 借已安装条目的译文（版本尾巴严丝合缝才借，D2 零跨版本兜底）
+        if (applyDownloadTranslation({ dlId: id, raw: b0 }, t.cached)) dlApplied++;
+        continue;
+      }
+      if (isGivenUp(cacheKeyOf(b0))) { givenUp++; continue; }
+      dlList.push({ dlId: id, raw: b0 });
+    }
+    if (cleared > 0) saveJson(CACHE_PATH, cache, 'retranslate cleared');
+    log('info', 'fresh translate', { todo: list.length + dlList.length, dl: dlList.length + dlApplied, skipped, givenUp, cleared });
+    const full = list.concat(dlList);
+    // 真正发请求的那一步抽成局部函数：指名 / 不指名共用同一条路径
+    // （两份实现必然漂移，0.16.3 续 7 的两处死路就是这么来的）。
+    // 命中缓存的条目在上面就已经就地套好了，这里只处理还需要送模型的。
+    const translate = async (batch) => {
+      if (batch.length === 0) {
+        notify({ id: nid, type: 'success', message: `重翻完成：没有需要重翻的模组名（已翻好跳过 ${skipped} 条）` });
+        return { applied: dlApplied, failed: 0, none: true, skipped };
+      }
+      notify({ id: nid, type: 'info', message: `开始重翻：${batch.length} 条待翻译（模型：${(cfg.provider && cfg.provider.baseUrl) || '?'}）` });
+      const lanes = Math.max(1, Math.min(10, cfg.concurrency || 5));
+      const texts = batch.map((p) => p.raw);
+      const results = await core.translateConcurrently(cfg, cache, texts, lanes, (done, total) => {
+        if (done % 25 === 0 || done === total) {
+          notify({ id: nid, type: 'info', message: `重翻进度 ${done}/${total}` });
+        }
+      }, 'mod');
+      let applied = dlApplied;
+      let failed = 0;
+      const retry = [];
+      for (let k = 0; k < batch.length; k++) {
+        const item = batch[k];
+        const okOne = item.dlId ? applyDownloadTranslation(item, results[k]) : applyTranslation(item, results[k]);
+        if (okOne) applied++; else { failed++; retry.push(item); }
+      }
+      // ── 失败条目单独重试一次 ────────────────────────────────────────────
+      // 模型在 20 条一起送时会被别的条目带偏：实测 `ModSkillSlotPages Remaster 1.8`
+      // 单条连翻 6 次 6 次都过，混在批量里却连续 2 次原样照抄主体
+      // （`ModSkillSlotPages 重制版 1.8` → 有英文残留 → 验收拒）。单条重送能救回来。
+      // 只在「部分失败」时做：全失败说明模型/接口有问题，重试只是白等。
+      if (retry.length > 0 && retry.length < batch.length && retry.length <= 10) {
+        notify({ id: nid, type: 'info', message: `有 ${retry.length} 条没过验收，单独重试一次` });
+        const once = await core.translateConcurrently(cfg, cache, retry.map((p) => p.raw), 1, null, 'mod');
+        for (let k = 0; k < retry.length; k++) {
+          const item = retry[k];
+          const okOne = item.dlId ? applyDownloadTranslation(item, once[k]) : applyTranslation(item, once[k]);
+          if (okOne) { applied++; failed--; }
+        }
+      }
+      saveJson(CACHE_PATH, cache, 'retranslate fresh');
+      log('info', 'fresh translate done', { applied, failed, skipped, retried: retry.length });
+      if (failed > 0) {
+        const whole = failed >= batch.length;
+        notify({
+          id: nid,
+          type: whole ? 'warning' : 'success',
+          message: whole
+            ? `重翻完成：成功 ${applied}，失败 ${failed}。多数原因是模型接口没开或地址不对，请到 设置 → 模组名汉化 里点「测试连接」`
+            : `重翻完成：成功 ${applied}，失败 ${failed} 条未通过验收${givenUp ? `，另有 ${givenUp} 条试满 3 次已暂停自动重试` : ''}。要再试可右键单条「翻译此模组」`,
+        });
+      } else {
+        notify({
+          id: nid,
+          type: 'success',
+          message: `重翻完成：成功 ${applied} 条${givenUp ? `（${givenUp} 条试满 3 次已暂停，可右键单条强制重试）` : ''}`,
+        });
+      }
+      return { applied, failed, skipped };
+    };
+    // 「一键全部」（未指名）也要扫下载记录：通用批量翻译只认模组条目，
+    // 下载行必须由 healStaleDownloadNames 补扫，否则点一次「全部」就漏掉整页下载行。
+    if (!want) return translate(full).then((r) => healStaleDownloadNames(state)
+      .then((h) => Object.assign({}, r, { dlHealed: h })));
+    return translate(full);
+  } catch (e) {
+    log('error', 'translateAllFresh crashed', String((e && e.stack) || e));
+    notify({ id: nid, type: 'error', message: '模组名重翻失败：' + String(e).slice(0, 200) });
+    return { applied: 0, failed: 0, error: String(e).slice(0, 180) };
+  } finally {
+    running = false;
+  }
+}
+
+/** 重置单条模组名（右键「重新翻译此名」的状態层半边）：
+ *  删 domCache 里的名字匹配项 + 同族旧版本残留 + 该条所有候选缓存键，
+ *  把英文原名写回 originalName / customFileName（自愈，否则下次又要猜）。
+ *  domCache 只删名字匹配项，绝不整清、不碰 pack（契约钉死）。
+ *  只许用 cache/domCache/cfg/dispatch/writeJson + 抽出来的助手：
+ *  refresh 组 5 的沙箱只注了这些（没有路径常量 → 落盘由调用方负责）。 */
+function resetModName(state, gameId, modId) {
+  const modsRoot = (state.persistent && state.persistent.mods) || {};
+  const mod = (modsRoot[gameId] || {})[modId] || {};
+  const names = englishBaseNameOf(mod, modId);
+  const rawKeys = [modId, mod && mod.id].filter((x) => typeof x === 'string' && x);
+  const base = names[0] || '';
+  // domCache：整名匹配（f === n || f.indexOf(n) === 0）+ 同族旧版本残留
+  // （1.8 与 1.7a 版本号不同，只按整名比会漏 —— 实测残留一活就是几个月）
+  const stems = names.map((n) => modNameTokens(n)).filter((t) => t.length);
+  let domDropped = 0;
+  for (const dk of Object.keys(domCache)) {
+    if (dk === '_ver') continue;
+    const f = stripPseudo(dk).trim();
+    if (!f) continue;
+    let hit = false;
+    for (const n of names) {
+      if (f === n || f.indexOf(n) === 0) { hit = true; break; }
+    }
+    if (!hit && stems.length) {
+      const dt = modNameTokens(f);
+      for (const st of stems) {
+        if (commonTokenPrefixLen(st, dt) >= 12) { hit = true; break; }
+      }
+    }
+    if (hit) { delete domCache[dk]; domDropped++; }
+  }
+  // 模组名缓存：删该条所有候选键（含原始键形态 —— raw 与 cleaned 两个键只删一个，
+  // 下次读侧归一化又把它翻出来，P3-6）
+  let dropped = 0;
+  for (const n of names.concat(rawKeys)) {
+    if (n && cache[n] !== undefined) { delete cache[n]; dropped++; }
+  }
+  // 原名写回（自愈）：否则 originalName 丢了下次又要从键里猜
+  if (base) {
+    dispatch('originalName', gameId, modId, base);
+    dispatch('customFileName', gameId, modId, base);
+    if (cfg && cfg.writeToNameField) dispatch('name', gameId, modId, base);
+  }
+  return { domDropped, dropped, base };
+}
+
+/** 英文原名候选（重翻的输入、签名表的匹配键、自愈的缓存键）——返回字符串数组。
+ *  半中半英的显示名（customFileName/modName/name 已被我们写过）一律不收：
+ *  拿它当缓存键就是永动机（续 7 实录：键跟着显示名飘，每次启动都判「没翻过」）。
+ *  属性里没有英文名时（合集 / 无属性模组）从 mod.id 或 mods 键名剥：
+ *    空格式 `<名字> <fileId> <版本> <时间戳> <随机id>`（时间戳锚定，名字可含空格）
+ *    横线式 `<名字>-<fileId>-<版本>-<子版本>-<epoch>`（从尾部剥纯数字段，
+ *      名字自带的 `-1.8` 不是纯数字，不会被误剥 —— `Cool-Mod-1.8` 实测）
+ *  摆放位置有硬约束：必须留在 mergeRuntimeTerms → hitFromDownload 这个区间里
+ *  （dlname 测试沙箱按这两个标记整段切片，声明在区间外 → translateAllFresh 里
+ *  ReferenceError）。测试各自按函数名抽取，位置对它们无所谓。 */
+function englishBaseNameOf(mod, modId) {
+  const a = (mod && mod.attributes) || {};
+  const out = [];
+  const seen = new Set();
+  const add = (s) => {
+    // 压缩包后缀不是名字的一部分。原来只在 add(a.fileName) 那一处剥，
+    // 但整串键净化后可能只剩 `VAXIS_Blood_Physics_v1.4.zip`（日期戳切完就没有尾巴了），
+    // 落到显示名上是 `VAXIS血迹物理模组 v1.4.zip` —— 真机实测。
+    let t = String(s == null ? '' : s).trim().replace(/\.(zip|7z|rar)$/i, '');
+    if (!t || t.length < 3 || t.length > 200) return;
+    if (CJK.test(t)) return;                    // 半中半英的显示名绝不是原名
+    // 状态键 / 下载文件名的形态：`<名字> <fileId> <版本> <日期T时-分Z> <hash>`。
+    // a.name 里存的就是整串键（实测 `ModSkillSlotPages Remaster 1.7a 13188 12 2026-10-05T15-05Z yShfiQa4f`），
+    // a.fileName 是带 .zip 的整串 —— 直接送翻会让模型把 fileId、更新日期、随机 id 一起
+    // 翻进中文（2026-10-26 真机 11 条：`清洁水源功能 13392 1 2026-10-03T17-14Z GpMW8t9md`），
+    // 而且脏串会以 cache 键的形式留下来，反过来盖掉干净键的译文。
+    // 净化：日期戳前正好是「fileId + 版本」两段，切掉它们和日期之后的全部；
+    // 只按空格分段，不猜数字含义 —— `The Witcher 3` 里的 3 在名字段，不会被吃掉。
+    if (/\d\d\d\d-\d\d-\d\dT[\d:Z.\-]+$/i.test(t) || /\d\d\d\d-\d\d-\d\dT[\d:Z.\-]+\s/i.test(t)) {
+      const at = t.search(/\d\d\d\d-\d\d-\d\dT[\d:Z.\-]+/i);
+      if (at <= 0) return;                      // 日期在开头 → 整条不是名字
+      const parts = t.slice(0, at).trim().split(/\s+/).filter(Boolean);
+      if (parts.length < 3) return;             // 名字段 + fileId + 版本，至少 3 段
+      t = parts.slice(0, parts.length - 2).join(' ');
+      if (!t || !/[A-Za-z]/.test(t)) return;
+      // 净化后 t 被重新赋过值，开头那次剥扩展名已经失效 —— 这里必须再剥一次
+      // （`VAXIS_Blood_Physics_v1.4.zip 13506 1.4 2026-…` 切完尾巴正好剩个 .zip）
+      t = t.replace(/\.(zip|7z|rar)$/i, '').trim();
+      if (!t) return;
+    }
+    const lw = t.toLowerCase();
+    if (seen.has(lw)) return;
+    seen.add(lw);
+    out.push(t);
+  };
+  const stripExt = (s) => String(s == null ? '' : s).replace(/\.(zip|7z|rar)$/i, '');
+  add(a.originalName);
+  add(a.logicalFileName);
+  add(a.name);
+  add(a.modName);
+  add(stripExt(a.fileName));
+  // 键/id 兜底：先试空格式（时间戳锚定），再试横线式（剥尾部纯数字段）
+  const key = String((mod && mod.id) || modId || '').trim();
+  if (key) {
+    const parts = key.split(/\s+/);
+    let base = '';
+    for (let i = parts.length - 1; i >= 0; i--) {
+      if (/^\d\d\d\d-\d\d-\d\dT[\d:Z.-]+$/i.test(parts[i])) { base = parts.slice(0, Math.max(0, i - 2)).join(' '); break; }
+    }
+    if (!base && key.indexOf('-') > 0) {
+      const seg = key.split('-');
+      let n = seg.length;
+      while (n > 1 && /^\d+$/.test(seg[n - 1].trim())) n--;
+      base = seg.slice(0, n).join('-').trim();
+    }
+    if (base) {
+      const spaced = base.replace(/_+/g, ' ').replace(/\s+/g, ' ').trim();
+      if (spaced !== base) add(spaced);         // 空格形态优先（缓存键/显示名常用它）
+      add(base);                                // 下划线形态一起给（DOM 文本常带下划线）
+    }
+  }
+  // 全部候选统一收敛到规范键：写缓存 / 送模型 / 失败记账用的必须是同一个形态。
+  // 放在这里一次做完，而不是在每条 add 里各写一遍剥法 —— 那正是「五套口径」的来源。
+  // typeof 守卫：早期沙箱只抽本函数，没注 canonicalName。
+  if (typeof canonicalName === 'function') {
+    const uniq = [];
+    const seenC = new Set();
+    for (const x of out) {
+      const c = canonicalName(x);
+      if (!c) continue;
+      const lk = c.toLowerCase();
+      if (seenC.has(lk)) continue;
+      seenC.add(lk);
+      uniq.push(c);
+    }
+    return uniq;
+  }
+  return out;
+}
+
+function hitFromDownload(state, modsRoot, id) {
+  try {
+    const files = ((state || {}).persistent || {}).downloads || {};
+    const f = (files.files || {})[id];
+    if (!f) return '';
+    const inst = f.installed || {};
+    // ① installed.modId 精确反查（「旧副本找不到」的正解）
+    if (inst.modId && inst.gameId && modsRoot[inst.gameId] && modsRoot[inst.gameId][inst.modId]) {
+      return inst.gameId + ':' + inst.modId;
+    }
+    // ② localPath 文件名锚点：去目录和压缩包后缀
+    const lp = String(f.localPath || '');
+    const base = lp.replace(/^.*[\\/]/, '').replace(/\.(zip|7z|rar)$/i, '');
+    if (!base) return '';
+    for (const g of Object.keys(modsRoot || {})) {
+      if (modsRoot[g][base]) return g + ':' + base;
+    }
+    // ③ 主干前缀（同族换代：SwordFX 1.3.28 的行 → 1.2.4 的现存条目）
+    const st = modNameTokens(base);
+    if (st.length && st.join(' ').length >= 12) {
+      let best = '';
+      let bestLen = 0;
+      for (const g of Object.keys(modsRoot || {})) {
+        for (const k of Object.keys(modsRoot[g] || {})) {
+          const n = commonTokenPrefixLen(st, modNameTokens(k));
+          if (n >= 12 && n > bestLen) { best = g + ':' + k; bestLen = n; }
+        }
+      }
+      if (best) return best;
+    }
+  } catch (e) { /* 状态形状异常就安静返回空 */ }
+  return '';
+}
+
+/** 右键「翻译此模组」：点下载行就修下载记录（F2，与反查结果无关），
+ *  点模组行按 m.id 反查（Vortex 传的是纯 UUID，在 mods 键里匹配不上）。
+ *  只修点名的 + 有缓存的，不把没缓存的拖去烧模型。 */
+async function translateSelected(instanceIds) {
+  if (running) {
+    notify({ type: 'info', message: '汉化正在运行中，请稍候' });
+    return { applied: 0, failed: 0, error: '正在翻译中，请稍候再点' };
+  }
+  const ids = normSelection(instanceIds);
+  const state = contextRef.api.getState();
+  const modsRoot = (state.persistent && state.persistent.mods) || {};
+  const dlFiles = ((state.persistent || {}).downloads || {}).files || {};
+  const list = [];
+  const dlIds = [];
+  const miss = [];
+  const diag = { ids: ids.length, mods: 0, dl: 0, miss };
+  for (const id of ids) {
+    let hit = null;
+    for (const g of Object.keys(modsRoot)) {
+      const table = modsRoot[g] || {};
+      for (const mid of Object.keys(table)) {
+        const m = table[mid] || {};
+        if (mid === id || String(m.id) === id) { hit = { gameId: g, modId: mid, mod: m }; break; }
+      }
+      if (hit) break;
+    }
+    // F2：点中下载行就修这条记录本身 —— 反查成功也照记（老代码把 dlIds 挂在 else 上，
+    // 反查越成功，下载记录本人漏得越彻底）。只有反查失败才算「没找到模组」。
+    if (dlFiles[id]) dlIds.push(id);
+    else if (!hit) miss.push(id);
+    if (dlFiles[id]) diag.dl++;
+    if (hit) diag.mods++;
+    if (!hit) continue;
+    const found = hit;
+    const bases = englishBaseNameOf(found.mod, found.modId);
+    const raw = bases[0] || rawNameOf(found.mod);
+    if (!raw) continue;
+    if (typeof registerKeptBrands === 'function') registerKeptBrands(raw);
+    // 右键是用户亲手点的「再来一次」—— 唯一能突破有界退让的出口。
+    // 不清账的话：批量路径试满 3 次拉黑后，右键也只会静默跳过，用户看到的就是
+    // 「手动点翻译没反应 / 提示未通过验收」，这正是 0.16.3 里被反复投诉的无限循环。
+    if (typeof clearNameFail === 'function') clearNameFail(cacheKeyOf(raw));
+    list.push({ gameId: found.gameId, modId: found.modId, raw, cached: nameCacheOf(raw) });
+  }
+  log('info', 'translate selected diag', diag);
+  const dlTargets = [];
+  for (const id of dlIds) {
+    // 第三个参数 force=true：右键是用户亲手点的「再来一次」，
+    // 状态层已是中文也必须给出目标，否则这里为空 → 用户看到「没找到模组」。
+    const t = downloadTargetOf(dlFiles[id], modsRoot, true);
+    if (t) {
+      if (typeof clearNameFail === 'function') clearNameFail(cacheKeyOf(t.raw));
+      dlTargets.push({ dlId: id, raw: t.raw, cached: t.cached, f: t.f || dlFiles[id] });
+    }
+  }
+  running = true;
+  try {
+    let applied = 0;
+    let failed = 0;
+    const pending = [];
+    for (const t of list) {
+      if (t.cached) { if (applyTranslation(t, t.cached)) applied++; else failed++; }
+      else pending.push(t);
+    }
+    for (const t of dlTargets) {
+      if (t.cached) { if (applyDownloadTranslation(t, t.cached)) applied++; else failed++; }
+      else pending.push(t);
+    }
+    log('info', 'fresh translate', { todo: list.length + dlTargets.length, dl: dlTargets.length, skipped: 0 });
+    // 点名的下载行还要过一遍存量自愈（半中半英那档批量路径不收）；
+    // 修好就得算进结果，否则右键点下载行会被当成「没找到模组」甩错。
+    const dlFixed = await healStaleDownloadNames(state, dlIds);
+    applied += dlFixed;
+    if (dlFixed > 0) {
+      log('info', 'fix download rows by hand', { n: dlFixed });
+    }
+    if (pending.length === 0) {
+      if (applied > 0) notify({ type: 'success', message: `已修好 ${applied} 条模组名（命中缓存，未调用模型）` });
+      else notify({ type: 'info', message: '没有需要翻译的模组名（列表里已是中文或没有模组）' });
+      return { applied, failed, none: applied === 0 };
+    }
+    notify({ type: 'info', message: `开始翻译：${pending.length} 条待翻译（模型：${(cfg.provider && cfg.provider.baseUrl) || '?'}）` });
+    const lanes = Math.max(1, Math.min(10, cfg.concurrency || 5));
+    const results = await core.translateConcurrently(cfg, cache, pending.map((p) => p.raw), lanes, () => {}, 'mod');
+    for (let k = 0; k < pending.length; k++) {
+      const item = pending[k];
+      const okOne = item.dlId ? applyDownloadTranslation(item, results[k]) : applyTranslation(item, results[k]);
+      if (okOne) applied++; else failed++;
+    }
+    saveJson(CACHE_PATH, cache, 'translateAll batch');
+    if (failed > 0) {
+      notify({
+        type: 'success',
+        message: `翻译完成：成功 ${applied}，失败 ${failed} 条未通过验收（模型没翻彻底，可再点一次重试）`,
+      });
+    } else {
+      notify({ type: 'success', message: `翻译完成：成功 ${applied} 条` });
+    }
+    return { applied, failed };
+  } catch (e) {
+    log('error', 'translateSelected crashed', String((e && e.stack) || e));
+    notify({ type: 'error', message: '翻译失败：' + String(e).slice(0, 200) });
+    return { applied: 0, failed: 0, error: String(e).slice(0, 180) };
+  } finally {
+    running = false;
+  }
+}
+
+/** 界面自愈（存量半中半英显示名）。不经过任何闸门，专门把「缓存对了、界面没跟上」
+ *  的条目写回去。两档：
+ *    重伤（残留 ≥12 字符）→ 缓存里那份完整译文（键取自本条属性，版本天然精确）；
+ *      缓存没有 → 主干反查（按版本号选）；都没有 → 词级补翻。
+ *    轻伤 → 只准词级补翻（只换没翻的那个词），绝不许拿缓存里另一份译文整句覆盖
+ *      —— 整句覆盖就是「剑星 Vortex 扩展包 → 星辰之刃漩涡扩展模组」事故的来源。
+ *  轻伤补不上必须有界退让：记 nameFail（sh: 前缀），试满 NAME_FAIL_MAX 不再调模型。 */
+async function healStaleDisplayNames(state) {
+  const modsRoot = (state.persistent && state.persistent.mods) || {};
+  // 内联不引模块级常量：测试沙箱按函数名切源码，引用外部变量就是 ReferenceError。
+  // 正则也不用 {n} 量词 —— 沙箱按花括号配平切函数体，`\d{2}` 会把深度算错，
+  // 拼出来的脚本直接语法错误（audit4-v3 实测）。
+  const metaDirt = /\d\d\d\d-\d\d-\d\dT\d\d[-:]\d\d/;
+  let n = 0;
+  for (const gameId of Object.keys(modsRoot)) {
+    const table = modsRoot[gameId] || {};
+    for (const modId of Object.keys(table)) {
+      const mod = table[modId] || {};
+      if (mod.type === 'collection' && !(cfg && cfg.includeCollections)) continue;
+      const a = mod.attributes || {};
+      const cur = String(a.customFileName || a.name || a.logicalFileName || '').trim();
+      if (!cur || !CJK.test(cur)) continue;      // 纯英文归正常翻译流程，自愈不插手
+      // 元数据污染（2026-10-26 真机 11 条）：状态键被当原名送翻，模型把 fileId / 更新日期 /
+      // 随机 id 一起翻进中文 —— `清洁水源功能 13392 1 2026-10-03T17-14Z GpMW8t9md`。
+      // 这不是「半中半英」，refineByWords 换不掉数字串，只会白烧一次调用然后记失败。
+      // 只能整句重置；而重置**只允许用同条目 logicalFileName 的译文**，
+      // 红线「绝不跨条目整句覆盖」不变（脏串里带着别的版本的 fileId，跨条目等于乱配）。
+      if (metaDirt.test(cur)) {
+        const lf = String(a.logicalFileName || '').trim();
+        const clean = lf && !metaDirt.test(lf) ? nameCacheOf(lf) : '';
+        if (clean && modNameOk(clean) && !metaDirt.test(clean)) {
+          if (dispatch('customFileName', gameId, modId, clean)) n++;
+        }
+        continue;                                // 干净译文还没有 → 不动，交给「立即翻译全部」重翻
+      }
+      if (!healWorthy(cur)) continue;            // 已合格 / 无残留 → 不动
+      const strict = badlyUnfinished(cur);
+      let zh = '';
+      if (strict) {
+        const bases = englishBaseNameOf(mod, modId);
+        for (const b of bases) {
+          const v = nameCacheOf(b);
+          if (v) { zh = v; break; }
+        }
+        if (!zh) {
+          for (const b of bases) { const v = findCacheByStem(b); if (v) { zh = v; break; } }
+        }
+      }
+      // 轻伤档（P1-c）：只准词级补翻，绝不拿缓存里另一份译文整句覆盖 ——
+      // 整句覆盖正是「剑星 Vortex 扩展包 → 星辰之刃漩涡扩展模组」事故的来源。
+      if (!strict && healWorthy(cur)) {
+        const failKey = 'sh:' + cur;
+        if (isGivenUp(failKey)) continue;        // 有界退让：不每次启动烧一次调用
+        const refined = await refineByWords(cur);
+        if (refined && refined !== cur && modNameOk(refined)) {
+          zh = refined;
+          // 救回来了就销账：否则「失败 2 次 → 第 3 次救回来」之后仍挂着 n=2，
+          // 再失败一次就永久 given-up（TTL 内）。销账与 bump 必须成对出现在同一分支上。
+          if (typeof clearNameFail === 'function') clearNameFail(failKey);
+        } else {
+          bumpNameFail(failKey, cfg && cfg.provider && cfg.provider.model);
+          continue;                              // 补不上就不写（不留半成品）
+        }
+      }
+      if (!zh && strict) {
+        // 重伤档缓存也没命中：同样只做词级补翻，一样不许跨条目整句覆盖
+        const failKey = 'sh:' + cur;
+        if (isGivenUp(failKey)) continue;
+        const refined = await refineByWords(cur);
+        if (refined && refined !== cur && modNameOk(refined)) {
+          zh = refined;
+          if (typeof clearNameFail === 'function') clearNameFail(failKey);  // 同上：救回即销账
+        }
+        else {
+          bumpNameFail(failKey, cfg && cfg.provider && cfg.provider.model);
+          continue;
+        }
+      }
+      if (!zh) continue;
+      if (dispatch('customFileName', gameId, modId, zh)) n++;
+    }
+  }
+  if (n > 0) log('info', 'healed stale display names', { n });
+  return n;
+}
+
+/** 下载记录自愈：Vortex 把 modInfo.name 同步回英文后，重启能按缓存套回中文。
+ *  与 healStaleDisplayNames 同一条护栏：现值已是合格译文就绝不动。 */
+/** 下载行的存量自愈（半中半英的 modInfo.name）。
+ *  只做一件能保证正确的事：**词级补翻当前这串**，补完必须过硬验收才写回；
+ *  绝不拿缓存里另一份译文整句覆盖（那是「剑星 → 星辰之刃」事故的做法），
+ *  也绝不碰纯英文行（那是批量翻译的活）。
+ *  补不上记失败账（键 `dl:` + 当前显示名，与模组原名的 `sh:` 分开），
+ *  试满 NAME_FAIL_MAX 次就安静放弃，不许每次启动都烧一次模型。
+ *  依赖全部内联：下载测试沙箱只注了 CJK/modNameOk/cacheLooksDone/healWorthy/
+ *  isGivenUp/bumpNameFail/refineByWords/va，多引一个模块级函数就是 ReferenceError。 */
+async function healStaleDownloadNames(state, only) {
+  const st = state || contextRef.api.getState();
+  const files = ((st.persistent || {}).downloads || {}).files || {};
+  const onlySet = only && only.length ? new Set(only) : null;
+  let n = 0;
+  for (const dlId of Object.keys(files)) {
+    if (onlySet && !onlySet.has(dlId)) continue;
+    const f = files[dlId] || {};
+    // 判据 = 界面真正显示的那串。以前读 modInfo.name —— 那是我们写的字段，
+    // 表格根本不渲染它，于是自愈通道永远在看一份「没人看的副本」。
+    const cur = downloadShownNameOf(f);
+    if (!cur) continue;
+    if (!CJK.test(cur)) continue;                 // 纯英文 → 批量翻译的活，自愈不插手
+    // 自愈门槛：与 mods 表那条通道（healStaleDisplayNames）用同一个判据 healWorthy。
+    // 以前这里是 `if (modNameOk(cur)) continue;` —— 语义是反的坑：modNameOk 真值 =
+    // 「合格、跳过」，healWorthy 真值 = 「值得救、继续」，所以必须写成 `!healWorthy`。
+    // 两份判据并存时，将来谁改 modNameOk 的残留口径，两条通道就会各走一边
+    // （审计 v4 #1：同一判据两份实现，0.16.3 已经吃过这个亏）。
+    if (!healWorthy(cur)) continue;               // 已合格 / 无残留 → 不动
+    // 记账键 = 显示名原串，**绝不能过 `cacheKeyOf`**。
+    // 2026-10-26 v7.1 事故：写成 `'dl:' + cacheKeyOf(cur)`，而 `cur` 上一行刚被
+    // `if (!CJK.test(cur)) continue` 保证含中文，`cacheKeyOf` 对中文返回 `''`
+    // → failKey 恒为裸 `'dl:'`，全通道共用一个桶。任意 3 行补不上就
+    // `isGivenUp('dl:')` 恒真 → 之后每一行都被跳过，且无人 `clearNameFail('dl:')`，
+    // TTL 7 天内不可恢复（用户症状：翻到某行之后再也不自愈，躺一周又突然好了）。
+    // 与 sh: 通道（`'sh:' + cur`）保持一致：记账键是**显示名**，不是规范键。
+    const failKey = 'dl:' + cur;
+    if (isGivenUp(failKey)) continue;             // 有界退让：不每次启动烧一次调用
+    let zh = '';
+    if (typeof refineByWords === 'function') {
+      try { zh = await refineByWords(cur); } catch (e) { zh = ''; }
+    }
+    zh = String(zh == null ? '' : zh).trim();
+    if (!zh || zh === cur || !CJK.test(zh) || !modNameOk(zh)) {
+      bumpNameFail(failKey, cfg && cfg.provider && cfg.provider.model);
+      continue;                                   // 补不上就不写（不留半成品）
+    }
+    // 只写 modInfo.name —— 安全字段。界面靠 DOM 层从 cache 贴，
+    // 绝不写 nexus.fileInfo.name（会触发 Vortex 的 fuzzRatio 拼名，见 PITFALLS P-NAME-03）。
+    if (!setDownloadShownName(dlId, zh)) {
+      bumpNameFail(failKey, cfg && cfg.provider && cfg.provider.model);
+      continue;
+    }
+    // 缓存键必须是英文原名：只读 fileInfo.name（我们从不写它），没留底就别硬拼中文键。
+    const mi = f.modInfo || {};
+    let en = String(mi.zhSourceName
+      || (((mi.nexus || {}).fileInfo || {}).name) || '').trim();
+    if (!en || CJK.test(en)) en = CJK.test(cur) ? '' : cur;
+    // typeof 守卫：modname-download 的 heal 沙箱只注了 CJK，没注 cacheKeyOf
+    // （2026-10-26 去掉守卫后该测试直接 ReferenceError，是它先红的）
+    const ckHeal = typeof cacheKeyOf === 'function' ? cacheKeyOf(en) : en;
+    // 回退到原串时也要过 CJK：键必须是英文原名，中文键读侧永远贴不上屏
+    if (ckHeal && !CJK.test(ckHeal)) cache[ckHeal] = zh;
+    // 救回来了就销账（与 sh: 通道同口径）。不清账的话：失败 2 次之后第 3 次救回来，
+    // 账上仍挂着 n=2，再失败一次就永久 given-up —— 用户会看到「明明修好了又开始不翻」。
+    if (typeof clearNameFail === 'function') clearNameFail(failKey);
+    n++;
+  }
+  if (n > 0) log('info', 'healed stale download names', { n });
+  return n;
+}
+
 // ---------- 设置页（React，无 JSX） ----------
 
 function makeSettingsComponent() {
@@ -635,7 +3314,7 @@ function makeSettingsComponent() {
     save(patch) {
       const next = Object.assign({}, JSON.parse(JSON.stringify(DEFAULT_CFG)), this.state.cfg, patch);
       this.setState({ cfg: next });
-      writeJson(CONFIG_PATH, next);
+      saveJson(CONFIG_PATH, next, 'settings save');
       Object.assign(cfg, next); // 保持同一引用，DOM 层与翻译层才能即时读到新配置
       mergeRuntimeTerms();      // 用户在设置页改术语后，游戏名对照不能被 16 条覆盖掉
       // 启动时若关着实时翻译，DOM 层根本没被注入；这里补启，否则勾选后毫无反应
@@ -700,7 +3379,7 @@ function makeSettingsComponent() {
             const n = failCache[k];
             if (typeof n === 'number' && n > 0 && n <= domTranslator.RETRY_MAX) { delete failCache[k]; revived++; }
           }
-          if (revived > 0) writeJson(FAIL_PATH, failCache);
+          if (revived > 0) saveJson(FAIL_PATH, failCache, 'fail revive');
         }
         const msg = `✓ 连接正常（模型: ${model}），示例: ${out[0] || '空'}` + (revived > 0 ? `；${revived} 条暂态失败已放回重试` : '');
         this.setState({ testResult: msg });
@@ -715,6 +3394,16 @@ function makeSettingsComponent() {
     }
 
     render() {
+      // L3：计数随 tick 刷新（_lastStatRead 记着上次统计对应的 tick）——
+      // 后台在持续写 domCache，面板上的「已缓存 N 条」不能停在打开面板那一刻
+      if (this._lastStatRead !== this.state.tick) {
+        this._lastStatRead = this.state.tick;
+        this.state.stats = {
+          dom: Object.keys(domCache).filter((k) => typeof domCache[k] === 'string' && k !== '_ver').length,
+          mod: Object.keys(cache).length,
+          fail: Object.keys(failCache).filter((k) => k !== '_ver').length,
+        };
+      }
       const c = this.state.cfg || {};
       const p = c.provider || {};
       const draft = this.state.draft || {};
@@ -875,7 +3564,13 @@ function makeSettingsComponent() {
         row('',
           mkCheck(!!c.includeCollections, (v) => this.save({ includeCollections: v }), '同时汉化「合集 (Collections)」的名称')),
         row('',
-          mkCheck(!!c.writeToNameField, (v) => this.save({ writeToNameField: v }), '列表没显示中文时勾选这个（同时写入 name 字段）')),
+          // 2026-10-26 白盒核实（asar renderer.js @2842013）：Vortex 显示名取
+          // customFileName || logicalFileName || fileName || name —— name 优先级最低，
+          // 而本扩展每次都会写 customFileName，所以勾这个**通常看不出任何变化**。
+          // 旧文案「列表没显示中文时勾选这个」会让人以为它是万能开关，勾了没反应就当成
+          // 「翻译又坏了」来报（这几天反复误判的来源之一）。文案必须说清它只在
+          // 前三个字段都为空时才兜底生效。
+          mkCheck(!!c.writeToNameField, (v) => this.save({ writeToNameField: v }), '兜底：仅当模组名前三个字段都为空时才生效（极少见，一般不必勾选）')),
         h('div', { style: { margin: '10px 0 4px 158px', display: 'flex', gap: 10, flexWrap: 'wrap' } },
           h('button', {
             style: this.state.busy === 'test' ? btnStyleBusy : btnStyle,
@@ -887,9 +3582,13 @@ function makeSettingsComponent() {
             disabled: this.state.busy === 'all',
             onClick: async () => {
               this.setState({ busy: 'all' });
-              this.flash('… 开始翻译全部模组名（完成后会报结果）', true);
+              this.flash('… 开始重翻全部模组名（清掉旧缓存，完成后会报结果）', true);
               try {
-                const r = await translateAll();
+                // 「立即翻译全部」= 模组名缓存一并清掉再翻（translateAllFresh 内部清，
+                //   只清模组名缓存 + give-up 名单；domCache 是页面文本，不动）
+                Object.keys(failCache).forEach((k) => { delete failCache[k]; });
+                saveJson(FAIL_PATH, failCache, 'fail record');
+                const r = await translateAllFresh();
                 const s = r || {};
                 this.setState({
                   stats: { dom: this.state.stats.dom, mod: Object.keys(cache).length, fail: this.state.stats.fail },
@@ -915,20 +3614,29 @@ function makeSettingsComponent() {
               // 保留 _ver：手动清空后同版本内还能从 seed 恢复，删了就会被当成
               // 「跨版本」连 seed 一起跳过（那是升级才有的待遇）
               Object.keys(domCache).forEach((k) => { if (k !== '_ver') delete domCache[k]; });
-              writeJson(DOM_CACHE_PATH, domCache);
+              saveJson(DOM_CACHE_PATH, domCache, 'dom cache purge');
               // 不能写包内的 domCache.seed.json：扩展目录是只读静态资源区，
               // 写失败时用户会看到「清空了，重启又回来」。改用 userData 里的忽略标记。
-              writeJson(SEED_SKIP_PATH, { ver: extVerOf(), at: Date.now() });
+              saveJson(SEED_SKIP_PATH, { ver: extVerOf(), at: Date.now() }, 'seed skip write');
               Object.keys(failCache).forEach((k) => delete failCache[k]);
-              writeJson(FAIL_PATH, failCache);
+              saveJson(FAIL_PATH, failCache, 'fail cache purge');
               Object.keys(cache).forEach((k) => delete cache[k]);
-              writeJson(CACHE_PATH, cache);
+              saveJson(CACHE_PATH, cache, 'cache purge');
+              // 清空后立刻补回零模型种子。扩展名的译文只有「游戏译名词库 + 固定后缀」
+              // 这一个正确来源（整串送模型会翻成「恒星之刃：漩涡扩展包」，实测）；
+              // 而 seedExtensionNames 在 autostart 里本轮已经跑过 —— 那时 cache 还有值
+              // → 它判「已有合格译文」返 0，不会重跑。不在这里补，下载行的剥尾通道
+              // 整轮都查不到东西，只能退回英文（2026-10-25 真机）。
+              try { seedExtensionNames(contextRef.api.getState()); } catch (e) { /* 补不上就保持英文 */ }
               resetLiveStatus();
+              const reseeded = Object.keys(cache).length;
               this.setState({
-                stats: { dom: 0, mod: 0, fail: 0 },
+                stats: { dom: 0, mod: reseeded, fail: 0 },
                 testResult: '',
                 flash: {
-                  text: `✓ 已清空：页面文本 ${before.dom} 条、模组名 ${before.mod} 条、失败名单 ${before.fail} 条。页面会重新开始翻译（模型没开的话会一直显示英文）`,
+                  text: `✓ 已清空：页面文本 ${before.dom} 条、模组名 ${before.mod} 条、失败名单 ${before.fail} 条。`
+                    + (reseeded > 0 ? `扩展名译文按游戏译名词库补回 ${reseeded} 条（这个只能拼，整句送模型会翻错）；` : '')
+                    + '其余点「立即翻译全部」重翻（模型没开的话会一直显示英文）',
                   ok: true,
                 },
               });
@@ -1123,7 +3831,7 @@ function main(context) {
       // 术语表去重（游戏译名并进术语表，只作用于运行时，不回写 config.json，
       // 否则每启动一次 config 就胖一圈）
       runtimeTerms = toTermList(gameMap);
-      cfg.gameTerms = runtimeTerms;
+      // gameTerms 留到 gameKeep 载入后由 rebuildKeepNames 统一装配（含品牌遮蔽术语）
       // 固定译名表（游戏名）→ DOM 层优先命中，不再过模型
       termExact = new Map();
       for (const k of Object.keys(gameMap)) {
@@ -1132,30 +3840,83 @@ function main(context) {
       }
       gameKeep = readJson(GAME_KEEP_PATH, []);
       if (!Array.isArray(gameKeep)) gameKeep = [];
+      keepNameSet = new Set(gameKeep.filter((x) => typeof x === 'string' && x.trim()).map((x) => x.trim().toLowerCase()));
       // 明确保持英文的名字（gamenames-keep.json）：
       // **不要**写进 domCache 来表达「保持英文」。DOM 层启动自清洗的判据就是
       // 「值等于键 = 假翻译，删掉」，写进去会被同一进程立刻清光，机制等于没有。
       // 改为单独一张 Set 交给 DOM 层，在送翻入口直接短路。
       if (gameKeep.length) log('info', 'keep-en names loaded', { n: gameKeep.length });
+      // 用户右键「这个名字保留英文」记的词（userKeep.json，数据目录，升级不丢）——
+      // 与词库合并成同一张保英文表由下面的 rebuildKeepNames 统一做
+      const userKept0 = (typeof userKeepList === 'function' ? userKeepList() : []).filter((x) => typeof x === 'string' && x.trim());
+      if (userKept0.length) log('info', 'user keep names loaded', { n: userKept0.length });
+      // 保英文名单（词库 + 用户右键保留）+ 品牌头登记 + 品牌遮蔽术语进 gameTerms 的唯一定装配点
+      rebuildKeepNames();
       cache = asDict(readJson(CACHE_PATH, {}));
+      // 键一次性规范化：读/写/删都改成 canonicalName 之后，旧键不迁移就等于集体失效
+      try {
+        const nm = typeof normalizeCacheKeys === 'function' ? normalizeCacheKeys(cache) : 0;
+        if (nm > 0) {
+          saveJson(CACHE_PATH, cache, 'cache normalize');
+          log('info', 'cache keys normalized', { n: nm });
+        }
+      } catch (e) { log('warn', 'cache key normalize fail', String(e)); }
       domCache = asDict(readJson(DOM_CACHE_PATH, {}));
       failCache = asDict(readJson(FAIL_PATH, {}));
+      nameFail = asDict(readJson(NAME_FAIL_PATH, {}));
+      // 失败账的键也归一化：旧版本记的是原串，新版本查的是规范键，
+      // 不迁移就等于「旧账全部失效 → 试满 3 次的条目又开始无限重试」（就是用户投诉的那个循环）
+      try {
+        const nf = typeof normalizeCacheKeys === 'function' ? normalizeCacheKeys(nameFail) : 0;
+        if (nf > 0) { saveJson(NAME_FAIL_PATH, nameFail, 'namefail normalize'); log('info', 'nameFail keys normalized', { n: nf }); }
+      } catch (e) { /* 迁移失败不影响主流程 */ }
+      wordCache = asDict(readJson(WORD_PATH, {}));
+      // P3-2：词级补翻词表里属于保英文名单的词删掉（vortex→漩涡 这类旧账：
+      // 补翻管线会把「明确保持英文」的品牌词硬译成中文，与品牌遮蔽机制直接打架）
+      {
+        const wBefore = Object.keys(wordCache).length;
+        for (const wk of Object.keys(wordCache)) {
+          if (keepNameSet && keepNameSet.has(String(wk).toLowerCase())) delete wordCache[wk];
+        }
+        const wDropped = wBefore - Object.keys(wordCache).length;
+        if (wDropped) {
+          if (saveJson(WORD_PATH, wordCache, 'word cache drop keep-en')) log('info', 'word cache dropped keep-en', { n: wDropped });
+        }
+      }
+      // 词级固定译名并进 wordCache（0.16.3 续 18）：
+      // 上面那个循环刚把「保英文名单里的词」从 wordCache 删掉，这里再盖固定译名 ——
+      // 顺序不能反，反了会把 plus/ultra 这类刚加进保英文名单的词又写回译文。
+      // 只补「还没有」的键；已有且不同的（模型之前翻的）直接用官方译名覆盖，
+      // 因为这张表就是「固定翻译」的唯一真理源。
+      try {
+        let wSeed = 0;
+        for (const wk of Object.keys(WORD_FIXES)) {
+          if (keepNameSet && keepNameSet.has(String(wk).toLowerCase())) continue;
+          if (wordCache[wk] === WORD_FIXES[wk]) continue;
+          wordCache[wk] = WORD_FIXES[wk];
+          wSeed++;
+        }
+        if (wSeed) {
+          saveJson(WORD_PATH, wordCache, 'word cache write');
+          log('info', 'word fixes seeded', { n: wSeed });
+        }
+      } catch (e) { log('warn', 'word fixes seed fail', String(e)); }
       // 版本标记：升级 → 译文缓存与失败名单整体作废。
       // 旧缓存是旧版本翻译管道的产物，新版本修过的 bug（全角引号/裸粘连/占位符/
       // 占比门槛/回声判定）在旧缓存里照样是坏的，留着等于留着 bug。
       // 用户填的配置在 config.json，不在此列，升级不受影响。
-      let cacheResetFor = '';
+      // （曾经这里还有个 cacheResetFor 进程内变量参与种子恢复判断，重启即丢；
+      //   0.16.3 起改为 domCount 实测 + seedSkip 二条件，不依赖任何内存状态）
       try {
         const extVer = (JSON.parse(fs.readFileSync(path.join(EXT_DIR, 'info.json'), 'utf8')).version) || '';
         if (extVer && domCache._ver !== extVer) {
           domCache = asDict({ _ver: extVer });
-          writeJson(DOM_CACHE_PATH, domCache);
-          cacheResetFor = extVer;
+          saveJson(DOM_CACHE_PATH, domCache, 'dom cache write');
           log('info', 'dom cache reset for new version', { version: extVer });
         }
         if (extVer && failCache._ver !== extVer) {
           failCache = asDict({ _ver: extVer });
-          writeJson(FAIL_PATH, failCache);
+          saveJson(FAIL_PATH, failCache, 'fail cache write');
           log('info', 'fail cache reset for new version', { version: extVer });
         }
       } catch (e) { /* info.json 读不到就跳过 */ }
@@ -1170,18 +3931,38 @@ function main(context) {
       // 打包时会把清空前的内容留一份 domCache.seed.json，同版本内缓存为空就自动恢复，
       // 这样误清缓存后界面文案立刻还是中文，不必等模型重翻一遍（重翻还经常失败）。
       // **跨版本不恢复**：刚因升级被清空正是为了扔掉旧译文，塞回来等于没清。
-      const seedSkip = readJson(SEED_SKIP_PATH, null);
-      const skipSeed = !!(seedSkip && (!seedSkip.ver || seedSkip.ver === extVerOf()));
-      if (!cacheResetFor && !skipSeed && Object.keys(domCache).filter((k) => typeof domCache[k] === 'string' && k !== '_ver').length === 0) {
+      const skipSeed = seedSkip();
+      const domCount = Object.keys(domCache).filter((k) => typeof domCache[k] === 'string' && k !== '_ver').length;
+      if (!skipSeed && domCount === 0) {
         const seed = readJson(SEED_PATH, {});
-        const n = Object.keys(seed).filter((k) => typeof seed[k] === 'string' && k !== '_ver').length;
+        // seed 质检：引号壳/空值/假翻译/占位符丢/伪标签错/引号不配对/BBCode 重复不灌
+        const good = {};
+        for (const k of Object.keys(seed)) {
+          if (k === '_ver' || typeof seed[k] !== 'string') continue;
+          if (!seedEntryOk(k, seed[k])) continue;
+          // 出厂 seed 是历史快照，里面留着「品牌被硬译」的坏条目
+          // （`<i1>Fluffy Mod Manager</i1>` → `绒毛模组管理器`）。词库加进来之后
+          // seedEntryOk 那条通用质检看不出这种错，必须单独按品牌判据拦一次，
+          // 否则每次启动都把它灌回 domCache，用户看到的就是「词库又没生效」。
+          if (brandLost(k, seed[k])) continue;
+          good[k] = seed[k];
+        }
+        const n = Object.keys(good).length;
         if (n > 0) {
-          domCache = asDict(seed);
-          if (domCache._ver === undefined) domCache._ver = extVerOf();
-          writeJson(DOM_CACHE_PATH, domCache);
+          domCache = asDict(good);
+          domCache._ver = extVerOf();
+          saveJson(DOM_CACHE_PATH, domCache, 'dom cache flush');
           log('info', 'dom cache restored from seed', { n });
         }
       }
+  // 品牌被硬译的存量缓存清掉（0.16.3 续 12 那批「剑星漩涡扩展模组」旧账）：
+  // 判据是「键里带品牌词、译文里却没有」——译文把品牌翻没了，是坏的，删掉重翻。
+  try { purgeBrandTranslations(); } catch (e) { log('warn', 'brand cache purge fail', String(e)); }
+  // 缓存清完之后再动状态库：顺序反了会先拿坏缓存把英文名又翻一遍。
+  // 但**这里不能调 restoreBrandNames** —— 它第一行是 contextRef.api.getState()，
+  // Vortex 在 init 阶段直接拒（"extension uses api in init function"），
+  // 整段抛错等于一条都没还原（0.16.3 实测日志实锤）。实际调用点在 autostart 段。
+
   let extVer = '';
   try { extVer = (JSON.parse(fs.readFileSync(path.join(EXT_DIR, 'info.json'), 'utf8')).version) || ''; } catch (e) { /* ignore */ }
   log('info', 'loaded v' + (extVer || '?'), { dir: EXT_DIR, baseUrl: cfg.provider && cfg.provider.baseUrl });
@@ -1215,7 +3996,30 @@ function main(context) {
     }
   };
 
-  reg('mods-action-icons', 300, 'settings', '一键汉化模组名', translateAll);
+  // 右键动作：300 一键重翻（清缓存）/ 301 翻译此模组（单条）/ 302 保留英文
+  // 300 必须包箭头函数：Vortex 会往回调塞 instanceIds，直接传会被当成 want
+  reg('mods-action-icons', 300, 'settings', '一键汉化模组名（全部重翻）', () => translateAllFresh());
+  reg('mods-action-icons', 301, 'settings', '翻译此模组', translateSelected);
+  reg('mods-action-icons', 302, 'settings', '这个名字保留英文（记入词表）', (ids) => {
+    // 右键传的是 UUID，先反查出屏幕上那条名字再记（记中文没有意义）
+    try {
+      const state = contextRef.api.getState();
+      const modsRoot = (state.persistent && state.persistent.mods) || {};
+      for (const id of normSelection(ids)) {
+        for (const g of Object.keys(modsRoot)) {
+          for (const mid of Object.keys(modsRoot[g] || {})) {
+            const m = modsRoot[g][mid] || {};
+            if (mid !== id && String(m.id) !== id) continue;
+            const r = keepNameEn(rawNameOf(m) || displayNameOf(m));
+            notify({ type: r && r.kept ? 'success' : 'info', message: r && r.kept ? '已记入保英文词表（重启后仍生效）' : '没能解析出这个名字' });
+            return r;
+          }
+        }
+      }
+      notify({ type: 'info', message: '没能解析出这个名字（只在模组行上可用）' });
+    } catch (e) { log('warn', 'keep name action', String(e)); }
+    return null;
+  });
   reg('btn-toolbar', 300, 'settings', '模组名汉化', translateAll);
   reg('global-toolbar', 300, 'settings', '模组名汉化', translateAll);
 
@@ -1257,8 +4061,9 @@ function main(context) {
         log('warn', 'auto hook inner', String(e));
       }
     };
-    context.api.onStateChange(['persistent', 'mods'], autoHook);
-    context.api.onStateChange(['persistent', 'downloads'], autoHook);
+    // 注册延后：init 阶段 context.api 不可用，onStateChange 静默失效（不抛错、不生效）。
+    // 真正绑定在 autostart 段（api 就绪后），见 autoHookRef / autoHookBound。
+    autoHookRef = autoHook;
   } catch (e) {
     log('warn', 'auto hook', String(e));
   }
@@ -1269,24 +4074,48 @@ function main(context) {
   startDomRef = () => {
     if (domStarted) return true;
     try {
-      domTranslator.startDomTranslator({
+      // F2：启动先清 domCache 里的模组名条目（D1 单一缓存源；扩展名豁免）。
+      // 必须在 DOM 层首次扫描之前 —— 否则那批条目会被老路径贴上去，又变成两个写者。
+      try { pruneDomCacheNames(); } catch (e) { log('warn', 'prune dom cache names fail', String(e)); }
+      // 保英文名单的快照源：keepNameEn 右键保留时往 keepEnSetRef 里加词。
+      // 传给 DOM 层的是一份拷贝（字面 keepEn: new Set(keepEnSetRef) 是
+      // review-fix 第 4 条的契约锚点，别并回去）——同会话内新保留的词靠
+      // index 侧 keepNameSet + residueWords 豁免兜底，重启后全量同步。
+      keepEnSetRef = new Set(
+        [].concat(gameKeep || [], userKeepList()).filter((x) => typeof x === 'string' && x.trim())
+      );
+      // 审计 v10 发现 3：startDomTranslator 拿不到 body 会明确返回 false（P2-2），
+      // 返回值必须接住 —— false 时不能置 domStarted，否则设置页补启条件 (!domStarted)
+      // 恒假，该会话 DOM 层静默死亡且无法自救。判据用 === false：undefined（老形态）
+      // 按成功，防御性兼容。
+      const domOk = domTranslator.startDomTranslator({
         cfg,
         cache: domCache,
         failCache: failCache,
         termExact: termExact,
-        keepEn: new Set((gameKeep || []).filter((x) => typeof x === 'string' && x.trim())),
-        // 采集是跨会话累积的素材：不载入已有文件，每次启动都会把上次采的清空
+        keepEn: new Set(keepEnSetRef),
+        // 采集是跨会话累积的素材：每次启动都把已有文件读进来，新采的追加在旧素材后面
         collected: readJson(COLLECT_PATH, []),
         statusRef: liveStatus,
         lexicon: lex(),
         translateBatch: core.translateBatch,
         translateConcurrently: core.translateConcurrently,
-        saveCollect: (arr) => writeJson(COLLECT_PATH, arr),
-        saveFail: (obj) => writeJson(FAIL_PATH, obj),
+        // 采集落盘也走 saveJson：DOM 层那一侧是 `try { saveCollect() } catch(e) {}`，
+        // 写失败在日志里完全看不见（审计 E5 / N4 同一类问题）。
+        saveCollect: (arr) => saveJson(COLLECT_PATH, arr, 'collected'),
+        saveFail: (obj) => saveJson(FAIL_PATH, obj, 'dom fail save'),
         lastFailInit: failMtime,
         log,
-        save: () => writeJson(DOM_CACHE_PATH, domCache),
-      });
+        save: () => saveJson(DOM_CACHE_PATH, domCache, 'dom cache save'),
+        // 名字译文源（cache.json）。右键动作一律走官方 registerAction，DOM 层不接管右键
+        nameGate,
+        unfinishedName,
+        nameTranslationOf: nameTranslationOf,
+      }) !== false;
+      if (!domOk) {
+        log('warn', 'dom layer not started (body not ready); retry via settings toggle');
+        return false;
+      }
       domStarted = true;
       log('info', 'dom layer started');
       return true;
@@ -1309,7 +4138,7 @@ function main(context) {
           for (const g of known) { if (g && g.id && g.name) map[g.name] = g.id; }
           // 这是诊断用的对账文件，不是包内静态资源；扩展目录在升级时会被覆盖，
           // 而且可能只读。落到数据目录，和「扩展目录只读」的纪律保持一致。
-          writeJson(path.join(DATA_DIR, 'games-available.json'), map);
+          saveJson(path.join(DATA_DIR, 'games-available.json'), map, 'games available dump');
           log('info', 'known games dumped', { n: Object.keys(map).length });
         }
         if (!((cfg.provider && cfg.provider.baseUrl) || '').trim() && !pendingNotice) {
@@ -1320,7 +4149,82 @@ function main(context) {
           };
         }
         flushPendingNotice();          // init 阶段攒下的通知，到这里 api 已经可用
-        if (cfg && cfg.enabled) applyCachedSilently();
+        if (cfg && cfg.enabled) {
+          // 品牌还原：必须等 api 就绪（init 段调会抛 "extension uses api in init function"，
+          // 整段等于没跑——0.16.3 实测「蓬松模组管理器」一直没被还原就是这个原因）。
+          // 还原成英文后，下一轮 collectTargets 会把它当未翻条目重新送模型 → 「Fluffy 模组管理器」。
+          try {
+            const bn = restoreBrandNames(contextRef.api.getState());
+            if (bn) log('info', 'brand names restored', { n: bn });
+          } catch (e) { log('warn', 'brand name restore fail', String(e)); }
+          // 扩展名零模型补种（审计 v4 #5）：`<游戏名> Vortex Extension` 按词库拼，
+          // 不写进 cache 的话，DOM 的剥尾贴名通道永远查不到（用户机实测：
+          // cache.json 42 条键里含 `Vortex Extension` 的 0 条 → 一条也贴不出来）。
+          // 必须在 restoreBrandNames 之后：先还原坏译文，再补正确译文。
+          try { seedExtensionNames(contextRef.api.getState()); } catch (e) { log('warn', 'extension seed fail', String(e)); }
+          // 自动翻译钩子：init 里注册静默失效，这里才是有效点（api 已可用）。
+          if (autoHookRef && !autoHookBound) {
+            autoHookBound = true;
+            try {
+              context.api.onStateChange(['persistent', 'mods'], autoHookRef);
+              context.api.onStateChange(['persistent', 'downloads'], autoHookRef);
+              log('info', 'auto hook bound');
+            } catch (e) { log('warn', 'auto hook bind', String(e)); }
+          }
+          // 词库漂移对账（2026-10-26 用户方案，替代「一键清状态层」）：
+          // 词表指纹变了才扫（平时零成本）。漂移条目删缓存键后，随后的
+          // 自动翻译 / 立即翻译全部把它当未翻条目重做——走正常管线，
+          // 遮蔽自动生效，重翻完成由管线 dispatch 覆盖 customFileName，
+          // 状态层从头到尾不被批量改写。删了键 = 普通未翻条目，重试/退让
+          // 全部交给既有机制，这里不own重试。
+          try {
+            const glStamp = glossaryStampOf(wordFixTerms());
+            if (cache._gl !== glStamp) {
+              const audit = auditGlossaryDrift(cache, wordFixTerms(), core.applyTerms, CJK);
+              for (const s of audit.stale) dropTranslation(s.k);
+              if (audit.stale.length === 0) {
+                // 全干净才落戳：有漂移不落戳，下次启动再审（重翻失败/又被灌回的还能被抓到）
+                cache._gl = glStamp;
+                saveJson(CACHE_PATH, cache, 'glossary drift audit');
+              } else {
+                saveJson(CACHE_PATH, cache, 'glossary drift drop');
+              }
+              log('info', 'glossary drift audit', {
+                checked: audit.checked, stale: audit.stale.length,
+                stamped: audit.stale.length === 0,
+                sample: audit.stale.slice(0, 5),
+              });
+              // 主动踢管线（2026-10-26 真机实录第三课）：删了键 ≠ 回到未翻队列 ——
+              // 「要翻」的判据看状态层（中文=翻过），且 autoHook 只挂在
+              // onStateChange 上，启动后 mods/downloads 表没人动它一次都不跑
+              // （上一次部署后就是死在这里：audit 打了、管线静默、显示纹丝不动）。
+              // ★ 只要执行了重审就踢，不要求本轮 stale>0 —— 上一次启动可能刚删过键
+              //   （本次重审 stale=0、只落戳），但状态层的旧译文还在等重翻；
+              //   todo 为空时 autoHook 自己空手返回，多踢一次零成本。
+              if (autoHookRef) {
+                setTimeout(() => {
+                  try { autoHookRef(); } catch (e) { log('warn', 'drift auto hook', String(e)); }
+                }, 15000);
+              }
+            }
+          } catch (e) { log('warn', 'glossary drift audit', String(e)); }
+          applyCachedSilently();
+          // 界面自愈（存量半中半英）：异步不阻塞启动；轻伤档有 nameFail 有界退让。
+          // 模组显示名 / 下载行两条线都在这一步走完 —— 只修显示名会留下整页下载行英文。
+          const state = contextRef.api.getState();
+          Promise.resolve()
+            .then(async () => {
+              let n = 0;
+              // 缓存死账先修：DOM 贴的是 cache.json，先把坏的改对，
+              // 下面两条状态层通道才不会拿坏译文当基准（顺序反了会白跑一轮）。
+              n += await healStaleCacheEntries();
+              n += await healStaleDisplayNames(state);
+              n += await healStaleDownloadNames(state);
+              return n;
+            })
+            .then((n) => { if (n > 0) log('info', 'startup heal done', { n }); })
+            .catch((e) => { log('warn', 'heal names fail', String(e)); });
+        }
       } catch (e) { log('warn', 'autostart', String(e)); }
     }, 8000);
   } catch (e) {

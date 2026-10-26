@@ -37,21 +37,51 @@ function escapeRegExp(s) {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+/** 全大写术语判定：字母 ≥2 且全大写（LOOT / UE4SS / HDT-SMP / F4SE）。
+ *  这类词大小写敏感 —— 小写 loot 不该命中品牌 LOOT（③ 实录）；
+ *  UE4SS 只有 5 个字母也够，单个字母的术语（如 X）不敏感处理。 */
+function termIsAllCaps(en) {
+  const L = String(en == null ? '' : en).replace(/[^A-Za-z]/g, '');
+  return L.length >= 2 && L === L.toUpperCase();
+}
+
 function applyTerms(text, terms, direction) {
   let out = text;
-  const sorted = (terms || []).slice().sort((a, b) => (b.en || '').length - (a.en || '').length);
+  // 排序：长词优先（Faster HDT-SMP 必须先于 HDT-SMP，否则长词被切碎）；
+  // 同长时全大写品牌优先（LOOT 先于 Loot，否则用户术语把品牌吃掉 —— 组 2 实录）。
+  const sorted = (terms || []).slice().sort((a, b) => {
+    const d = (b.en || '').length - (a.en || '').length;
+    if (d) return d;
+    return (termIsAllCaps(b.en) ? 1 : 0) - (termIsAllCaps(a.en) ? 1 : 0);
+  });
+  // 单条术语的遮罩替换（mask 方向专用）。
+  const maskOne = (text, t) => {
+    // 右边界不能用 lookahead 表达「后面不是小写字母」：`i` 标志会让字符类 [a-z]
+    // 连大写一起匹配，(?![a-z0-9]) 实际等价于 (?![A-Za-z0-9]) —— 实测 GwentCardSwap
+    // 里的 Gwent 遮不上。改成匹配后用回调检查下一个字符，语义才可控。
+    // 全大写品牌大小写敏感；其余术语大小写不敏感（Grass 要能匹配 grass）。
+    const re = new RegExp(escapeRegExp(t.en), termIsAllCaps(t.en) ? 'g' : 'gi');
+    // 已遮罩的段不再参与匹配：长词先遮出 『Faster HDT-SMP』 后，短词 HDT-SMP
+    // 又会切进去变成 『Faster 『HDT-SMP』』（嵌套遮罩，还原必错）。
+    return String(text).split(/(『[^』]*』)/g).map((seg) => {
+      if (/^『[^』]*』$/.test(seg)) return seg;
+      return seg.replace(re, (hit, offset, whole) => {
+        const next = String(whole).charAt(offset + hit.length);
+        if (/[A-Za-z0-9]/.test(next)) {
+          // fuzzy 档（专名硬遮蔽）：驼峰里的大写照遮 —— `ModSummonandMountRoach`、
+          // `GwentCardSwap` 这类连写名字，只要松一侧边界，模型就会自由发挥
+          // （实测 Roach→蟑螂、Gwent 保留英文、Oils→油质）。
+          // 小写后缀和数字仍然挡住（OilsX 之外，Roachs / oils2 都不遮）。
+          if (!(t.fuzzy && /[A-Z]/.test(next))) return hit;
+        }
+        return '『' + t.zh + '』';
+      });
+    }).join('');
+  };
   for (const t of sorted) {
     if (!t.en || !t.zh) continue;
-    if (direction === 'mask') {
-      // 必须带词边界。默认术语表里就有 Quest / Blood / Grass 这类短词，没有 \b 会切进别的单词：
-      //   Bloody Mess → 『血迹』y Mess、Grasslands → 『草地』lands、Questionable → 『任务』ionable
-      // 模型拿到这种半中半英的输入，译名就成了「血迹y 混乱」并被缓存下来。
-      const bare = /^[A-Za-z0-9_]+$/.test(t.en);
-      const re = new RegExp((bare ? '\\b' : '') + escapeRegExp(t.en) + (bare ? '\\b' : ''), 'gi');
-      out = out.replace(re, '『' + t.zh + '』');
-    } else {
-      out = out.replace(new RegExp('『' + escapeRegExp(t.zh) + '』', 'g'), t.zh);
-    }
+    if (direction === 'mask') out = maskOne(out, t);
+    else out = out.replace(new RegExp('『' + escapeRegExp(t.zh) + '』', 'g'), t.zh);
   }
   return out;
 }
@@ -118,6 +148,21 @@ function normalizeCase(t) {
   return s;
 }
 
+/** 遮罩感知的大小写归一：品牌/术语先打成『』再送翻，归一化不许碰遮罩段。
+ *  ① 『』内原样保留（UE4SS 不被改成 Ue4ss，否则词库再也匹配不上 —— ④ 实录）；
+ *  ② 「是不是全大写」要连遮罩段一起判断：只看拆出来的段会把
+ *     VAXIS_『血迹』_Physics 判成「VAXIS_ 全大写」→ 单独改成 Vaxis_（⑤ 实录）；
+ *  ③ 混合大小写串整体不动（VAXIS_Blood_Physics_v1.5 原样保留）。 */
+function normalizeCaseKeepMasks(t) {
+  const s = String(t == null ? '' : t);
+  const bare = s.replace(/『[^』]*』/g, '');
+  const letters = bare.replace(/[^A-Za-z]/g, '');
+  if (letters.length < 3 || letters !== letters.toUpperCase()) return s;
+  return s.split(/(『[^』]*』)/g)
+    .map((seg) => (/^『[^』]*』$/.test(seg) ? seg : normalizeCase(seg)))
+    .join('');
+}
+
 /** 内置对照：写死在提示词里，不依赖用户术语表。
  *  模型对缩写极易认错（实测 TW3 被当成《上古卷轴3》，用户的合集名一半带 TW3），
  *  这种错误用后处理救不回来，只能在提示词里先钉死。 */
@@ -152,6 +197,10 @@ const PATH_GAME_ALIASES = [
   'Skyrim Special Edition', 'Skyrim', 'Fallout 4', 'Fallout New Vegas',
 ];
 
+// BBCode 标签头清单（review4）：与 protectPaths / srcHead 三处必须一致 ——
+// table 系列曾漏，[table]…[/table] 整值会被剥壳门吃掉标签本尊。
+const BB_HEAD = 'b|i|u|s|url|img|quote|spoiler|list|\\*|color|size|font|center|code|table|tr|td|th|h[1-6]';
+
 function protectPaths(text, box) {
   let s = String(text);
   const put = (frag) => {
@@ -162,7 +211,7 @@ function protectPaths(text, box) {
   // BBcode 标签：模型根本不认 [b]/[i]/[u]，会当普通文字删掉或写坏闭合；
   // 实测 7B 把「[i]次世代[/i]」输成「[i]次世代</i>」，页面上直接露出 </i>。
   // 换成占位符最稳：模型只需原样搬占位符，不可能写坏标签。
-  s = s.replace(/\[\/?(?:b|i|u|s|url|img|quote|spoiler|list|\*|color|size|font|center|code|h[1-6])(?:=[^\]]{0,64})?\]/gi,
+  s = s.replace(/\[\/?(?:b|i|u|s|url|img|quote|spoiler|list|\*|color|size|font|center|code|table|tr|td|th|h[1-6])(?:=[^\]]{0,64})?\]/gi,
     (m) => put(m));
   // 盘符路径 C:\Users\...\x.log
   s = s.replace(/[A-Za-z]:\\(?:[^\\\s"'<>|*?]+\\)*[^\\\s"'<>|*?]*/g, (m) => (m.length > 3 ? put(m) : m));
@@ -449,6 +498,38 @@ async function llmTranslate(cfg, texts, modeOverride) {
   // 模型名必填：本地挂多个模型/云端列表几十个时自动选第一个不可靠，固定由用户指定
   if (!model) throw new Error('未配置模型名：本地模型可能有多个、云端列表更多，自动选择不可靠，请在扩展设置页填入模型名（如 hy-mt2-7b / deepseek-chat）');
 
+  // 整名品牌短路（防模型加词）：名字整个就是词库品牌（Vortex / Nexus Mods / HDT-SMP）时，
+  // 模型实测爱「补全」——HDT-SMP → "HDT-SMP叠加层"。这种条目根本不值得烧一次调用：
+  // 从发送列表里摘出去原样返回（界面保持英文原名，正是「保留品牌」的预期结果）。
+  const keepWholeSet = new Set((cfg.gameTerms || [])
+    .filter((t) => t && t.brand && t.en)
+    .map((t) => String(t.en).trim().toLowerCase()));
+  const wholeBrand = (t) => {
+    const srcTrim = String(t == null ? '' : t).trim();
+    return keepWholeSet.has(srcTrim.toLowerCase());
+  };
+  if (keepWholeSet.size && texts.some(wholeBrand)) {
+    if (texts.every(wholeBrand)) {
+      const allKept = texts.map((t) => t);
+      try { allKept._rejects = new Set(); } catch (e) { /* ignore */ }
+      return allKept;
+    }
+    // 混合批：摘出品牌条目，剩下的照常发，最后按原位拼回。
+    // mode 用整批的口径往下传 —— 子批改写模式会让遮蔽/归一化在两条条目间不一致。
+    const mode0 = modeOverride || (isUiBatch(texts) ? 'ui' : 'mod');
+    const kept = new Map();
+    const rest = [];
+    const restPos = [];
+    texts.forEach((t, i) => {
+      if (wholeBrand(t)) kept.set(i, t); else { rest.push(t); restPos.push(i); }
+    });
+    const out = await llmTranslate(cfg, rest, mode0);
+    const merged = texts.slice();
+    restPos.forEach((orig, j) => { merged[orig] = out[j]; });
+    try { merged._rejects = out._rejects || new Set(); } catch (e) { /* ignore */ }
+    return merged;
+  }
+
   // 用户术语全带（量小）。游戏名只带「这一批文本里真出现了的」：
   // 以前是 slice(0, 200)，而 gamenames 按字母序排，第 200 条是 Dragon's Dogma，
   // 巫师3 / 天际 / 法环 / 辐射4 全在尾部 —— 86 款可用游戏只剩 18 款进得了提示词，
@@ -456,23 +537,38 @@ async function llmTranslate(cfg, texts, modeOverride) {
   const userTerms = (cfg.terms || []).slice(0, 200);
   const blob = texts.join('\n');
   const gameTerms = [];
+  let plainTermN = 0;
   for (const t of (cfg.gameTerms || [])) {
     if (!t || !t.en || blob.indexOf(t.en) === -1) continue;
     gameTerms.push(t);
-    if (gameTerms.length >= 40) break;      // 一批里不会同时出现几十款游戏
+    // 品牌词（brand:true，来自 gamenames-keep 遮罩）不占这 40 条名额：
+    // 少了它们，Vortex / Nexus Mods 这类词就会被翻成中文，比少几个游戏名严重得多（P2-e）。
+    if (!t.brand && ++plainTermN >= 40) break;      // 一批里不会同时出现几十款游戏
   }
   const terms = userTerms.concat(gameTerms);
   const mode = modeOverride || (isUiBatch(texts) ? 'ui' : 'mod');
   // 全大写归一化只用于模组名（小模型对 ALL CAPS 易拒翻）。
   // html / ui 层不能做：页面上真有 CWSO、UE4SS 这种全大写专名，归一化后会变成 Cwso / Ue4ss，
   // 模型照抄回来值≠原文，就被当成「翻译成功」写进缓存，等于把专名改坏了。
-  const normalized = (mode === 'mod') ? texts.map(normalizeCase) : texts.slice();
-  // 界面整句不遮术语（遮了会把长句拆碎，模型反而漏译）
+  // 先遮罩、后归一（顺序反了 UE4SS 会先变成 Ue4ss，词库再也匹配不上 —— ④ 实录）。
+  // 界面整句以前完全不遮术语（注释理由：遮了会把长句拆碎）。但那条理由只对
+  // 「长短语」成立 —— `Geralt of Rivia` 这种遮进长句确实会打乱语序。
+  // 代价是：ui/html 模式里裸送模型，`Stellar Blade` 被翻成「恒星之刃」、`Vortex`
+  // 被翻成「漩涡」（同一个洞，0.16.3 续16 实测）。所以改成按粒度分级：
+  //   mod 模式：全遮（模组名，术语越准越好）
+  //   ui/html：只遮「品牌（zh===en，回填原样英文）」和 ≤3 词短术语（剑星/巫师3/次世代），
+  //     并跳过 modOnly 词条 —— Oils/Reborn 这类通用英文词只服务模组名，长文本里遮它
+  //     就是「更换发动机剑油」（2026-10-26 模型 A/B 实测）；域内专名（伊格尼/杰洛特）
+  //     绝不 modOnly，裸送 ui/html 必夹英文。
   // 逐条遮，不要 join('\n') 再 split：只要任意一条文本自身含换行，拆出来的条数就比原来多，
   // payloadList / boxes / safeList 全部跟着错位 —— 第 N 条拿到的是前一条的一部分，静默错译。
-  const payloadList = (mode === 'mod' && terms.length)
-    ? normalized.map((t) => applyTerms(t, terms, 'mask'))
-    : normalized;
+  const maskTerms = (mode === 'mod')
+    ? terms
+    : terms.filter((t) => t.brand || (!t.modOnly && String(t.en || '').trim().split(/\s+/).length <= 3));
+  const masked = maskTerms.length
+    ? texts.map((t) => applyTerms(t, maskTerms, 'mask'))
+    : texts.slice();
+  const payloadList = (mode === 'mod') ? masked.map(normalizeCaseKeepMasks) : masked;
 
   // 路径占位保护（mod 名里基本没有路径，只为 html/ui 的说明书、报错提示服务）
   const boxes = payloadList.map(() => ({ seq: 1, map: new Map() }));
@@ -560,7 +656,21 @@ async function llmTranslate(cfg, texts, modeOverride) {
   const withRejects = (list) => { try { list._rejects = rejects; } catch (e) { /* ignore */ } return list; };
 
   function finishOne(s, src) {
-    if (mode === 'mod') s = applyTerms(s, terms, 'unmask');
+    if (mode === 'mod') {
+      // BBCode 闭合扶正（review4）：小模型把闭合写成 [b> 或 HTML 风格 </b>。
+      // 只认已知 BB 标签名（[abc> 这种普通文本不动）；html 模式不碰 ——
+      // </b> 在 HTML 里是合法标签，绝不能被转成 BBCode。
+      s = s.replace(new RegExp('\\[(\\/?)(' + BB_HEAD + ')>', 'gi'), (m0, sl, nm) => '[' + sl + nm + ']');
+      s = s.replace(new RegExp('<\\/(' + BB_HEAD + ')>', 'gi'), (m0, nm) => '[/' + nm + ']');
+    }
+    // unmask 必须所有模式都跑：ui/html 现在也遮蔽（见 maskTerms），
+    // 漏了回填就会把『剑星』『Vortex』这些占位符原样露在界面上。
+    if (maskTerms.length) {
+      s = applyTerms(s, maskTerms, 'unmask');
+      // 兜底剥壳只给 mod 模式做：ui/html 的正文里可能有合法的『』引用，
+      // 全量剥会把正常文本改坏；模型自造的壳由下面的括号清理和标题壳剥离处理。
+      if (mode === 'mod') s = s.replace(/『\s*([\s\S]*?)\s*』/g, '$1');
+    }
     // 模型有时会把带『』标记的术语改写成「」等括号，统一清理掉包裹符号
     for (const t of terms) {
       if (!t.zh) continue;
@@ -574,10 +684,14 @@ async function llmTranslate(cfg, texts, modeOverride) {
     const srcBare = String(src == null ? '' : src).replace(/^\s*\[\s*"([\s\S]*)"\s*\]\s*$/, '$1');
     // BBcode 文本（[b]Blood[/b]）开头也是「[」，但那不是标题括号，
     // 去掉 BBcode 标签后再判断，否则模型加的【】永远剥不掉（实测整段被包进【】）
-    const srcHead = srcBare.replace(/\[\/?(?:b|i|u|s|url|img|quote|spoiler|list|\*|color|size|font|center|code|h[1-6])(?:=[^\]]{0,64})?\]/gi, '').trim();
+    const srcHead = srcBare.replace(/\[\/?(?:b|i|u|s|url|img|quote|spoiler|list|\*|color|size|font|center|code|table|tr|td|th|h[1-6])(?:=[^\]]{0,64})?\]/gi, '').trim();
     if (!/^[【（「『\[\(]/.test(srcHead)) {
       const m2 = s.match(/^([【「『])([\s\S]*)([】」』])$/);
       if (m2) s = m2[2].trim();
+      // 方括号 JSON 壳（review4）：模型把译文包成 [“模组内容”] / ["Mod Content"] 的壳，
+      // 原文并没有方括号 → 剥掉。壳内不能含方括号，否则会把 [b]…[/b] 的标签本尊吃掉。
+      const mShell = s.match(/^\[\s*["“”']*\s*([^\[\]【】「」『』]+?)\s*["“”']*\s*\]$/);
+      if (mShell && mShell[1].trim()) s = mShell[1].trim();
     }
     // 模型也爱给游戏名/作品名套《》（实测游戏卡片显示成「《我的夏日座驾》」），原文没有就去掉
     if (s.indexOf('《') === 0 && s.indexOf('》') === s.length - 1 && String(src).indexOf('《') === -1) {
@@ -992,6 +1106,7 @@ module.exports = {
   buildSystemPrompt,
   isUiBatch,
   normalizeCase,
+  normalizeCaseKeepMasks,
   toSimplified,
   extractJsonArray,
   splitByBudget,
