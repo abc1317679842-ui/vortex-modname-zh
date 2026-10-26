@@ -155,7 +155,7 @@ Links are now <i1>exposed over IPC</i1> ({{2}} links)
 ## 五、模型调用：窗口是动态算的
 
 模型的 `max_context_length` **不等于**实际加载的上下文。
-LM Studio 的 `/api/v0/models` 里 `loaded_context_length` 才是真的（开发机 8192，模型标称 262144）。
+LM Studio 的 `/api/v0/models` 里 `loaded_context_length` 才是真的（实测有机器只加载 8192，模型标称 262144）。
 
 写死 `max_tokens: 4096` 会撞上实际只有 4096 的窗口，服务端返回
 `Context size has been exceeded`，整批作废 —— 这是早期「整页英文」的真正原因。
