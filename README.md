@@ -240,10 +240,11 @@ Vortex 的 i18n 只认一份来源。装本扩展前建议先把别的中文包�
 
 ## 开发
 
-想改代码或想知道「为什么这句没翻」，看这两份：
+想改代码或想知道「为什么这句没翻」，看这三份：
 
-- [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md) — 三层架构、序列化回填、上下文预算、失败状态机
-- [DEV-NOTES.md](DEV-NOTES.md) — 开发纪律日志，每条都对应一次真实故障（改代码前必读）
+- [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md) — 工作原理：三层架构、模组名管线、序列化回填、上下文预算、失败状态机
+- [docs/DEV-GUIDE.md](docs/DEV-GUIDE.md) — 开发指南：管线链路图、改动落点、诊断决策树、动手前检查单
+- [DEV-NOTES.md](DEV-NOTES.md) — 开发纪律日志，每条都对应一次真实故障
 
 ```
 index.js             入口、设置页、模组名翻译
