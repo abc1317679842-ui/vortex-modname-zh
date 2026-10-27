@@ -83,7 +83,7 @@
 
 ## 安装
 
-三种方式，任选一种。装完都需要**重启 Vortex 两次**，并去
+两种方式，任选一种。装完都需要**重启 Vortex 两次**，并去
 **设置 → 界面 → 语言** 选「中文（简体）」。
 
 > 为什么要选语言：Vortex 的 i18n 只读「当前语言」对应的目录。
@@ -104,24 +104,7 @@
 
 AI 会自己判断路径、检查进程、解压、告诉你下一步。你只需要按它说的点。
 
-### 方式二：一键脚本
-
-Win + X → **终端**（PowerShell）。把下面代码块里两行**一起复制、粘贴进窗口，按一次回车**即可——PowerShell 会自动先执行第一行（下载脚本）、再执行第二行（运行脚本）。一行一行分两次粘贴也行，效果一样：
-
-```powershell
-Invoke-WebRequest 'https://github.com/abc1317679842-ui/vortex-modname-zh/releases/latest/download/install.ps1' -OutFile "$env:TEMP\vortex-zh-install.ps1"
-powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\vortex-zh-install.ps1"
-```
-
-> 为什么不用一行 `irm ... | iex`：GitHub 的下载链接不带编码声明，Windows 自带的 PowerShell 5.1 会把 UTF-8 脚本按 Latin-1 解码，中文全是乱码。这两行是纯字节落盘，不会乱。
-> 脚本做的事：检查 Vortex 是否在跑 → 下载 zip → 解压到扩展目录（保留你已填的 config.json）→ 告诉你剩下三步。不改注册表、不写扩展目录以外的位置。
-
-脚本会：检测 Vortex 是否运行 → 下载最新版 → 解压到扩展目录 → 提示你重启。
-
-> 不放心从网络直接执行脚本的话，用方式三。
-> 也可以先把 [install.ps1](install.ps1) 下载下来看一遍再运行。
-
-### 方式三：手动安装
+### 方式二：手动安装
 
 1. 到 [Releases](../../releases/latest) 下载 `vortex-modname-zh.zip`（**不要解压**）
 2. 打开 Vortex → 左侧 **扩展 (Extensions)** → 右下角 **从文件安装 (Install From File)** → 选那个 zip
