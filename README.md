@@ -11,6 +11,14 @@
 
 📦 **本扩展也已发布到 Nexus Mods：[Vortex Full Chinese Localization - AI Mod Name Translation](https://www.nexusmods.com/site/mods/2475)**
 
+> [!CAUTION]
+> **⚠️ 重点注意：同一个 zip 用「从文件安装」装两次，Vortex 会记成两个扩展**
+> 现象：扩展列表里出现两条同名扩展，右键菜单每项出现两遍。
+> 解决：**扩展页把同名的全部移除 → 重启 Vortex → 再装一次**。
+> ⛔ 别只删旧的那条：两条记录指向同一个文件夹，删哪条都会把它删掉，剩下那条跟着失效。
+> ✅ 配置不会丢：模型地址、模型名、密钥、译文缓存都在 `%APPDATA%\Vortex\vortex-modname-zh\`，
+> 不在扩展目录里，删扩展、重装都不影响。
+
 ---
 
 ## 先看效果
@@ -86,6 +94,9 @@
 两种方式，任选一种。装完都需要**重启 Vortex 两次**，并去
 **设置 → 界面 → 语言** 选「中文（简体）」。
 
+> 装之前先看一眼 **扩展** 页：如果已经有同名的旧版本，先在那里**移除**再装。
+> 同一个 zip 装两次会变成两个扩展（右键菜单每项出现两遍），详见页首警告。
+
 > 为什么要选语言：Vortex 的 i18n 只读「当前语言」对应的目录。
 > 界面语言还是 English 时，装好的词库根本不会被加载。
 
@@ -94,26 +105,35 @@
 把下面这段整段复制，发给能操作电脑的 AI（WorkBuddy / Claude / Cursor 等）：
 
 ```
-帮我在 Windows 上安装 Vortex 汉化扩展，按这个顺序做：
-1. 下载 https://github.com/abc1317679842-ui/vortex-modname-zh/releases/latest/download/vortex-modname-zh.zip 到临时目录
-2. 检查 Vortex 是否在运行，在运行就让我先关掉（文件占用会导致解压失败）
-3. 把这个 zip 解压到 %APPDATA%\Vortex\plugins\vortex-modname-zh\（没有就新建，有就覆盖；不要删除这个目录里已有的 config.json）
-4. 完成后告诉我：重启 Vortex 两次，然后去 设置 → 界面 → 语言 选「中文（简体）」，再重启一次
-5. 最后提醒我去 设置 → 模组名汉化 填翻译接口地址和模型名
+帮我在 Windows 上安装或更新 Vortex 汉化扩展，按这个顺序做：
+1. 先检查是否已经装过：看 %APPDATA%\Vortex\plugins\ 下有没有 vortex-modname-zh 目录，
+   并让我打开 Vortex → 扩展 看列表里有没有同名旧版本
+2. 如果发现旧版本（列表里同名扩展不止一条），先停下来告诉我：
+   让我在扩展页把同名的全部移除、重启 Vortex —— 同一个 zip 从文件安装两次会变成两个扩展，
+   右键菜单每项出现两遍；而且几条记录指向同一个目录，删其中一条会把目录删掉、另一条也跟着失效
+3. 下载 https://github.com/abc1317679842-ui/vortex-modname-zh/releases/latest/download/vortex-modname-zh.zip 到临时目录
+4. 检查 Vortex 是否在运行，在运行就让我先关掉（文件占用会导致解压失败）
+5. 把这个 zip 解压到 %APPDATA%\Vortex\plugins\vortex-modname-zh\（没有就新建，有就覆盖）
+6. 完成后告诉我：重启 Vortex 两次，然后去 设置 → 界面 → 语言 选「中文（简体）」，再重启一次
+7. 最后提醒我去 设置 → 模组名汉化 填翻译接口地址和模型名
+   （如果之前填过，配置存在 %APPDATA%\Vortex\vortex-modname-zh\config.json，不会被覆盖，不用重填）
 ```
 
 AI 会自己判断路径、检查进程、解压、告诉你下一步。你只需要按它说的点。
 
 ### 方式二：手动安装
 
-1. 到 [Releases](../../releases/latest) 下载 `vortex-modname-zh.zip`（**不要解压**）
-2. 打开 Vortex → 左侧 **扩展 (Extensions)** → 右下角 **从文件安装 (Install From File)** → 选那个 zip
-3. 按提示**重启 Vortex 两次**（第一次写出语言包，第二次才加载它）
-4. **设置 → 界面 → 语言** → 选「中文（简体）」，再重启一次
-5. **设置 → 模组名汉化** → 填接口地址和模型名（见下一节）
+1. **先查旧版本**：Vortex → 扩展，如果列表里已经有同名的「Vortex 全界面汉化」，
+   把它们**全部移除**（不是删文件夹）并重启 Vortex。只有一个旧的就删那一个；
+   有两个以上就全删——它们指向同一个文件夹，删其中一条会连文件夹一起删掉，另一条随之失效
+2. 到 [Releases](../../releases/latest) 下载 `vortex-modname-zh.zip`（**不要解压**）
+3. 打开 Vortex → 左侧 **扩展 (Extensions)** → 右下角 **从文件安装 (Install From File)** → 选那个 zip
+4. 按提示**重启 Vortex 两次**（第一次写出语言包，第二次才加载它）
+5. **设置 → 界面 → 语言** → 选「中文（简体）」，再重启一次
+6. **设置 → 模组名汉化** → 填接口地址和模型名（见下一节）
 
 装完如果界面还是英文：看 设置 → 模组名汉化 → 「界面汉化」那一栏，
-如果显示黄字「Vortex 界面语言是 xxx」，说明第 4 步没做。
+如果显示黄字「Vortex 界面语言是 xxx」，说明第 5 步没做。
 
 ---
 
