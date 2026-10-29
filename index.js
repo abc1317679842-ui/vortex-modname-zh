@@ -20,6 +20,7 @@ let LOG_PATH = path.join(DATA_DIR, 'translator.log');
 let SEED_SKIP_PATH = path.join(DATA_DIR, 'seed-skip.json');   // 用户点过「清空缓存」后别再灌种子
 let NAME_FAIL_PATH = path.join(DATA_DIR, 'nameFail.json');    // 模组名 give-up 记账（烧模型的有界退让）
 let WORD_PATH = path.join(DATA_DIR, 'wordCache.json');        // 词级补翻词表（Gwent → 昆特牌）
+let GATE_SHOWN_PATH = path.join(DATA_DIR, 'gate-shown.json'); // 升级首启「模型连不上」弹窗已提示过的版本
 // 以下是随包发布的静态资源，永远读扩展目录
 const SEED_PATH = path.join(EXT_DIR, 'domCache.seed.json');
 const GAME_NAMES_PATH = path.join(EXT_DIR, 'gamenames.json');
@@ -77,8 +78,8 @@ const seedEntryOk = (k, v) => {
   return true;
       };
 
-// 用户点过「清空缓存」后别再灌种子（同版本内生效；跨版本升级照样灌 ——
-// 升级时清空正是为了扔旧译文，塞回来等于没清）。
+// 用户点过「清空缓存」后别再灌种子（同版本内生效；0.16.5 起跨版本升级也不灌 ——
+// 升级清空段会自己写一条同版本 seed-skip，理由同上：塞回来等于没清）。
 // （下一行的缩进是 audit2 组 2 的区间切片标记，勿动）
       const seedSkip = () => {
   const s = readJson(SEED_SKIP_PATH, null);
@@ -113,6 +114,10 @@ const DEFAULT_CFG = {
 };
 let cfg = JSON.parse(JSON.stringify(DEFAULT_CFG));
 let cache = {};
+// 升级清空模组名缓存后置真：autostart 段据此自动触发一次全量重翻（0.16.5）。
+// 只在本进程内有效 —— 重启就丢，但那没关系：清空动作本身带 _ver 标记，
+// 重启后不会再清第二遍，缺席的条目下次「立即翻译全部」照样能补。
+let cacheRebuildPending = false;
 let domCache = {};
 let failCache = {};
 let nameFail = {};    // 模组名 give-up 记账：键 → {n, ts, model}（试满 NAME_FAIL_MAX 不再烧模型）
@@ -154,6 +159,14 @@ let keepNameSet = new Set();  // 同上，小写集合（residueWords 判「品�
 let runtimeTerms = null; // 游戏名对照表（运行时，绝不写回 config.json）
 let domStarted = false;  // DOM 层是否已启动（它是一次性注入的，启停不对称）
 let startDomRef = null;  // 由 main() 赋值的启动函数，供设置页「打开实时翻译」时补启
+let domKickRef = null;   // DOM 层的 kick：手动翻译时立刻解除「模型挂机暂停」，不等 2 分钟探活
+
+/** 手动动作叫醒 DOM 层（0.16.5 补）。用户点了按钮却要等最长 120 秒才开始翻界面文本，
+ *  就是缺这一下：探活是自动路径的兜底节奏，不能拿来当手动操作的响应时间。 */
+function kickDomLayer(reason) {
+  if (typeof domKickRef !== 'function') return;
+  try { domKickRef(reason); } catch (e) { log('warn', 'kick dom fail', String(e)); }
+}
 // DOM 层写入的实时翻译状态，设置页「实时队列」面板直接读它（每秒刷新）
 const liveStatus = { inflight: [], recent: [], queued: 0, ok: 0, fail: 0, hits: 0, lanes: 0, per: 0, modelDown: false, lastBatchAt: 0, lastDoneAt: 0, groups: 0 };
 
@@ -202,6 +215,7 @@ function useDataDir(dir) {
   SEED_SKIP_PATH = path.join(dir, 'seed-skip.json');
   NAME_FAIL_PATH = path.join(dir, 'nameFail.json');
   WORD_PATH = path.join(dir, 'wordCache.json');
+  GATE_SHOWN_PATH = path.join(dir, 'gate-shown.json');
   USER_KEEP_PATH = path.join(dir, 'userKeep.json');
   try { fs.mkdirSync(dir, { recursive: true }); } catch (e) { /* ignore */ }
 }
@@ -1574,6 +1588,58 @@ function keepNameEn(text) {
   log('info', 'name kept as english', { name: t.slice(0, 60), restored });
   return { kept: true, restored };
 }
+
+/** 「取消保留英文」：把名字从 userKeep.json 里摘掉，让它可以重新被翻译。
+ *  0.16.5 之前只有加没有减 —— 右键误点一下，那个模组名就永久保持英文，
+ *  除了手改 %APPDATA%\Vortex\vortex-modname-zh\userKeep.json 没有任何出口。
+ *  只摘名单、不动缓存：能不能翻出来交给随后的重翻流程（模型没开时不会假装成功）。 */
+function unkeepName(text) {
+  let t = String(text == null ? '' : text).trim();
+  if (!t) return { removed: 0, note: 'empty' };
+  // 屏幕上点到的可能是中文译文：userKeep 里存的是英文原名，反查回去再比
+  const nk0 = normKey(t);
+  if (!Object.keys(cache).some((k) => normKey(k) === nk0)) {
+    const back = Object.keys(cache).find((k) => normKey(String(cache[k])) === nk0);
+    if (back) t = back;
+  }
+  const nk = normKey(t);
+  const list = userKeepList();
+  const at = list.findIndex((x) => normKey(String(x)) === nk);
+  if (at < 0) return { removed: 0, note: 'not-kept' };
+  const gone = list[at];
+  list.splice(at, 1);
+  saveJson(USER_KEEP_PATH, { ver: extVerOf(), at: Date.now(), names: list }, 'userKeep remove');
+  // 名单变了，遮蔽表必须立刻重算：不重算的话本轮它仍被当成「整名不翻」，
+  // 重翻会原样退回英文，用户看到的就是「取消了还是英文」。
+  try { mergeRuntimeTerms(); } catch (e) { log('warn', 'rebuild keep names fail', String(e)); }
+  if (keepEnSetRef) {
+    for (const x of Array.from(keepEnSetRef)) if (normKey(String(x)) === nk) keepEnSetRef.delete(x);
+  }
+  log('info', 'name unkept', { name: String(gone).slice(0, 60), left: list.length });
+  return { removed: 1, name: t, left: list.length };
+}
+
+/** 清空用户保留词表（设置页按钮）。词库 gamenames-keep.json 不动 —— 那是出厂的，
+ *  用户清的是自己右键加的那份。返回清掉的条数。 */
+function clearUserKeep() {
+  const list = userKeepList();
+  const n = list.length;
+  if (n > 0) {
+    list.length = 0;
+    saveJson(USER_KEEP_PATH, { ver: extVerOf(), at: Date.now(), names: [] }, 'userKeep clear');
+  }
+  try { mergeRuntimeTerms(); } catch (e) { log('warn', 'rebuild keep names fail', String(e)); }
+  // 只重建、不 clear()：keepEnSetRef 里混着出厂词库 gameKeep，
+  // 整表清空会把 gamenames-keep.json 的保留词一起抹掉 —— DOM 层随后就会把
+  // UE4SS 这类工具名翻成中文（正是 0.16.3 反复投诉的那种坏译文）。
+  if (keepEnSetRef) {
+    keepEnSetRef = new Set(
+      [].concat(gameKeep || [], userKeepList()).filter((x) => typeof x === 'string' && x.trim())
+    );
+  }
+  log('info', 'user keep cleared', { n });
+  return n;
+}
 // 「重新翻译此名」：只清这一条的缓存（模组名缓存 + domCache 里含它的键 + 失败名单），只重翻这一条
 function retranslateName(text) {
   let t = String(text == null ? '' : text).trim();
@@ -1596,10 +1662,28 @@ function retranslateName(text) {
   }
   saveJson(DOM_CACHE_PATH, domCache, 'keepName domCache drop');
   saveJson(FAIL_PATH, failCache, 'keepName failCache drop');
-  const state = contextRef.api.getState();
-  const items = collectTargets(state, null).concat(collectDownloadTargets(state)).filter((it) => normKey(it.raw) === nk);
-  if (!items.length) return { queued: 0, note: '当前列表里没有这个名字' };
-  return translate(items);
+  // 重翻必须**排队**：批量批次正在跑时 translate() 会立刻早退（只有一条「正在翻译中」
+  // 提示、连日志都不写），用户看到的就是「取消保留英文点了没反应」
+  // —— 2026-10-29 真机实录：unkeep 在 21:48:31、自动批次 21:48:31.578 才 done，正好撞死。
+  const fire = (tries) => {
+    try {
+      if (running) {
+        if (tries <= 0) { log('warn', 'retranslate busy give up', { name: nk.slice(0, 40) }); return; }
+        setTimeout(() => fire(tries - 1), 1500);
+        return;
+      }
+      const st = contextRef.api.getState();
+      const items = collectTargets(st, null).concat(collectDownloadTargets(st))
+        .filter((it) => normKey(it.raw) === nk);
+      if (!items.length) {
+        log('info', 'retranslate nothing to do', { name: nk.slice(0, 40) });
+        return;
+      }
+      Promise.resolve(translate(items, { manual: true })).catch((e) => log('warn', 'retranslate fail', String(e)));
+    } catch (e) { log('warn', 'retranslate retry fail', String(e)); }
+  };
+  fire(20);   // 最多等 30 秒（20 × 1.5s），批量批次跑完就接上
+  return { queued: 1 };
 }
 // 右键菜单接管判据：命中的是「已知模组名」才接管，普通界面文本照常弹 Vortex 原生菜单
 function isKnownName(text) {
@@ -1624,6 +1708,18 @@ function asDict(o) {
   const d = Object.create(null);
   if (o && typeof o === 'object') for (const k of Object.keys(o)) d[k] = o[k];
   return d;
+}
+
+/** 真实条目数（排除 `_ver` / `_st` / `_gl` 这类元信息键）。
+ *  0.16.5 起 cache.json 也带 `_ver`，裸 `Object.keys(cache).length` 会恒 +1：
+ *  统计面板永远多一条，更糟的是「cache 有内容才做某事」这类判断会恒真。
+ *  与 domCache / failCache 早就在用的 `filter(k => k !== '_ver')` 同一口径。 */
+function cacheEntryCount(dict) {
+  let n = 0;
+  for (const k of Object.keys(dict || {})) {
+    if (k && k.charAt(0) !== '_') n++;
+  }
+  return n;
 }
 
 function readJson(file, fallback) {
@@ -1719,6 +1815,30 @@ function saveJson(file, data, what) {
   return ok;
 }
 
+// 配置写盘防抖（0.16.5）：设置页输入框每敲一个字符都会调 save()，以前每个字符写一次
+// config.json。这里**只延迟「写文件」这一步**，内存里的 cfg 仍然立即更新 ——
+// 若连内存一起延迟，填完地址马上点「立即翻译」时翻译层读到的还是旧配置，会拿旧地址去连。
+// ⚠ 凡是「要按配置去连模型」或「要重新读盘」的地方，先调 flushCfgWrite()，
+//   否则读到的是延迟前的旧文件（翻译入口、设置页 init 三处）。
+const CFG_WRITE_DELAY = 400;
+let cfgWriteTimer = null;
+
+function scheduleCfgWrite() {
+  if (cfgWriteTimer) clearTimeout(cfgWriteTimer);
+  cfgWriteTimer = setTimeout(() => {
+    cfgWriteTimer = null;
+    saveJson(CONFIG_PATH, cfg, 'settings save');
+  }, CFG_WRITE_DELAY);
+}
+
+/** 有没落盘的配置就立刻写掉。返回是否真的写了。 */
+function flushCfgWrite() {
+  if (!cfgWriteTimer) return false;
+  clearTimeout(cfgWriteTimer);
+  cfgWriteTimer = null;
+  return saveJson(CONFIG_PATH, cfg, 'settings save flush');
+}
+
 // Vortex 禁止扩展在 init 阶段使用 context.api（报 "extension uses api in init function"）。
 // 语言包重建正好发生在 init 里，所以「界面语言包已更新，重启后生效」这条通知
 // 以前 100% 发不出去（日志里 6 次启动全是 locale pack built → notify fail）。
@@ -1738,6 +1858,253 @@ function flushPendingNotice() {
   pendingNotice = null;
   try { contextRef.api.sendNotification(p); log('info', 'deferred notify sent'); }
   catch (e) { pendingNotice = p; log('warn', 'deferred notify fail', String(e)); }
+}
+
+// ─── 通知三档（0.16.5，规则从 renderer.js 里读出来的，不是猜的）──────────────
+// ① canBeToast：displayMS<=5000 且 type 不是 warning/activity 且无 actions → 底部 toast，
+//    直接 return，根本不进通知列表；
+// ② 否则 dispatch(addNotification)：只要带 displayMS，到点 dispatch(dismissNotification) 删掉这条；
+// ③ 铃铛面板：有 displayMS 就用它，没给才按类型兜底（warning/error 10s、success/info 5s）；
+//    带 actions 或 activity 的 dispTime = null，面板自己不按时间过滤。
+//    ⚠ 但「面板不过滤」≠「永久」：store 层只要 id 与 displayMS 同时存在就挂删除定时器，
+//    根本不看 actions。所以永久卡片必须是「有 actions + 不给 displayMS」。见 notifySticky。
+// 由此三档（用户要求：一律从铃铛弹，底部不闪）：过程类 6 秒／结果类 10 秒／异常类挂「知道了」永久留。
+// 关键：displayMS 必须 >5000，否则会被 canBeToast 抢去走底部 toast——底部只有 5 秒上限，也根本看不住。
+const ACK_ACTIONS = [{ title: '知道了', action: (dismiss) => { try { dismiss(); } catch (e) { /* 点掉失败无所谓 */ } } }];
+// 异常类通知：永久留在铃铛，直到用户点「知道了」。
+// 必须主动剥掉 displayMS——addNotification 的删除定时器条件是
+// 「id 与 displayMS 都存在」，它不看 actions，到点照样 dismiss 掉。
+// actions 只让铃铛面板跳过「按类型兜底时长」，拦不住 store 层这个定时删除。
+// （0.16.5 早期版本就是两侧都给了，所以异常卡片 6 秒后自己没了，用户实测「根本没变永久」。）
+function notifySticky(payload) {
+  const p = Object.assign({}, payload, { actions: ACK_ACTIONS });
+  delete p.displayMS;
+  return notify(p);
+}
+/** 结果类停留时长：手动点出来的 10 秒；自动批次 6 秒。两者都 >5000，都走铃铛。 */
+function resultMS(manual) { return manual ? 10000 : 6000; }
+
+// 异常卡片是「永久」的，所以必须有人负责撤：否则问题修好后，那张红卡还挂在铃铛里，
+// 让用户去点一个已经不存在的故障。策略只有一条——后面成功了就把前面的撤掉。
+const ANOMALY_IDS = ['modname-zh-gate', 'modname-zh-allfail', 'modname-zh-partial', 'modname-zh-crash'];
+/** @param ids 不给就撤全部异常卡片；探活通过时只撤闸门那条 */
+function clearAnomaly(ids) {
+  const api = contextRef && contextRef.api;
+  if (!api || typeof api.dismissNotification !== 'function') return;
+  for (const id of (ids || ANOMALY_IDS)) {
+    try { api.dismissNotification(id); } catch (e) { log('warn', 'clear anomaly fail', id + ' ' + String(e)); }
+  }
+}
+/** 异常卡片互斥：同一时刻只留最近的一条。否则「先全失败、后来部分成功」，那张「全部失败」还挂着。 */
+function notifyAnomaly(payload) {
+  clearAnomaly(['modname-zh-allfail', 'modname-zh-partial', 'modname-zh-crash']);
+  return notifySticky(payload);
+}
+
+// ─── 翻译前置闸门（0.16.5）─────────────────────────────────────────────────
+// 以前没有任何预检：几十条全烧完，结尾才甩一句「多数原因是模型接口没开或地址不对」。
+// 「没填地址 / 密钥错 / 模型名错 / 服务没启动」四种原因被塞进同一句话，用户只能自己猜。
+// 现在发请求前先探一次 GET {base}/models，按类型分开报；确定的那几类直接拦住，
+// 一批请求都不发。探活只管「地址通不通、密钥认不认、模型名在不在列表里」——
+// 不代替真正的翻译验证，那一步仍然是设置页的「测试连接」。
+let preflightCache = { at: 0, res: null };  // 60 秒内复用「连通」结论：autoHook 每次状态变更都会踢一次
+let lastPreflight = null;                   // 最近一次结论，失败提示引用同一份，不另编一套说法
+const preGateNotified = {};                 // code → 已提示过（自动路径不重复刷屏）
+
+function preHost(base) {
+  try { return new URL(base).host || String(base || ''); } catch (e) { return String(base || ''); }
+}
+
+/** 一次轻量探活。@param force 跳过缓存（用户主动点按钮时用，要看到当下的真结果） */
+async function modelPreflight(force) {
+  const p = (cfg && cfg.provider) || {};
+  const base = String(p.baseUrl || '').trim().replace(/\/+$/, '');
+  if (!base) return { ok: false, code: 'noprovider', blocking: true };
+  const model = String(p.model || '').trim();
+  // 有地址没模型名：请求照样发不出去，而且这种错不必再打一次网络
+  if (!model) return { ok: false, code: 'nomodel', blocking: true, base };
+  const now = Date.now();
+  if (!force && preflightCache.res) {
+    const ttl = preflightCache.res.ok ? 60000 : 10000;
+    if (now - preflightCache.at < ttl) return preflightCache.res;
+  }
+  let res;
+  try { res = await probeOnce(base, model, p.apiKey || ''); }
+  catch (e) { res = { ok: false, code: 'neterr', blocking: true, base, model, detail: String(e).slice(0, 120) }; }
+  preflightCache = { at: now, res };
+  return res;
+}
+
+async function probeOnce(base, model, key) {
+  let r;
+  try {
+    // 8 秒是给「地址通但服务卡住」留的余量：正常 /models 是毫秒级（本机实测 7ms），
+    // 云端再慢也不该超过这个数；真超了就是地址指错或服务假死，值得报出来。
+    r = await core.httpRequest(base + '/models', 'GET', key ? { Authorization: 'Bearer ' + key } : {}, null, 8000);
+  } catch (e) {
+    const code = String((e && e.code) || '');
+    const msg = String((e && e.message) || e);
+    if (/timeout/i.test(msg)) return { ok: false, code: 'timeout', blocking: true, base, model };
+    if (code === 'ECONNREFUSED') return { ok: false, code: 'refused', blocking: true, base, model };
+    if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') return { ok: false, code: 'dns', blocking: true, base, model };
+    return { ok: false, code: 'neterr', blocking: true, base, model, detail: msg.slice(0, 120) };
+  }
+  if (r.status === 401 || r.status === 403) return { ok: false, code: 'auth', blocking: true, base, model, status: r.status };
+  if (r.status >= 400) {
+    // /models 不是所有 OpenAI 兼容端点都实现（404/405 很常见），5xx 是服务端自己的事。
+    // 这两类不能拦：拦了就是「端点不提供模型列表」的用户永远翻不了。
+    return { ok: true, code: 'http', base, model, status: r.status };
+  }
+  let ids = null;
+  try {
+    const j = JSON.parse(r.body);
+    ids = Array.isArray(j && j.data) ? j.data.map((x) => String((x && x.id) || '')) : null;
+  } catch (e) { ids = null; }
+  if (!ids) return { ok: true, code: 'badjson', base, model, status: r.status };
+  if (ids.length > 0 && ids.indexOf(model) === -1) return { ok: true, code: 'modelmissing', base, model, ids };
+  return { ok: true, code: 'ok', base, model, ids };
+}
+
+/** 预检结论 → 短话（通知）+ 长话（弹窗）。两种文案同源，不许各写一份。 */
+function describePreflight(res) {
+  const base = res.base || '';
+  const host = preHost(base);
+  const s = (title, short, text, kind) => ({ blocking: true, kind: kind || 'error', title, short, text });
+  switch (res.code) {
+    case 'noprovider':
+      return {
+        blocking: true, kind: 'info', title: '还没填翻译接口',
+        short: '没填接口地址，请求发不出去',
+        // 正文走弹窗的 text 字段（纯文本，\n 换行）—— 不是 bbcode。
+        // 以前这里写 HTML 的 <br/>：bbcode 字段会不会把标签渲染成换行，取决于宿主版本，
+        // 万一不认就是一屏字面 "<br/>"，用户看不懂还以为是扩展坏了。
+        text: '界面汉化不需要模型，已经生效；模组名、合集名、更新日志要调用一个翻译模型才能翻。'
+          + '\n\n怎么修：设置 → 模组名汉化 → 翻译接口，填「接口地址」和「模型名」，再点「测试连接」。'
+          + '\n本地 LM Studio 一般是 http://127.0.0.1:1234/v1'
+          + '\n本地 Ollama 一般是 http://127.0.0.1:11434/v1'
+          + '\n云端填服务商给的 …/v1 地址，密钥填进 API Key'
+          + '\n\n只想让界面是中文、不打算翻模组名？忽略这条就行 —— 界面汉化不用模型，已经生效。',
+      };
+    case 'nomodel':
+      return s('还差一个模型名', '填了接口地址，但模型名是空的',
+        '接口地址已填：' + base + '\n但「模型名」空着，请求发不出去。'
+        + '\n\n怎么修：同一页填「模型名」。本地常见 hy-mt2-7b、qwen2.5-7b-instruct；云端照服务商文档填。'
+        + '\n不知道填什么，先点「测试连接」，接口支持的话它会把能用的模型名列出来。', 'info');
+    case 'refused':
+      return s('连不上模型服务', '连不上 ' + host,
+        '地址 ' + base + ' 直接拒绝了连接 —— 服务没启动，或者端口不对。'
+        + '\n\n本地模型：LM Studio 要开 Developer → Start Server；Ollama 要让 ollama serve 跑着。'
+        + '\n云端：确认地址末尾是 /v1，斜杠别多也别少。改完点「测试连接」。');
+    case 'timeout':
+      return s('模型服务没有响应', host + ' 8 秒内没响应',
+        '地址 ' + base + ' 8 秒内没有响应。'
+        + '\n\n本地大模型刚启动时第一轮加载要几十秒，等它加载完再点「测试连接」；'
+        + '\n一直不通就是端口或地址不对（也可能走了不通的代理）。');
+    case 'dns':
+      return s('地址解析不了', '解析不了 ' + host,
+        '域名 ' + host + ' 解析不了。'
+        + '\n\n检查地址有没有拼错、有没有多出来的空格；云端接口在断网或代理没开时也会这样。');
+    case 'auth':
+      return s('密钥被拒绝（HTTP ' + res.status + '）', '密钥被拒绝（HTTP ' + res.status + '）',
+        '接口 ' + host + ' 拒绝了这次请求的密钥。'
+        + '\n\n本地模型不需要密钥 —— 误填了就把 API Key 清空。'
+        + '\n云端核对三件事：密钥是否复制完整、是否过期、额度是否用完。');
+    case 'neterr':
+      return s('请求发不出去', '网络错误' + (res.detail ? '：' + res.detail : ''),
+        '连 ' + host + ' 时出错' + (res.detail ? '：' + res.detail : '') + '。'
+        + '\n\n检查本机代理、防火墙，以及地址里的端口。');
+    default:
+      return null;
+  }
+}
+
+/** 放行但有疑点（端点不给模型列表 / 模型名不在列表里）：只在真失败时补一句，不单独弹。 */
+function preflightHint() {
+  const r = lastPreflight;
+  if (!r || r.ok === false) return '';
+  if (r.code === 'http') return '；另外接口返回 HTTP ' + r.status + '，地址可能少了 /v1';
+  if (r.code === 'badjson') return '；另外接口没返回模型列表，地址可能少了 /v1';
+  if (r.code === 'modelmissing') {
+    const ids = r.ids || [];
+    const s = ids.slice(0, 3).join(' / ');
+    return '；另外模型名 ' + r.model + ' 不在接口列表里' + (s ? '（现有：' + s + (ids.length > 3 ? ' …' : '') + '）' : '');
+  }
+  return '';
+}
+
+/** 通知正文里能塞下的疑点：一句话，不超过 12 字；塞不下就不说。
+ *  通知区域只够一两行，详情留给弹窗、「测试连接」和 translator.log。 */
+function hintShort() {
+  const r = lastPreflight;
+  if (!r || r.ok === false) return '';
+  if (r.code === 'modelmissing') return '，模型名不在接口列表';
+  if (r.code === 'http' || r.code === 'badjson') return '，地址可能少了 /v1';
+  return '';
+}
+
+function showModelDialog(kind, title, text) {
+  try {
+    const api = contextRef.api;
+    if (api && typeof api.showDialog === 'function') {
+      // 用 text 不用 bbcode：bbcode 要按 BBCode 语法解析，标签写法随宿主版本变；
+      // text 是纯文本、保留 \n 换行，正文里写的换行一定会正确显示。
+      const content = { text: String(text == null ? '' : text), options: { wrap: true } };
+      Promise.resolve(api.showDialog(kind, title, content, [{ label: '知道了' }]))
+        .catch((e) => log('warn', 'model dialog fail', String(e)));
+      return true;
+    }
+  } catch (e) { log('warn', 'model dialog fail', String(e)); }
+  return false;
+}
+
+/**
+ * 升级后首次自动重建时，模型没连上 → 弹一次窗（每个版本只弹一次）。
+ * 为什么不能只发系统通知：通知几秒就消失，用户装完新版第一眼看到「界面还是旧的模组名」，
+ * 只会以为汉化坏了，根本不知道是模型没开。这个弹窗就是「更新完第一次」的那次交代。
+ * 落盘 gate-shown.json 记版本，同版本不再弹；下个版本升级重新弹。
+ * 返回 true = 弹窗已出（调用方别再叠通知，两条通道只走一条）。
+ */
+function showGateDialogOnce(d, code) {
+  const ver = extVerOf();
+  const shown = readJson(GATE_SHOWN_PATH, null);
+  if (ver && shown && shown.ver === ver) return false;   // 本版已交代过
+  const ok = showModelDialog(d.kind, d.title, d.text);
+  if (ok) {
+    try { saveJson(GATE_SHOWN_PATH, { ver, code, at: Date.now() }, 'gate dialog shown'); }
+    catch (e) { log('warn', 'gate shown mark fail', String(e)); }
+  }
+  return ok;
+}
+
+/** 翻译类动作的统一闸门。true = 放行。
+ *  manual：用户主动点的（按钮 / 右键 / 菜单）→ 弹窗说清，弹不出来才退回通知；
+ *  opts.dialogOnce：升级后首次自动重建 → 弹窗，但每个版本只弹一次（见 showGateDialogOnce）；
+ *  其它自动触发（安装钩子 / 状态变更）→ 只发一次通知、不弹窗，否则每次状态变更都糊一脸。
+ *  预检自己出错一律放行：宁可让真正的翻译流程去报错，也不能卡在探活上。 */
+async function gateModel(manual, action, opts) {
+  let res;
+  try { res = await modelPreflight(!!manual); }
+  catch (e) { log('warn', 'preflight crash', String(e)); return true; }
+  lastPreflight = res;
+  log('info', 'model preflight', { code: res.code, ok: res.ok, manual: !!manual });
+  if (res.ok) { clearAnomaly(['modname-zh-gate']); return true; }
+  const d = describePreflight(res);
+  if (!d) return true;
+  if (manual) {
+    // 用户是点完按钮才看到这个弹窗的：正文末尾补一句因果，否则他只看懂「配置有问题」，
+    // 不知道刚才那一下到底跑没跑。
+    const body = d.text + '\n\n（这一次没有开始翻译，按上面的步骤改好再点一次就行。）';
+    if (!showModelDialog(d.kind, d.title, body)) {
+      notifySticky({ id: 'modname-zh-gate', type: d.kind === 'info' ? 'warning' : 'error', title: d.title, message: '这次' + (action || '翻译') + '没有开始', noDismiss: true });
+    }
+  } else if (opts && opts.dialogOnce) {
+    // 弹窗成功就不再发通知；本版本已经弹过则完全静默（上次已经交代过，不必每次启动刷）
+    showGateDialogOnce(d, res.code);
+  } else if (!preGateNotified[res.code]) {
+    preGateNotified[res.code] = 1;
+    notifySticky({ id: 'modname-zh-gate', type: d.kind === 'info' ? 'warning' : 'error', title: d.title, message: '这次' + (action || '翻译') + '没有开始' });
+  }
+  return false;
 }
 
 function dispatch(key, gameId, modId, value) {
@@ -1812,6 +2179,10 @@ function collectTargets(state, gameIdFilter) {
       // F3：整条没有一个可翻的英文词（REFramework / UE4SS / SkyUI）→ 不进队列。
       // 送模型必然照抄或吐空 → 验收不过 → 记一次假失败，还触发误导提示。
       if (nothingToTranslate(raw)) continue;
+      // 整名在保英文名单里（右键「这个名字保留英文」）→ 不送模型。
+      // 以前只在 keepNameEn 里 dispatch 回原名，批量路径照旧把它送翻：模型遵守
+      // 品牌遮蔽原样退回，applyTranslation 又当成功 —— 白烧一次还报「1 条成功」。
+      if (typeof isKnownBrand === 'function' && isKnownBrand(raw)) continue;
       // 翻不动就退让：被验收拒满 NAME_FAIL_MAX 次的不再自动重来。
       // 少了这一句，翻不过的条目每次收集都重新进队列 → 翻 → 被拒 → 下次再来，
       // 用户看到的就是「怎么点都翻不了、一直提示未通过验收」（2026-10-26 真机）。
@@ -1949,7 +2320,7 @@ function collectDownloadTargets(state) {
   // downloadTargetOf 的「状态层已是中文」分支会往 cache 里补译文（DOM 层贴屏用）。
   // 那条分支不返回 target，所以没人写盘 —— 补进去的译文以前只活在内存里，
   // 关掉 Vortex 就没了，下次启动重算。这里统一落一次盘。
-  const cacheBefore = Object.keys(cache).length;
+  const cacheBefore = cacheEntryCount(cache);
   for (const dlId of Object.keys(files)) {
     const f = files[dlId];
     const raw0 = downloadShownNameOf(f);
@@ -1965,10 +2336,10 @@ function collectDownloadTargets(state) {
     if (isGivenUp(typeof cacheKeyOf === 'function' ? cacheKeyOf(raw) : raw) && good === undefined) continue;
     out.push({ dlId, raw, cached: t.cached, f });
   }
-  const added = Object.keys(cache).length - cacheBefore;
+  const added = cacheEntryCount(cache) - cacheBefore;
   if (added > 0) {
     saveJson(CACHE_PATH, cache, 'dl cache write');
-    log('info', 'dl cache filled', { added, total: Object.keys(cache).length });
+    log('info', 'dl cache filled', { added, total: cacheEntryCount(cache) });
   }
 
   // 诊断（P-NAME-05）：哪些下载行「有英文原名、cache 却查不到译文」——这些行只能显示英文。
@@ -1989,15 +2360,68 @@ function collectDownloadTargets(state) {
   return out;
 }
 
+// ---------- 给用户看的两个助手：失败原因 / 进度节流 ----------
+/** 最近一次 applyTranslation / applyDownloadTranslation 返回 false 的原因代码。
+ *  这两个函数同步执行、在 for 循环里逐条调用、中间没有 await —— 用「最后一次原因」
+ *  不会串台，比给两个函数改签名（调用点 7 处）风险小得多。 */
+let lastApplyFail = '';
+const FAIL_LABEL = {
+  noreply: '没返回译文',
+  blank: '返回空',
+  nocjk: '没译成中文',
+  half: '仍夹英文',
+  write: '写不进列表',
+};
+/** 失败原因一句话，只报数量最多的两项；拿不到原因就返回空串，调用方只报条数。 */
+function failCauseText(tally) {
+  const ks = Object.keys(tally || {}).filter((k) => tally[k] > 0).sort((a, b) => tally[b] - tally[a]);
+  if (!ks.length) return '';
+  const head = ks.slice(0, 2).map((k) => `${tally[k]} 条${FAIL_LABEL[k] || k}`);
+  return '（' + head.join('，') + (ks.length > 2 ? ' 等' : '') + '）';
+}
+/** 进度通知节流：跨过 25% / 50% / 75% 各发一条，100% 交给结果通知。
+ *  以前是每 25 条一条 —— 300 条会连刷 12 个 toast，用户根本看不过来，而且
+ *  「60/300」这种中间值对用户没有任何信息量（进度条在按钮上）。 */
+function makeProgressNotifier(nid, total) {
+  let last = 0;
+  return (done) => {
+    if (!(total >= 40)) return;                    // 一两批就跑完，报进度没有意义
+    const step = Math.floor((done / total) * 4);
+    if (step <= last || step >= 4) return;         // 100% 交给结果通知，别叠一条
+    last = step;
+    notify({ id: nid, type: 'info', displayMS: 6000, title: '翻译进度', message: `${done}/${total}` });
+  };
+}
+/** 译文被拒的具体原因（只给用户看的一句话）。
+ *  合格与否仍由 modNameOk 独家判定，这里只是把「被拒」再分个类，不改判据。 */
+function whyRejected(raw, zh) {
+  const s = String(zh == null ? '' : zh).trim();
+  if (!s) return 'blank';
+  if (!CJK.test(s)) return 'nocjk';                                   // R1：一个汉字都没有
+  if (s === String(raw == null ? '' : raw).trim()) return 'nocjk';    // 原样抄回去
+  return 'half';                                                      // 有中文但夹残留/被引号包着
+}
+
 function applyTranslation(item, zh) {
   if (item.dlId) return applyDownloadTranslation(item, zh);
+  lastApplyFail = 'noreply';
   if (!zh) return false;
   // let：下面同族统一要把结果写回 clean（const 会抛 TypeError 中断整批 —— dlname 组 4 实录）
   let clean = String(zh).replace(/^["'\s]+|["'\s]+$/g, '');
+  lastApplyFail = 'blank';
   if (!clean) return false;
-  // 译文=原文 = 无需翻译（专名/已中文）。不写 Vortex 持久化状态——originalName 和
-  // customFileName 都写成原值没有意义，只在缓存里标记「这条处理过了」。
+  // 译文=原文 分两种，以前混为一谈（2026-10-29 真机：右键「取消保留英文」后
+  // 点「立即翻译」提示 1 条成功，界面仍是英文）：
+  //  ① 整名在保英文名单里 → 本来就该是英文，算成功、不写缓存（写了读侧也不认）
+  //  ② 原文里有待翻英文、模型却原样退回 → **没翻**，按失败记账走有界退让。
+  //     旧代码把它当成功并写缓存，于是「点几次都报成功、界面一次都不变」。
   if (clean === item.raw) {
+    if (typeof isKnownBrand === 'function' && isKnownBrand(item.raw)) return true;
+    const wantTr = typeof needsTranslate === 'function' ? needsTranslate(item.raw) : false;
+    if (wantTr) {
+      lastApplyFail = 'nocjk';
+      return typeof rejectName === 'function' ? rejectName(item.raw, clean, 'mod') : false;
+    }
     const ckSame = cacheKeyOf(item.raw);
     if (ckSame) cache[ckSame] = clean;     // 中文/空键不写（cacheKeyOf 返回 '' 即拒绝）
     return true;
@@ -2005,7 +2429,10 @@ function applyTranslation(item, zh) {
   // 验收三规则：不达标的译文不写状态、不入缓存（最坏结局=保持英文，绝不比原文更差）
   // 直接调 modNameOk（唯一实现；nameAcceptable 只是它的别名，测试沙箱没抽那个名字）
   // 拒绝必须走 rejectName：它会记 give-up 账，试满 3 次就不再反复烧模型
-  if (!modNameOk(item.raw, clean)) return rejectName(item.raw, clean, 'mod');
+  if (!modNameOk(item.raw, clean)) {
+    lastApplyFail = whyRejected(item.raw, clean);
+    return rejectName(item.raw, clean, 'mod');
+  }
   // F4：同族多版本统一（骨架 + 本条版本号）；取不到版本尾巴时原样返回，绝不跨版本覆盖
   const unified = unifyFamilyName(item.raw, clean);
   if (unified !== clean) {
@@ -2019,7 +2446,7 @@ function applyTranslation(item, zh) {
   const okOrig = dispatch('originalName', item.gameId, item.modId, item.raw);
   const okCustom = dispatch('customFileName', item.gameId, item.modId, clean);
   if (cfg.writeToNameField) dispatch('name', item.gameId, item.modId, clean);
-  if (!okOrig || !okCustom) return false;
+  if (!okOrig || !okCustom) { lastApplyFail = 'write'; return false; }
   const ckOk = cacheKeyOf(item.raw);
   if (ckOk) {
     cache[ckOk] = clean;
@@ -2030,19 +2457,31 @@ function applyTranslation(item, zh) {
 
 /** 下载条目（尚未安装的模组）也翻名字：官方 action setDownloadModInfo */
 function applyDownloadTranslation(item, zh) {
+  lastApplyFail = 'noreply';
   if (!zh) return false;
   // let：同族统一写回（与 applyTranslation 同一个坑）
   let clean = String(zh).replace(/^["'\s]+|["'\s]+$/g, '');
+  lastApplyFail = 'blank';
   if (!clean) return false;
   // 译文=原文 = 无需翻译：不写 Vortex 状态，只标记缓存（同 applyTranslation）
+  // 译文=原文：与 applyTranslation 同一口径（名单内=成功不写缓存 / 待翻英文原样退回=失败）
   if (clean === item.raw) {
+    if (typeof isKnownBrand === 'function' && isKnownBrand(item.raw)) return true;
+    const wantTrDl = typeof needsTranslate === 'function' ? needsTranslate(item.raw) : false;
+    if (wantTrDl) {
+      lastApplyFail = 'nocjk';
+      return typeof rejectName === 'function' ? rejectName(item.raw, clean, 'dl') : false;
+    }
     const ckSameDl = cacheKeyOf(item.raw);
     if (ckSameDl) cache[ckSameDl] = clean;   // 中文/空键不写
     return true;
   }
   // 拒绝必须走 rejectName：下载行以前只打日志、不记账，同一个名字每次收集都重来
   // —— 用户看到的就是「点了也没用、一直提示未通过验收」的无限循环（2026-10-26 真机）。
-  if (!modNameOk(item.raw, clean)) return rejectName(item.raw, clean, 'dl');
+  if (!modNameOk(item.raw, clean)) {
+    lastApplyFail = whyRejected(item.raw, clean);
+    return rejectName(item.raw, clean, 'dl');
+  }
   // F4：同族多版本统一（下载行同样适用；取不到版本尾巴就原样返回）
   const unified = unifyFamilyName(item.raw, clean);
   if (unified !== clean) clean = unified;
@@ -2052,7 +2491,7 @@ function applyDownloadTranslation(item, zh) {
   // 必然 < 50，于是给每个 mod 写出 `customFileName = \`${modName} - ${fileName}\``
   // → 整个列表炸成「英文 - 中文」拼装名（PITFALLS P-NAME-03，已踩两次）。
   // 界面显示归 DOM 层从 cache.json 贴；状态库只回答「我翻过没有」。
-  if (!setDownloadShownName(item.dlId, clean)) return false;
+  if (!setDownloadShownName(item.dlId, clean)) { lastApplyFail = 'write'; return false; }
   const ckDl = cacheKeyOf(item.raw);
   if (ckDl) {
     cache[ckDl] = clean;
@@ -2089,10 +2528,11 @@ function restoreAll(state) {
   // 对下载路径没有 cur 比对（不像 mods 路径那样先看当前值），重启约 8 秒后会把
   // 中文按缓存又写回该条目；用户改用手动清缓存则原名映射永久丢失。
   const dlFiles = (((state.persistent || {}).downloads || {}).files) || {};
-  if (Object.keys(dlFiles).length > 0 && Object.keys(cache).length > 0) {
+  if (Object.keys(dlFiles).length > 0 && cacheEntryCount(cache) > 0) {
     // 反查表：译文 → cache 键（原名）。同一译文可能对应多个原名，取第一个。
     const rev = new Map();
     for (const k of Object.keys(cache)) {
+      if (!k || k.charAt(0) === '_') continue;   // _ver/_st/_gl 是元信息，不是原名
       const v = cache[k];
       if (typeof v === 'string' && !rev.has(v)) rev.set(v, k);
     }
@@ -2131,16 +2571,23 @@ function restoreAll(state) {
   return n;
 }
 
-async function translate(list) {
+async function translate(list, opts) {
+  // 手动触发（工具栏按钮 / 一键汉化 / 取消保留后的重翻）的结果通知留在通知中心，
+  // 全部通知都走铃铛（用户要求：底部不要闪）。停留时长靠 displayMS > 5000 保证不被
+  // canBeToast 抢走；不设 displayMS 反而是坑——store 里永不删除，徽标越挂越多。
+  const manual = !!(opts && opts.manual);
   if (running) {
-    notify({ type: 'info', message: '汉化正在运行中，请稍候' });
-    return { applied: 0, failed: 0, error: '正在翻译中，请稍候再点' };
+    notify({ id: 'modname-zh-busy', type: 'info', displayMS: 6000, title: '正在翻译中', message: '等这一轮跑完再点' });
+    return { applied: 0, failed: 0, error: '正在翻译中，等这一轮跑完再点' };
   }
   if (!list || list.length === 0) {
-    notify({ type: 'info', message: '没有需要汉化的模组名' });
+    notify({ id: 'modname-zh-busy', type: 'info', displayMS: 6000, title: '没有要翻的条目', message: '列表里已是中文' });
     return { applied: 0, failed: 0, none: true };
   }
   running = true;
+  // 手动点了就立刻叫醒界面翻译层：DOM 层因模型挂机进入暂停时，
+  // 只有 2 分钟一次的探活能恢复，手动按钮必须有最高优先级（0.16.5 补）。
+  if (manual) kickDomLayer('translate');
   const nid = 'modname-zh-progress';
   try {
     // 必须是「原地改」，不能 cfg = readJson(...)：save() 靠 Object.assign 改同一个对象
@@ -2149,6 +2596,9 @@ async function translate(list) {
       // 兜底不能写 cfg 本身：readJson 失败时返回的就是这个引用，
       // 紧接着把 cfg 的键全删了，Object.assign(cfg, 自己) 等于拿到空对象，
       // 后面就会误报「模组名汉化已在设置中关闭」，并且 DOM 层失去全部配置。
+      // 先把手上的配置写下去：设置页刚填的地址可能还在 400ms 防抖窗口里，
+      // 直接读文件会拿到旧地址，导致「刚填完就点翻译」反而报未配置。
+      flushCfgWrite();
       const raw = readJson(CONFIG_PATH, null);
       if (raw && typeof raw === 'object') {
         for (const k of Object.keys(cfg)) delete cfg[k];
@@ -2163,7 +2613,7 @@ async function translate(list) {
       mergeRuntimeTerms();
     }
     if (!cfg.enabled) {
-      notify({ type: 'info', message: '模组名汉化已在设置中关闭' });
+      notify({ id: 'modname-zh-off', type: 'info', displayMS: 6000, title: '模组名翻译已关闭', message: '在设置里打开后再试' });
       return { applied: 0, failed: 0, error: '模组名汉化已在设置里被关掉了' };
     }
 
@@ -2181,14 +2631,22 @@ async function translate(list) {
 
     if (pending.length === 0) {
       saveJson(CACHE_PATH, cache, 'translate done');
-      notify({ id: nid, type: 'success', message: `模组名汉化：已处理 ${applied} 条（全部命中缓存）` });
+      notify({ id: nid, type: 'success', displayMS: resultMS(manual), title: '模组名翻译完成', message: `${applied} 条（命中缓存）` });
       return { applied, failed: 0, cachedOnly: true };
+    }
+
+    // 发请求前先确认模型连不连得上（0.16.5）：连不上就一条都不烧。
+    // manual 必须透传：手动点按钮时要弹窗把四类原因说清。
+    // 之前这里写死 false，手动点完模型没开会静默返回 —— 用户看到的就是「点了没反应」。
+    if (!(await gateModel(manual, '汉化'))) {
+      const d = describePreflight(lastPreflight);
+      return { applied, failed: 0, error: '模型接口未就绪：' + ((d && d.short) || '未知原因') };
     }
 
     const lanes = Math.max(1, Math.min(10, cfg.concurrency || 5));
     notify({
-      id: nid, type: 'info',
-      message: `开始汉化：${pending.length} 条待翻译，${lanes} 路并发（模型：${(cfg.provider && cfg.provider.baseUrl) || '?'}）`,
+      id: nid, type: 'info', displayMS: 6000, title: '开始翻译模组名',
+      message: `${pending.length} 条`,
     });
 
     const texts = pending.map((p) => p.raw);
@@ -2196,50 +2654,41 @@ async function translate(list) {
     // 按批长度猜——批均 >24 字符的真实长名会被误判 ui，modOnly 词条（Oils→剑油/
     // Reborn→重生）不遮蔽，产出缺固定译名的「合格译文」→ 对账全量词表判漂移 →
     // 删键重翻 → 再缺 → 循环。遮蔽是硬保证，提示词对照只是模型自觉。
-    const results = await core.translateConcurrently(cfg, cache, texts, lanes, (done, total) => {
-      if (done % 25 === 0 || done === total) {
-        notify({ id: nid, type: 'info', message: `汉化进度 ${done}/${total}` });
-      }
-    }, 'mod');
+    const results = await core.translateConcurrently(cfg, cache, texts, lanes, makeProgressNotifier(nid, pending.length), 'mod');
+    const why = {};
     for (let k = 0; k < pending.length; k++) {
       if (applyTranslation(pending[k], results[k])) applied++;
-      else failed++;
+      else { failed++; why[lastApplyFail] = (why[lastApplyFail] || 0) + 1; }
     }
     saveJson(CACHE_PATH, cache, 'translate done');
-    log('info', 'done', { applied, failed, lanes });
+    log('info', 'done', { applied, failed, lanes, why });
     if (failed > 0) {
-      // 只有整批全灭才可能是模型接口没开；部分失败更常见的原因是「模型没翻彻底」
-      // （旧代码一律甩给模型接口：实测成功 30 失败 3 而模型一直好着，用户被误导）
+      // 有成功 = 接口一定是通的，这时再提「模型没连上」就是自相矛盾的提示。
+      // 全失败才可能整批被模型拒；但预检已经放行了，所以也不能甩「去测连接」——
+      // 只能说「没拿到可用结果」，把具体原文与返回指到日志里。
       const whole = failed >= pending.length;
       if (whole) {
-        notify({
-          id: nid,
-          type: 'warning',
-          message: `汉化完成：成功 ${applied}，失败 ${failed}。多数原因是模型接口没开或地址不对，请到 设置 → 模组名汉化 里点「测试连接」`,
-        });
+        notifyAnomaly({ id: 'modname-zh-allfail', type: 'error', title: '模组名没翻出来', message: `${failed} 条全部失败` + failCauseText(why) + hintShort() });
       } else {
-        notify({
-          id: nid,
-          type: 'success',
-          message: `汉化完成：成功 ${applied}，失败 ${failed} 条未通过验收（模型没翻彻底，下次扫描会自动重试）`,
-        });
+        notifyAnomaly({ id: 'modname-zh-partial', type: 'warning', title: '模组名翻译完成', message: `${applied} 条成功，${failed} 条失败` + failCauseText(why) });
       }
     } else {
-      notify({ id: nid, type: 'success', message: `汉化完成：成功 ${applied} 条` });
+      clearAnomaly();
+      notify({ id: nid, type: 'success', displayMS: resultMS(manual), title: '模组名翻译完成', message: `${applied} 条成功` });
     }
     return { applied, failed };
   } catch (e) {
     log('error', 'translate crashed', String((e && e.stack) || e));
-    notify({ id: nid, type: 'error', message: '模组名汉化失败：' + String(e).slice(0, 200) });
-    return { applied: 0, failed: 0, error: String(e).slice(0, 180) };
+    notifyAnomaly({ id: 'modname-zh-crash', type: 'error', title: '翻译出错', message: String(e).slice(0, 50) });
+    return { applied: 0, failed: 0, error: String(e).slice(0, 60) };
   } finally {
     running = false;
   }
 }
 
-function translateAll() {
+function translateAll(opts) {
   const state = contextRef.api.getState();
-  return translate(collectTargets(state, null).concat(collectDownloadTargets(state)));
+  return translate(collectTargets(state, null).concat(collectDownloadTargets(state)), opts);
 }
 
 function applyCachedSilently() {
@@ -2314,10 +2763,13 @@ function ensureLocalePack(isStartup) {
     if (r.changed) {
       log('info', 'locale pack built', { entries: r.entries, reason: r.reason, removed: (r.removed || []).length });
       if (isStartup) {
+        // 阶段性提示：6 秒后自己消失。>5000 是为了避开底部 toast（用户要求一律走铃铛）。
         notify({
+          id: 'modname-zh-pack',
           type: 'info',
-          message: `界面语言包已更新（${r.entries} 条词条，单个 common.json），重启 Vortex 后生效`,
-          instructions: '重启 Vortex 才会加载新的语言包',
+          displayMS: 6000,
+          title: '界面语言包已更新',
+          message: `${r.entries} 条词条，重启生效`,
         });
       }
     }
@@ -2637,16 +3089,25 @@ function normSelection(sel) {
  *  已翻好的条目跳过（skipped 只统计这一类）；半拉子要清要翻。
  *  下载记录不清缓存：判据是界面显示串，缓存是「显示串 → 译文」的映射，
  *  清了就白烧模型（given-up + 有缓存的条目正是这么被救回来的）。 */
-async function translateAllFresh(want, dlIds) {
+/** @param opts.manual 用户主动点的是 true：模型连不上时弹窗说清原因。
+ *  升级后的自动重建走默认 false（只发通知，不弹窗，不打断启动）。 */
+async function translateAllFresh(want, dlIds, opts) {
+  const manual = !!(opts && opts.manual);
+  // keepExisting：只补缺的/失败的/被放弃的，已有合格译文一律不动。
+  // 「立即翻译」与「清空缓存并全部重翻」必须是两个语义（用户 2026-10-29 定）：
+  //   keepExisting=true  → 立即翻译：插队把当前该翻的跑一遍，不推倒重来
+  //   keepExisting=false → 强制重翻：先删译文再翻，一个不留
+  const keepExisting = !!(opts && opts.keepExisting);
   if (running) {
-    notify({ type: 'info', message: '汉化正在运行中，请稍候' });
-    return { applied: 0, failed: 0, error: '正在翻译中，请稍候再点' };
+    notify({ id: 'modname-zh-busy', type: 'info', displayMS: 6000, title: '正在翻译中', message: '等这一轮跑完再点' });
+    return { applied: 0, failed: 0, error: '正在翻译中，等这一轮跑完再点' };
   }
   if (!cfg || !cfg.enabled) {
-    notify({ type: 'info', message: '模组名汉化已在设置中关闭' });
+    notify({ id: 'modname-zh-off', type: 'info', displayMS: 6000, title: '模组名翻译已关闭', message: '在设置里打开后再试' });
     return { applied: 0, failed: 0, error: '模组名汉化已在设置里被关掉了' };
   }
   running = true;
+  if (manual) kickDomLayer('fresh');
   const nid = 'modname-zh-fresh';
   try {
     // 枚举用一次状态快照（变量名刻意不叫 st：契约钉住「不用重新 getState 的显示名」）
@@ -2683,8 +3144,12 @@ async function translateAllFresh(want, dlIds) {
           if (nothingToTranslate(r.base)) continue;
           // 翻不动就退让（与 collectTargets 同一判据）。这里**连清缓存都不做** ——
           // 否则条目既被删了译文、又被拉黑，界面停在英文且永远不再试，比不打补丁更糟。
-          if (typeof isGivenUp === 'function' && isGivenUp(cacheKeyOf(r.base))) { givenUp++; continue; }
-          if (cache[cacheKeyOf(r.base)] !== undefined && typeof dropTranslation === 'function') {
+          // 手动「强制重翻」不吃放弃名单：用户点它就是要求再来一遍，
+          // 按 isGivenUp 跳过会得到 todo:0，看起来就是「清了缓存也不翻」（0.16.5 补）。
+          if (!manual && typeof isGivenUp === 'function' && isGivenUp(cacheKeyOf(r.base))) { givenUp++; continue; }
+          // keepExisting（「立即翻译」）时不删旧译文：那是「强制重翻」才做的事。
+          // 以前这里无条件删，导致点了「立即翻译」等于悄悄清了一次缓存。
+          if (!keepExisting && cache[cacheKeyOf(r.base)] !== undefined && typeof dropTranslation === 'function') {
             dropTranslation(r.base);
             cleared++;
           }
@@ -2716,7 +3181,7 @@ async function translateAllFresh(want, dlIds) {
         if (applyDownloadTranslation({ dlId: id, raw: b0 }, t.cached)) dlApplied++;
         continue;
       }
-      if (isGivenUp(cacheKeyOf(b0))) { givenUp++; continue; }
+      if (!manual && isGivenUp(cacheKeyOf(b0))) { givenUp++; continue; }
       dlList.push({ dlId: id, raw: b0 });
     }
     if (cleared > 0) saveJson(CACHE_PATH, cache, 'retranslate cleared');
@@ -2727,24 +3192,38 @@ async function translateAllFresh(want, dlIds) {
     // 命中缓存的条目在上面就已经就地套好了，这里只处理还需要送模型的。
     const translate = async (batch) => {
       if (batch.length === 0) {
-        notify({ id: nid, type: 'success', message: `重翻完成：没有需要重翻的模组名（已翻好跳过 ${skipped} 条）` });
+        notify({ id: nid, type: 'success', displayMS: resultMS(manual), title: '模组名重翻完成', message: `已合格 ${skipped} 条，无需重翻` });
         return { applied: dlApplied, failed: 0, none: true, skipped };
       }
-      notify({ id: nid, type: 'info', message: `开始重翻：${batch.length} 条待翻译（模型：${(cfg.provider && cfg.provider.baseUrl) || '?'}）` });
+      // 先探模型（0.16.5）：连不上就在这里收手，一条都不烧。
+      // 以前是先烧完整批，再在结尾甩一句「多数原因是模型接口没开或地址不对」。
+      if (!(await gateModel(manual, '重翻', opts))) {
+        const d = describePreflight(lastPreflight);
+        return {
+          applied: dlApplied, failed: 0, skipped,
+          error: '模型接口未就绪：' + ((d && d.short) || '未知原因'),
+          preflight: (lastPreflight && lastPreflight.code) || '',
+        };
+      }
+      notify({ id: nid, type: 'info', displayMS: 6000, title: '开始重翻模组名', message: `${batch.length} 条` });
       const lanes = Math.max(1, Math.min(10, cfg.concurrency || 5));
       const texts = batch.map((p) => p.raw);
-      const results = await core.translateConcurrently(cfg, cache, texts, lanes, (done, total) => {
-        if (done % 25 === 0 || done === total) {
-          notify({ id: nid, type: 'info', message: `重翻进度 ${done}/${total}` });
-        }
-      }, 'mod');
+      const results = await core.translateConcurrently(cfg, cache, texts, lanes, makeProgressNotifier(nid, batch.length), 'mod');
       let applied = dlApplied;
       let failed = 0;
       const retry = [];
+      const retryWhy = [];        // 与 retry 同下标的失败原因：重试救回来时要把它从统计里扣掉
+      const why = {};
       for (let k = 0; k < batch.length; k++) {
         const item = batch[k];
         const okOne = item.dlId ? applyDownloadTranslation(item, results[k]) : applyTranslation(item, results[k]);
-        if (okOne) applied++; else { failed++; retry.push(item); }
+        if (okOne) applied++;
+        else {
+          failed++;
+          retry.push(item);
+          retryWhy.push(lastApplyFail);
+          why[lastApplyFail] = (why[lastApplyFail] || 0) + 1;
+        }
       }
       // ── 失败条目单独重试一次 ────────────────────────────────────────────
       // 模型在 20 条一起送时会被别的条目带偏：实测 `ModSkillSlotPages Remaster 1.8`
@@ -2752,30 +3231,35 @@ async function translateAllFresh(want, dlIds) {
       // （`ModSkillSlotPages 重制版 1.8` → 有英文残留 → 验收拒）。单条重送能救回来。
       // 只在「部分失败」时做：全失败说明模型/接口有问题，重试只是白等。
       if (retry.length > 0 && retry.length < batch.length && retry.length <= 10) {
-        notify({ id: nid, type: 'info', message: `有 ${retry.length} 条没过验收，单独重试一次` });
+        notify({ id: nid, type: 'info', displayMS: 6000, title: '单独重试', message: `${retry.length} 条没过验收，再试一次` });
         const once = await core.translateConcurrently(cfg, cache, retry.map((p) => p.raw), 1, null, 'mod');
         for (let k = 0; k < retry.length; k++) {
           const item = retry[k];
           const okOne = item.dlId ? applyDownloadTranslation(item, once[k]) : applyTranslation(item, once[k]);
-          if (okOne) { applied++; failed--; }
+          if (okOne) {
+            applied++; failed--;
+            const w = retryWhy[k];
+            if (w && why[w] > 0) why[w]--;   // 重试救回来了，这次失败不该再出现在原因统计里
+          }   // 重试救回来的算成功，不再计入失败数
         }
       }
       saveJson(CACHE_PATH, cache, 'retranslate fresh');
-      log('info', 'fresh translate done', { applied, failed, skipped, retried: retry.length });
+      log('info', 'fresh translate done', { applied, failed, skipped, retried: retry.length, why });
       if (failed > 0) {
         const whole = failed >= batch.length;
-        notify({
-          id: nid,
-          type: whole ? 'warning' : 'success',
+        notifyAnomaly({
+          id: whole ? 'modname-zh-allfail' : 'modname-zh-partial',
+          type: whole ? 'error' : 'warning',
+          title: whole ? '模组名没翻出来' : '模组名重翻完成',
           message: whole
-            ? `重翻完成：成功 ${applied}，失败 ${failed}。多数原因是模型接口没开或地址不对，请到 设置 → 模组名汉化 里点「测试连接」`
-            : `重翻完成：成功 ${applied}，失败 ${failed} 条未通过验收${givenUp ? `，另有 ${givenUp} 条试满 3 次已暂停自动重试` : ''}。要再试可右键单条「翻译此模组」`,
+            ? `${failed} 条全部失败` + failCauseText(why) + hintShort()
+            : `${applied} 条成功，${failed} 条失败` + failCauseText(why) + (givenUp ? `，${givenUp} 条已暂停` : ''),
         });
       } else {
+        clearAnomaly();
         notify({
-          id: nid,
-          type: 'success',
-          message: `重翻完成：成功 ${applied} 条${givenUp ? `（${givenUp} 条试满 3 次已暂停，可右键单条强制重试）` : ''}`,
+          id: nid, type: 'success', displayMS: resultMS(manual), title: '模组名重翻完成',
+          message: `${applied} 条成功` + (givenUp ? `，${givenUp} 条已暂停` : ''),
         });
       }
       return { applied, failed, skipped };
@@ -2787,8 +3271,8 @@ async function translateAllFresh(want, dlIds) {
     return translate(full);
   } catch (e) {
     log('error', 'translateAllFresh crashed', String((e && e.stack) || e));
-    notify({ id: nid, type: 'error', message: '模组名重翻失败：' + String(e).slice(0, 200) });
-    return { applied: 0, failed: 0, error: String(e).slice(0, 180) };
+    notifyAnomaly({ id: 'modname-zh-crash', type: 'error', title: '重翻出错', message: String(e).slice(0, 50) });
+    return { applied: 0, failed: 0, error: String(e).slice(0, 60) };
   } finally {
     running = false;
   }
@@ -2969,9 +3453,16 @@ function hitFromDownload(state, modsRoot, id) {
  *  点模组行按 m.id 反查（Vortex 传的是纯 UUID，在 mods 键里匹配不上）。
  *  只修点名的 + 有缓存的，不把没缓存的拖去烧模型。 */
 async function translateSelected(instanceIds) {
+  // 批量批次在跑时不能直接丢弃：右键是用户亲手点的一次请求，等它跑完自动接上
+  // （最多等 30 秒，与「取消保留英文」的重翻排队同一口径）。以前这里立刻 return
+  // 「正在翻译中」，用户看到的就是「右键点了没反应」。
+  for (let i = 0; running && i < 20; i++) {
+    if (i === 0) notify({ id: 'modname-zh-busy', type: 'info', displayMS: 6000, title: '正在翻译中', message: '已排队，这一轮跑完自动接上' });
+    await new Promise((r) => setTimeout(r, 1500));
+  }
   if (running) {
-    notify({ type: 'info', message: '汉化正在运行中，请稍候' });
-    return { applied: 0, failed: 0, error: '正在翻译中，请稍候再点' };
+    notify({ id: 'modname-zh-busy', type: 'info', displayMS: 6000, title: '仍在翻译中', message: '这一轮太久，等它跑完再点一次' });
+    return { applied: 0, failed: 0, error: '正在翻译中，等这一轮跑完再点' };
   }
   const ids = normSelection(instanceIds);
   const state = contextRef.api.getState();
@@ -2980,6 +3471,7 @@ async function translateSelected(instanceIds) {
   const list = [];
   const dlIds = [];
   const miss = [];
+  const kept = [];   // 整名在保英文名单里：不送模型，单独提示（0.16.5）
   const diag = { ids: ids.length, mods: 0, dl: 0, miss };
   for (const id of ids) {
     let hit = null;
@@ -3003,6 +3495,9 @@ async function translateSelected(instanceIds) {
     const raw = bases[0] || rawNameOf(found.mod);
     if (!raw) continue;
     if (typeof registerKeptBrands === 'function') registerKeptBrands(raw);
+    // 整名在保英文名单里 → 点了「立即翻译」也不该送模型：模型只会原样退回，
+    // 旧代码把它记成成功并报「1 条成功」，界面一动不动（2026-10-29 真机）。
+    if (typeof isKnownBrand === 'function' && isKnownBrand(raw)) { kept.push(raw); continue; }
     // 右键是用户亲手点的「再来一次」—— 唯一能突破有界退让的出口。
     // 不清账的话：批量路径试满 3 次拉黑后，右键也只会静默跳过，用户看到的就是
     // 「手动点翻译没反应 / 提示未通过验收」，这正是 0.16.3 里被反复投诉的无限循环。
@@ -3021,16 +3516,19 @@ async function translateSelected(instanceIds) {
     }
   }
   running = true;
+  kickDomLayer('selected');
   try {
     let applied = 0;
     let failed = 0;
+    const why = {};
+    const unsat = (k) => { why[k] = (why[k] || 0) + 1; };
     const pending = [];
     for (const t of list) {
-      if (t.cached) { if (applyTranslation(t, t.cached)) applied++; else failed++; }
+      if (t.cached) { if (applyTranslation(t, t.cached)) applied++; else { failed++; unsat(lastApplyFail); } }
       else pending.push(t);
     }
     for (const t of dlTargets) {
-      if (t.cached) { if (applyDownloadTranslation(t, t.cached)) applied++; else failed++; }
+      if (t.cached) { if (applyDownloadTranslation(t, t.cached)) applied++; else { failed++; unsat(lastApplyFail); } }
       else pending.push(t);
     }
     log('info', 'fresh translate', { todo: list.length + dlTargets.length, dl: dlTargets.length, skipped: 0 });
@@ -3042,32 +3540,41 @@ async function translateSelected(instanceIds) {
       log('info', 'fix download rows by hand', { n: dlFixed });
     }
     if (pending.length === 0) {
-      if (applied > 0) notify({ type: 'success', message: `已修好 ${applied} 条模组名（命中缓存，未调用模型）` });
-      else notify({ type: 'info', message: '没有需要翻译的模组名（列表里已是中文或没有模组）' });
-      return { applied, failed, none: applied === 0 };
+      // 全部命中缓存 = 这一批确实修好了，旧的红卡没有理由继续挂着
+      if (applied > 0) { clearAnomaly(); notify({ id: 'modname-zh-sel', type: 'success', displayMS: 10000, title: '已修好', message: `${applied} 条（命中缓存）` }); }
+      // 名单内条目以前会走「没有要翻的条目 / 选中的已是中文」，用户以为程序坏了
+      else if (kept.length > 0) notify({ id: 'modname-zh-sel', type: 'info', displayMS: 10000, title: '这条保留英文', message: '要翻先右键取消保留' });
+      else notify({ id: 'modname-zh-sel', type: 'info', displayMS: 6000, title: '没有要翻的条目', message: '选中的已是中文' });
+      return { applied, failed, none: applied === 0, kept: kept.length };
     }
-    notify({ type: 'info', message: `开始翻译：${pending.length} 条待翻译（模型：${(cfg.provider && cfg.provider.baseUrl) || '?'}）` });
+    // 右键是用户主动点的（manual=true）：模型连不上就弹窗说清是哪一种原因
+    if (!(await gateModel(true, '翻译'))) {
+      const d = describePreflight(lastPreflight);
+      return { applied, failed, error: '模型接口未就绪：' + ((d && d.short) || '未知原因') };
+    }
+    notify({ id: 'modname-zh-sel', type: 'info', displayMS: 6000, title: '开始翻译模组名', message: `${pending.length} 条` });
     const lanes = Math.max(1, Math.min(10, cfg.concurrency || 5));
     const results = await core.translateConcurrently(cfg, cache, pending.map((p) => p.raw), lanes, () => {}, 'mod');
     for (let k = 0; k < pending.length; k++) {
       const item = pending[k];
       const okOne = item.dlId ? applyDownloadTranslation(item, results[k]) : applyTranslation(item, results[k]);
-      if (okOne) applied++; else failed++;
+      if (okOne) applied++; else { failed++; unsat(lastApplyFail); }
     }
     saveJson(CACHE_PATH, cache, 'translateAll batch');
     if (failed > 0) {
-      notify({
-        type: 'success',
-        message: `翻译完成：成功 ${applied}，失败 ${failed} 条未通过验收（模型没翻彻底，可再点一次重试）`,
+      notifyAnomaly({
+        id: 'modname-zh-partial', type: 'warning', title: '翻译完成',
+        message: `${applied} 条成功，${failed} 条失败` + failCauseText(why),
       });
     } else {
-      notify({ type: 'success', message: `翻译完成：成功 ${applied} 条` });
+      clearAnomaly();
+      notify({ id: 'modname-zh-sel', type: 'success', displayMS: 10000, title: '翻译完成', message: `${applied} 条成功` });
     }
     return { applied, failed };
   } catch (e) {
     log('error', 'translateSelected crashed', String((e && e.stack) || e));
-    notify({ type: 'error', message: '翻译失败：' + String(e).slice(0, 200) });
-    return { applied: 0, failed: 0, error: String(e).slice(0, 180) };
+    notifyAnomaly({ id: 'modname-zh-crash', type: 'error', title: '翻译出错', message: String(e).slice(0, 50) });
+    return { applied: 0, failed: 0, error: String(e).slice(0, 60) };
   } finally {
     running = false;
   }
@@ -3249,6 +3756,8 @@ function makeSettingsComponent() {
       } catch (e) { /* ignore */ }
       // 同样要深拷贝：读到 DEFAULT_CFG 本体的话，设置页的 state.cfg
       // 和「出厂配置」就是同一个对象，后面任何赋值都会污染它。
+      // 同上：设置页 init 会拿磁盘值重建 state.cfg，不先落盘会把刚填的内容回退掉
+      flushCfgWrite();
       const loaded = readJson(CONFIG_PATH, null) || JSON.parse(JSON.stringify(DEFAULT_CFG));
       this.state = {
         cfg: loaded,
@@ -3258,12 +3767,11 @@ function makeSettingsComponent() {
           concurrency: String(loaded.concurrency == null ? DEFAULT_CFG.concurrency : loaded.concurrency),
           batchSize: String(loaded.batchSize == null ? DEFAULT_CFG.batchSize : loaded.batchSize),
         },
-        flash: null,        // { text, ok } —— 按钮操作完成后的当场反馈
+        // 页面内提示已取消（全部走铃铛），state.flash 不再存在
         queueOpen: false,   // 实时队列面板是否展开
         tick: 0,            // 面板刷新用的心跳（每秒变一次，触发重渲染）
         busy: '',           // 正在执行的按钮 key（执行期间禁用，防重复点）
         testing: false,
-        testResult: '',
         stats: {
           // _ver 是版本标记不是条目，两条缓存都带它，不过滤的话计数恒 +1
           //（和「清空全部翻译缓存」按钮里的 before 快照口径保持一致）
@@ -3275,7 +3783,6 @@ function makeSettingsComponent() {
         loc: locStat,
         locMsg: '',
       };
-      this._flashTimer = null;
       this._alive = true;
     }
 
@@ -3285,8 +3792,12 @@ function makeSettingsComponent() {
       // 否则装完看到「界面中文、模组名还是英文」只会以为扩展坏了
       try {
         const c = this.state.cfg || {};
-        if (!((c.provider && c.provider.baseUrl) || '').trim()) {
-          this.flash('还没填翻译接口地址：界面汉化不受影响，但模组名 / 更新日志不会被翻译。在下面「翻译接口」里填 LM Studio 或云端地址。', false);
+        const pv = c.provider || {};
+        // 与翻译闸门同一套说法（0.16.5）：缺什么就说什么，不写「接口地址」三个字了事
+        if (!String(pv.baseUrl || '').trim()) {
+          this.flash('还没填翻译接口，在下面填地址和模型名', false);
+        } else if (!String(pv.model || '').trim()) {
+          this.flash('还差「模型名」，填好再点测试连接', false);
         }
       } catch (e) { /* ignore */ }
       // 面板开没开都要刷新：按钮上得能看到「正在翻 N 条 / 排队 M 条」，
@@ -3307,16 +3818,18 @@ function makeSettingsComponent() {
 
     componentWillUnmount() {
       this._alive = false;
-      if (this._flashTimer) clearTimeout(this._flashTimer);
       if (this._tick) clearInterval(this._tick);
     }
 
     save(patch) {
       const next = Object.assign({}, JSON.parse(JSON.stringify(DEFAULT_CFG)), this.state.cfg, patch);
       this.setState({ cfg: next });
-      saveJson(CONFIG_PATH, next, 'settings save');
+      // 防抖写盘：只推迟写文件，内存 cfg 仍立刻更新（连内存一起延迟会让「填完就点翻译」用旧配置）
+      scheduleCfgWrite();
       Object.assign(cfg, next); // 保持同一引用，DOM 层与翻译层才能即时读到新配置
       mergeRuntimeTerms();      // 用户在设置页改术语后，游戏名对照不能被 16 条覆盖掉
+      // 改了接口地址/密钥/模型名 → 上一次的预检结论作废，否则 10 秒内还按旧地址拦人
+      preflightCache = { at: 0, res: null };
       // 启动时若关着实时翻译，DOM 层根本没被注入；这里补启，否则勾选后毫无反应
       if (patch && patch.domTranslate === true && !domStarted && typeof startDomRef === 'function') {
         try {
@@ -3326,15 +3839,15 @@ function makeSettingsComponent() {
       log('info', 'config updated', Object.keys(patch));
     }
 
-    /** 当场反馈：页面内一行绿/红字 + 系统提示，几秒后自动消失 */
-    flash(text, ok) {
-      if (this._flashTimer) clearTimeout(this._flashTimer);
-      if (this._alive) this.setState({ flash: { text, ok: ok !== false } });
-      this._flashTimer = setTimeout(() => {
-        if (this._alive) this.setState({ flash: null });
-      }, 6000);
+    /** 操作反馈统一走通知中心（铃铛），设置页里不再叠一行字（用户 2026-10-29 要求）。
+     *  以前是「页面内一行 + 铃铛一条」双发，同一个结果在屏幕上出现两遍。
+     *  opts.quiet：这条已经在别处通知过（例如翻译管线内部发过带明细的通知），这里完全静默。 */
+    flash(text, ok, opts) {
+      if (opts && opts.quiet) return;
       try {
-        notify({ id: 'modname-zh-flash', type: ok === false ? 'warning' : 'success', message: String(text).replace(/^[✓✗×]\s*/, '') });
+        const one = String(text).replace(/^[✓✗×…]\s*/, '').replace(/\s+/g, ' ');
+        // 阶段性反馈：6 秒后自己消失。>5000 才不会被 canBeToast 抢去走底部 toast。
+        notify({ id: 'modname-zh-flash', type: ok === false ? 'error' : 'success', displayMS: 6000, message: one.length > 30 ? one.slice(0, 30) + '…' : one });
       } catch (e) { /* 提示失败不影响主流程 */ }
     }
 
@@ -3343,31 +3856,48 @@ function makeSettingsComponent() {
       const raw = String(this.state.draft[key] == null ? '' : this.state.draft[key]).trim();
       const n = parseInt(raw, 10);
       if (!raw || !isFinite(n) || n <= 0) {
-        return this.flash(`✗ ${label}：没填或不是数字，未保存（请输入 ${min}-${max} 的整数）`, false);
+        return this.flash(`✗ ${label}：要 ${min}-${max} 的整数`, false);
       }
       const v = Math.max(min, Math.min(max, n));
       this.save({ [key]: v });
       this.setState({ draft: Object.assign({}, this.state.draft, { [key]: String(v) }) });
-      this.flash(`✓ ${label} 已应用：${v}${v !== n ? `（超出 ${min}-${max}，已按边界保存）` : ''}`, true);
+      this.flash(`✓ ${label} = ${v}${v !== n ? '（已按边界）' : ''}`, true);
     }
 
     async test() {
       this.setState({ testing: true, busy: 'test' });
-      this.flash('… 正在向模型发一条测试文本', true);
+      this.flash('… 正在连模型', true);
       try {
         const c = this.state.cfg;
-        const base = String((c.provider && c.provider.baseUrl) || '').replace(/\/+$/, '');
+        const p = c.provider || {};
+        const base = String(p.baseUrl || '').trim().replace(/\/+$/, '');
+        // 第一步：分类探活（0.16.5）。预检能说出「服务没启动 / 密钥被拒 / 模型名不在列表」，
+        // 而下面那条测试翻译只能说「没收到有效译文」—— 用户正是被那句话带去查错地方。
+        const pre = await modelPreflight(true);
+        lastPreflight = pre;
+        // 只差模型名：顺手把接口里能用的列出来，省得用户去别处翻
+        if (pre.code === 'nomodel' && base) {
+          const lib = await probeOnce(base, '', p.apiKey || '');
+          if (lib.ids && lib.ids.length) {
+            throw new Error('还差「模型名」。接口里能用的有：' + lib.ids.slice(0, 6).join('、')
+              + (lib.ids.length > 6 ? ' 等' : '') + '。挑一个填进「模型名」再点这里');
+          }
+        }
+        const d = describePreflight(pre);
+        if (d) throw new Error(d.title + '：' + d.short);
         if (!base) throw new Error('请先填接口地址');
-        let model = (c.provider && c.provider.model) || await core.pickModel(base, (c.provider && c.provider.apiKey) || '');
-        if (!model) throw new Error('连上了但拿不到模型列表，请手动填「模型名」');
-        const probe = Object.assign({}, c, { provider: Object.assign({}, c.provider, { model }), batchSize: 5 });
+        let model = String(p.model || '').trim() || await core.pickModel(base, p.apiKey || '');
+        if (!model) throw new Error('拿不到模型列表，请手动填模型名');
+        const probe = Object.assign({}, c, { provider: Object.assign({}, p, { model }), batchSize: 5 });
         const out = await core.translateBatch(probe, {}, ['Dynamic Grass - Next Gen']);
         // translateBatch 失败时不抛异常、只返回含 null 的数组。以前这里照样拼出
         // 「✓ 连接正常（模型: X），示例: 空」——用户按提示去查模型，而真正错的是接口地址。
         // 没拿到有效译文就必须当失败抛，且不做后面的 failCache 复活。
         const got = out && out[0];
         if (!got || got === 'Dynamic Grass - Next Gen') {
-          throw new Error('接口或模型不可用：没收到有效译文（请检查接口地址、模型名与密钥）');
+          // 走到这里说明地址通、密钥没被拒（预检都过了），不许再让人回去查接口地址。
+          // 只剩两类可查：模型类型不对 / 上下文不够。
+          throw new Error('接口和密钥都通，但模型没给出译文（查模型是不是对话模型）' + preflightHint());
         }
         // 模型可用 → 只给「暂态失败」重新来过的机会。
         // -1 是已判定不可译的专名（模型两次原样返回），> RETRY_MAX 是重试用尽，
@@ -3381,12 +3911,13 @@ function makeSettingsComponent() {
           }
           if (revived > 0) saveJson(FAIL_PATH, failCache, 'fail revive');
         }
-        const msg = `✓ 连接正常（模型: ${model}），示例: ${out[0] || '空'}` + (revived > 0 ? `；${revived} 条暂态失败已放回重试` : '');
-        this.setState({ testResult: msg });
+        // 连接测试通过 = 模型确实活了：顺手叫醒 DOM 层（它可能还卡在 modelDown，
+        // 否则界面文本得再等一次 2 分钟探活 —— 用户点这里就是想让它马上好）。
+        kickDomLayer('test');
+        const msg = `✓ 连接正常（模型：${model}）` + (revived > 0 ? `，${revived} 条已放回重试` : '');
         this.flash(msg, true);
       } catch (e) {
-        const msg = '✗ 连接失败：' + String(e).slice(0, 220);
-        this.setState({ testResult: msg });
+        const msg = '✗ ' + String(e && e.message ? e.message : e).slice(0, 80);
         this.flash(msg, false);
       } finally {
         this.setState({ testing: false, busy: '' });
@@ -3400,7 +3931,7 @@ function makeSettingsComponent() {
         this._lastStatRead = this.state.tick;
         this.state.stats = {
           dom: Object.keys(domCache).filter((k) => typeof domCache[k] === 'string' && k !== '_ver').length,
-          mod: Object.keys(cache).length,
+          mod: cacheEntryCount(cache),
           fail: Object.keys(failCache).filter((k) => k !== '_ver').length,
         };
       }
@@ -3464,15 +3995,8 @@ function makeSettingsComponent() {
         );
       };
 
-      const flashView = this.state.flash
-        ? h('div', {
-          style: {
-            margin: '10px 0 0 158px', padding: '6px 10px', borderRadius: 3, lineHeight: 1.6,
-            border: '1px solid ' + (this.state.flash.ok ? '#3f8f4f' : '#a94442'),
-            background: this.state.flash.ok ? 'rgba(63,143,79,0.15)' : 'rgba(169,68,66,0.15)',
-          },
-        }, this.state.flash.text)
-        : null;
+      // 页面内提示已取消：所有操作反馈统一走铃铛，避免同一个结果在屏幕上出现两遍。
+      const flashView = null;
 
       // ── 实时队列面板：正在翻哪条、耗时多久、成功没成功、还剩多少排队 ──
       // 整个面板包在 try 里：这只是个诊断工具，任何异常都不许把设置页带崩
@@ -3511,7 +4035,7 @@ function makeSettingsComponent() {
             h('div', { style: { opacity: 0.85 } },
               '词库直接命中 ' + (L.hits || 0) + ' 条（不调模型）· 模型翻译 ' + (L.ok || 0) + ' 条 · 失败 ' + (L.fail || 0),
               L.per ? ' · 本批共 ' + L.per + ' 组' : '',
-              L.modelDown ? h('span', { style: { color: '#e08b2a' } }, ' ｜ 模型无响应，已暂停重试（每 2 分钟探活）') : null),
+              L.modelDown ? h('span', { style: { color: '#e08b2a' } }, ' ｜ 模型无响应，已暂停重试（每 2 分钟自动探活；点「测试连接」或任意翻译按钮会立刻重试）') : null),
             inflight.length > 0
               ? h('div', null,
                 h('div', { style: { opacity: 0.65, margin: '6px 0 2px' } }, '正在发送（每条从真正发出时开始计时）'),
@@ -3535,7 +4059,7 @@ function makeSettingsComponent() {
               '失败数一直涨、页面还是英文 → 多半是模型上下文不够（日志里会写 Context size has been exceeded）：把 LM Studio 的 Context Length 调大，或把「每批送翻条数」调小。正在发送的条目卡很久 → 本地 7B 算力不够，并发填成和 LM Studio 的 Parallel Requests 一样。'));
         } catch (e) {
           return h('div', { style: { margin: '10px 0 0 158px', opacity: 0.9 } },
-            '队列面板渲染出错（不影响翻译）：' + String(e).slice(0, 160));
+            '队列面板渲染出错（不影响翻译）：' + String(e).slice(0, 60));
         }
       })();
 
@@ -3582,34 +4106,44 @@ function makeSettingsComponent() {
             disabled: this.state.busy === 'all',
             onClick: async () => {
               this.setState({ busy: 'all' });
-              this.flash('… 开始重翻全部模组名（清掉旧缓存，完成后会报结果）', true);
+              this.flash('… 正在补翻缺失的模组名', true);
               try {
-                // 「立即翻译全部」= 模组名缓存一并清掉再翻（translateAllFresh 内部清，
-                //   只清模组名缓存 + give-up 名单；domCache 是页面文本，不动）
+                // 「立即翻译」= 只补缺的 / 失败的 / 被放弃的，已有合格译文不动（keepExisting）。
+                // 要连旧译文一起推翻重来，用下面那个「清空缓存并全部重翻」。
                 Object.keys(failCache).forEach((k) => { delete failCache[k]; });
                 saveJson(FAIL_PATH, failCache, 'fail record');
-                const r = await translateAllFresh();
+                const r = await translateAllFresh(undefined, undefined, { manual: true, keepExisting: true });
                 const s = r || {};
+                // 销账（0.16.5 审计补）：_rebuild 是「清空过、还没重建」的欠账标记，
+                // 升级自动重建成功后由 clearRebuildFlag 销；手动这条路径跑成功了同样该销 ——
+                // 否则标记留在盘上，下次启动还会空跑一轮全量巡检（模型没开时白等 60 秒重试）。
+                if (!s.error && cache._rebuild) {
+                  delete cache._rebuild;
+                  saveJson(CACHE_PATH, cache, 'rebuild flag cleared');
+                }
                 this.setState({
-                  stats: { dom: this.state.stats.dom, mod: Object.keys(cache).length, fail: this.state.stats.fail },
+                  stats: { dom: this.state.stats.dom, mod: cacheEntryCount(cache), fail: this.state.stats.fail },
                 });
-                if (s.error) this.flash('✗ ' + s.error, false);
-                else if (s.none) this.flash('✓ 没有需要翻译的模组名（列表里已是中文或没有模组）', true);
-                else if (s.failed > 0) this.flash(`△ 翻译完成：成功 ${s.applied} 条，失败 ${s.failed} 条。失败多半是模型没开/地址错/模型名不对，可点「测试连接」核对`, false);
-                else this.flash(`✓ 翻译完成：成功 ${s.applied} 条`, true);
+                // 这几条只写页面内那行字：系统通知已经由 translateAllFresh 内部发过
+                // （带失败名单的完整版），再叠一条同义通知就是两条重复提示。
+                if (s.error) this.flash('✗ ' + s.error, false, { quiet: true });
+                else if (s.none) this.flash('✓ 没有要翻的模组名（列表里已是中文或没有模组）', true, { quiet: true });
+                else if (s.failed > 0) this.flash(`✓ ${s.applied} 条成功，${s.failed} 条失败（下次自动重试）`, true, { quiet: true });
+                else this.flash(`✓ ${s.applied} 条成功`, true, { quiet: true });
               } catch (e) {
-                this.flash('✗ 翻译失败：' + String(e).slice(0, 180), false);
+                this.flash('✗ 重翻出错：' + String(e && e.message ? e.message : e).slice(0, 60), false);
               } finally {
                 this.setState({ busy: '' });
               }
             },
-          }, this.state.busy === 'all' ? '翻译中…' : '立即翻译全部'),
-          h('button', { style: btnStyle, onClick: () => {
+          }, this.state.busy === 'all' ? '翻译中…' : '立即翻译（只补缺的）'),
+          h('button', { style: btnStyle, onClick: async () => {
             try {
               const before = {
                 dom: Object.keys(domCache).filter((k) => typeof domCache[k] === 'string' && k !== '_ver').length,
-                mod: Object.keys(cache).length,
+                mod: cacheEntryCount(cache),
                 fail: Object.keys(failCache).filter((k) => k !== '_ver').length,
+                nf: Object.keys(nameFail).filter((k) => k !== '_ver').length,
               };
               // 保留 _ver：手动清空后同版本内还能从 seed 恢复，删了就会被当成
               // 「跨版本」连 seed 一起跳过（那是升级才有的待遇）
@@ -3620,8 +4154,20 @@ function makeSettingsComponent() {
               saveJson(SEED_SKIP_PATH, { ver: extVerOf(), at: Date.now() }, 'seed skip write');
               Object.keys(failCache).forEach((k) => delete failCache[k]);
               saveJson(FAIL_PATH, failCache, 'fail cache purge');
-              Object.keys(cache).forEach((k) => delete cache[k]);
+              // 保留 _ver 并落戳：升级清空逻辑（cache reset for new version）按 _ver 判断，
+              // 手动清完若不留戳，下次重启会被判「跨版本」再清一遍并自动全量重翻
+              // —— 每重启一次就白烧一轮模型。留戳 = 只在这次版本内认账。
+              Object.keys(cache).forEach((k) => { if (k !== '_ver') delete cache[k]; });
+              cache._ver = extVerOf();
+              // 同样落 _rebuild：手动清完不点「立即翻译全部」就退出，重启能自动补建，
+              // 不会留下「清了却不建」的空缓存。
+              cache._rebuild = 1;
               saveJson(CACHE_PATH, cache, 'cache purge');
+              // give-up 记账一并清（0.16.5）：按钮写着「清空全部翻译缓存(强制重翻)」，
+              // 而 isGivenUp 会让试满 3 次的条目直接跳过模型 —— 不清这份账本，
+              // 「强制重翻」对那批条目就是空话。清空后退让状态归零，本轮重新试满。
+              nameFail = asDict({ _ver: extVerOf() });
+              saveJson(NAME_FAIL_PATH, nameFail, 'nameFail purge');
               // 清空后立刻补回零模型种子。扩展名的译文只有「游戏译名词库 + 固定后缀」
               // 这一个正确来源（整串送模型会翻成「恒星之刃：漩涡扩展包」，实测）；
               // 而 seedExtensionNames 在 autostart 里本轮已经跑过 —— 那时 cache 还有值
@@ -3629,45 +4175,65 @@ function makeSettingsComponent() {
               // 整轮都查不到东西，只能退回英文（2026-10-25 真机）。
               try { seedExtensionNames(contextRef.api.getState()); } catch (e) { /* 补不上就保持英文 */ }
               resetLiveStatus();
-              const reseeded = Object.keys(cache).length;
-              this.setState({
-                stats: { dom: 0, mod: reseeded, fail: 0 },
-                testResult: '',
-                flash: {
-                  text: `✓ 已清空：页面文本 ${before.dom} 条、模组名 ${before.mod} 条、失败名单 ${before.fail} 条。`
-                    + (reseeded > 0 ? `扩展名译文按游戏译名词库补回 ${reseeded} 条（这个只能拼，整句送模型会翻错）；` : '')
-                    + '其余点「立即翻译全部」重翻（模型没开的话会一直显示英文）',
-                  ok: true,
-                },
-              });
-              notify({ id: 'modname-zh-flash', type: 'success', message: `已清空全部翻译缓存（${before.dom + before.mod} 条），正在重新翻译` });
+              // 清完必须叫醒 DOM 层：它若还卡在 modelDown，清空后也不会重扫，
+              // 用户看到的就是「清了缓存也没用」（0.16.5 补）。
+              kickDomLayer('purge');
+              const reseeded = cacheEntryCount(cache);
+              this.setState({ stats: { dom: 0, mod: reseeded, fail: 0 } });
+              this.flash(`✓ 已清空 ${before.dom + before.mod + before.fail + before.nf} 条，开始全部重翻`
+                + (reseeded > 0 ? `（扩展名补回 ${reseeded} 条）` : ''), true);
+              // 这里以前还有一条内容完全相同的 notify，同 id 会覆盖，属于冗余；已删。
+              // 按钮名字写着「并全部重翻」，就必须真的翻。以前这里只清不翻，
+              // 提示却写「正在重翻」—— 用户等半天一条都没动（2026-10-29 用户指出）。
+              this.setState({ busy: 'all' });
+              const rr = await translateAllFresh(undefined, undefined, { manual: true });
+              // 重翻成功就把「欠账」标记销掉，否则下次启动还会白跑一轮全量巡检
+              // （与上面「立即翻译」那条同一口径）。
+              if (rr && !rr.error && cache._rebuild) {
+                delete cache._rebuild;
+                saveJson(CACHE_PATH, cache, 'rebuild flag cleared');
+              }
+              if (rr && rr.error) {
+                this.flash('✗ 已清空，但重翻没跑起来：' + rr.error, false);
+              }
             } catch (e) {
               log('error', 'clear dom cache', String(e));
-              this.setState({ flash: { text: '✗ 清空失败：' + String(e).slice(0, 180), ok: false } });
+              this.flash('✗ 清空失败：' + String(e).slice(0, 60), false);
+            } finally {
+              this.setState({ busy: '' });
             }
-          } }, '清空全部翻译缓存(强制重翻)'),
+          } }, '清空缓存并全部重翻（强制）'),
           h('button', { style: btnStyle, onClick: () => {
             try {
               const n = restoreAll(contextRef.api.getState());
-              this.setState({
-                stats: { dom: this.state.stats.dom, mod: 0, fail: this.state.stats.fail },
-                flash: { text: n > 0 ? `✓ 已还原 ${n} 个模组为英文原名` : '✓ 没有需要还原的模组（现在都是英文原名）', ok: true },
-              });
-              notify({ id: 'modname-zh-flash', type: 'success', message: `已还原 ${n} 个模组原名` });
+              this.setState({ stats: { dom: this.state.stats.dom, mod: 0, fail: this.state.stats.fail } });
+              // 只发一条：flash 已经走铃铛，再 notify 就是同义两条
+              this.flash(n > 0 ? `✓ 已还原 ${n} 个模组为英文原名` : '✓ 没有需要还原的模组（现在都是英文原名）', true);
             } catch (e) {
-              this.setState({ flash: { text: '✗ 还原失败：' + String(e).slice(0, 180), ok: false } });
+              this.flash('✗ 还原失败：' + String(e).slice(0, 60), false);
             }
           } }, '还原全部英文名'),
+          h('button', { style: btnStyle, onClick: () => {
+            // 只清用户右键加的那份；出厂词库 gamenames-keep.json 不动
+            try {
+              const n = clearUserKeep();
+              this.flash(n > 0
+                ? `✓ 已清空 ${n} 条保留英文，这些名字以后照常翻译`
+                : '✓ 保留名单本来就是空的', true);
+            } catch (e) {
+              this.flash('✗ 清空失败：' + String(e).slice(0, 60), false);
+            }
+          } }, `清空保留英文词表${userKeepList().length ? `（${userKeepList().length} 条）` : ''}`),
           h('button', { style: btnStyle, onClick: () => {
             try {
               const items = scanUntranslated(40);
               this.setState({ diag: { items, at: Date.now() } });
               this.flash(items.length > 0
-                ? `✓ 本页还有 ${items.length} 条英文没翻，下面的清单里能看到它们在哪个元素上（含原因）`
+                ? `✓ 本页还有 ${items.length} 条英文没翻（见下面清单）`
                 : '✓ 本页肉眼范围内没有残留英文（当前页面全部命中）', true);
             } catch (e) {
               this.setState({ diag: null });
-              this.flash('✗ 自检失败：' + String(e).slice(0, 160), false);
+              this.flash('✗ 自检失败：' + String(e).slice(0, 60), false);
             }
           } }, '自检：本页还有哪些英文没翻'),
           h('button', {
@@ -3679,6 +4245,15 @@ function makeSettingsComponent() {
             const tag = infl > 0 ? `正在翻 ${infl} · 排队 ${q}` : (q > 0 ? `排队 ${q}` : '空闲');
             return (this.state.queueOpen ? '收起实时队列' : '实时队列') + ' · ' + tag;
           })())),
+        // 按钮说明：每个按钮旁边都必须能读懂它到底清不清缓存、发不发请求
+        h('div', { style: { margin: '0 0 8px 158px', opacity: 0.65, fontSize: 12, lineHeight: 1.85 } },
+          h('div', null, '「测试连接」只探模型通不通，不翻任何东西。'),
+          h('div', null, '「立即翻译（只补缺的）」补齐当前缺译文的、失败的、被放弃的名字；已有译文与界面文本都不动。'),
+          h('div', null, '「清空缓存并全部重翻（强制）」把界面文本与模组名译文一起清掉重来，失败的和已放弃的一并重试；出厂词库、词级固定译名表、模型配置、保留英文名单都不动。'),
+          h('div', null, '「还原全部英文名」只把模组显示名改回英文，不删任何译文缓存。'),
+          h('div', null, '「清空保留英文词表」只清你自己右键保留的那份，出厂词库不动。'),
+          h('div', null, '「自检」列出本页还有哪些英文没翻，只读，不发请求、不改缓存。'),
+          h('div', null, '「实时队列」看正在翻哪一条、还剩多少、模型有没有响应；模型挂了会在这里写明。')),
         flashView,
         queueView,
         this.state.diag && this.state.diag.items.length > 0
@@ -3735,18 +4310,13 @@ function makeSettingsComponent() {
                 locMsg: r && r.changed
                   ? `✓ 已重建：${r.entries} 条词条。重启 Vortex 生效。`
                   : `✓ 已是最新（${(r && r.entries) || 0} 条），无需重建。`,
-                flash: {
-                  text: r && r.changed
-                    ? `✓ 界面语言包已重建：${r.entries} 条词条，重启 Vortex 后生效`
-                    : `✓ 界面语言包已是最新：${(r && r.entries) || 0} 条，无需重建`,
-                  ok: true,
-                },
               });
+              this.flash(r && r.changed
+                ? `✓ 界面语言包已重建：${r.entries} 条词条，重启 Vortex 后生效`
+                : `✓ 界面语言包已是最新：${(r && r.entries) || 0} 条，无需重建`, true);
             } catch (e) {
-              this.setState({
-                locMsg: '× 重建失败：' + String(e).slice(0, 160),
-                flash: { text: '✗ 重建失败：' + String(e).slice(0, 160), ok: false },
-              });
+              this.setState({ locMsg: '× 重建失败：' + String(e).slice(0, 60) });
+              this.flash('✗ 重建失败：' + String(e).slice(0, 60), false);
             }
           } }, '重建界面语言包'),
           h('button', { style: btnStyle, onClick: () => {
@@ -3758,36 +4328,26 @@ function makeSettingsComponent() {
                 locMsg: r.keptPack
                   ? `未删除 common.json：无法确认它是本扩展写的（manifest 缺失或哈希不符）。如确认要删，请手动删除 ${r.dir} 下的 common.json`
                   : `已移除接管：删除 ${r.removed} 个文件${r.restoredFrom ? '，并已从备份还原' : ''}。重启 Vortex 生效。`,
-                flash: {
-                  text: r.keptPack
-                    ? '△ 未能确认 common.json 的归属，已保留不动（详见左侧说明）'
-                    : (r.removed > 0
-                      ? `✓ 已移除接管：删除 ${r.removed} 个文件${r.restoredFrom ? '，并已从备份还原' : ''}，重启 Vortex 后还原英文界面`
-                      : '✓ 本来就没接管，无需移除'),
-                  ok: !r.keptPack,
-                },
               });
+              this.flash(r.keptPack
+                ? '△ 未能确认 common.json 的归属，已保留不动（详见下方说明）'
+                : (r.removed > 0
+                  ? `✓ 已移除接管：删除 ${r.removed} 个文件${r.restoredFrom ? '，并已从备份还原' : ''}，重启 Vortex 后还原英文界面`
+                  : '✓ 本来就没接管，无需移除'), !r.keptPack);
             } catch (e) {
-              this.setState({
-                locMsg: '× 移除失败：' + String(e).slice(0, 160),
-                flash: { text: '✗ 移除失败：' + String(e).slice(0, 160), ok: false },
-              });
+              this.setState({ locMsg: '× 移除失败：' + String(e).slice(0, 60) });
+              this.flash('✗ 移除失败：' + String(e).slice(0, 60), false);
             }
           } }, '移除接管（还原）'),
           h('button', { style: btnStyle, onClick: () => {
             try {
               let opened = false;
               try { va.util.opn(EXT_DIR); opened = true; } catch (e) { opened = false; }
-              this.setState({
-                flash: {
-                  text: opened
-                    ? `✓ 已在文件管理器中打开：${EXT_DIR}（词库 pack.json 就在里面）`
-                    : `词库位置：${EXT_DIR}\\pack.json。改完点「重建界面语言包」再重启 Vortex`,
-                  ok: true,
-                },
-              });
+              this.flash(opened
+                ? `✓ 已在文件管理器中打开：${EXT_DIR}（词库 pack.json 就在里面）`
+                : `词库位置：${EXT_DIR}\\pack.json。改完点「重建界面语言包」再重启 Vortex`, true);
             } catch (e) {
-              this.setState({ flash: { text: '✗ 打开失败：' + String(e).slice(0, 160), ok: false } });
+              this.flash('✗ 打开失败：' + String(e).slice(0, 60), false);
             }
           } }, '打开词库位置')),
         this.state.locMsg
@@ -3861,6 +4421,9 @@ function main(context) {
           log('info', 'cache keys normalized', { n: nm });
         }
       } catch (e) { log('warn', 'cache key normalize fail', String(e)); }
+      // 上次清空后没等到重建就退出了（_rebuild 还烙在 cache.json 上）→ 本次接着建。
+      // 标志由重建流程成功收尾时清掉：中途再退还会续，模型没开则留着等下次。
+      if (cache._rebuild) cacheRebuildPending = true;
       domCache = asDict(readJson(DOM_CACHE_PATH, {}));
       failCache = asDict(readJson(FAIL_PATH, {}));
       nameFail = asDict(readJson(NAME_FAIL_PATH, {}));
@@ -3910,14 +4473,54 @@ function main(context) {
       try {
         const extVer = (JSON.parse(fs.readFileSync(path.join(EXT_DIR, 'info.json'), 'utf8')).version) || '';
         if (extVer && domCache._ver !== extVer) {
+          // 只有「确实有存量译文」才算升级清空。首次安装时 domCache 是空的、_ver 也没有，
+          // 这里同样会命中 —— 那种情况下必须放 seed 进来，否则新用户一进来满屏英文。
+          const hadDom = Object.keys(domCache).some((k) => k !== '_ver' && typeof domCache[k] === 'string');
           domCache = asDict({ _ver: extVer });
           saveJson(DOM_CACHE_PATH, domCache, 'dom cache write');
-          log('info', 'dom cache reset for new version', { version: extVer });
+          // 堵 seed 回灌（0.16.5 补刀）：seed 恢复段在**同一次启动**里紧跟在本节之后，
+          // 判据是 `!skipSeed && domCount === 0`，而上面刚把 domCache 清成空 ——
+          // 不写这条，包里那份 40KB 的旧页面译文会立刻被灌回来并盖上 _ver=当前版本，
+          // 版本清空等于白做（下次启动 _ver 已匹配，连重试的机会都没有）。
+          // seedSkip() 认「seed-skip.json 的 ver === 当前版本」，写一版即视为本次已灌过。
+          // 代价：升级后首启页面文本没有种子兜底，按需重翻；seed 从此只服务首次安装。
+          if (hadDom) saveJson(SEED_SKIP_PATH, { ver: extVer, at: Date.now() }, 'seed skip on version reset');
+          log('info', 'dom cache reset for new version', { version: extVer, hadDom });
         }
         if (extVer && failCache._ver !== extVer) {
           failCache = asDict({ _ver: extVer });
           saveJson(FAIL_PATH, failCache, 'fail cache write');
           log('info', 'fail cache reset for new version', { version: extVer });
+        }
+        // 模组名缓存同样按版本作废（0.16.5）。前两条只清「页面文本」和「失败名单」，
+        // cache.json 从来没被清过 —— 于是老用户升级后继续用旧规则+旧词库翻出来的译名：
+        // 这类译名往往已是全中文（`帕尔架构`），needsTranslate 判「不用翻」、
+        // healWorthy 判「没残留」→ 两道自愈都不开门，永久固化。
+        // 清完在本节末尾置 cacheRebuildPending，由 autostart 自动跑一次
+        // translateAllFresh 重建：它的判据是「显示名合格 且 缓存里确有条目」
+        // （cachedHas），缓存一空必然全量重翻，翻完由 applyTranslation dispatch 回
+        // customFileName，界面跟着变 —— 不需要额外写状态层。
+        // 必须写 _ver：老用户 cache.json 没有版本标记，不写就会每次启动被判「跨版本」清一遍。
+        if (extVer && cache._ver !== extVer) {
+          // _rebuild 落盘（0.16.5 补刀）：cacheRebuildPending 只活在内存里，而重建要等
+          // 25 秒才发起 —— 清空后这段时间退出 Vortex，标志就丢了；下次启动 _ver 已匹配，
+          // 既不清也不建，缓存空着没人管（界面靠 customFileName 撑着，看不出来）。
+          // 所以标志跟 _ver 一起写进 cache.json，启动时读到就续。
+          cache = asDict({ _ver: extVer, _rebuild: 1 });
+          saveJson(CACHE_PATH, cache, 'cache reset for new version');
+          log('info', 'cache reset for new version', { version: extVer });
+          cacheRebuildPending = true;
+        }
+        // give-up 记账（nameFail.json）同样按版本作废（0.16.5）。
+        // 它是「这条试满 NAME_FAIL_MAX 次就别再烧模型」的账本，TTL 7 天、**跨版本存活**。
+        // 不清就会挡住上面刚加的「清空重翻」：translateAllFresh 里
+        // `if (isGivenUp(cacheKeyOf(r.base))) { givenUp++; continue; }` 直接跳过，
+        // 老用户那些被放弃过的条目升级后永远重建不到，缓存等于白清。
+        // 代价：旧困难条目在新版白试一轮（有界：再失败又重新记账退让，不会无限刷）。
+        if (extVer && nameFail._ver !== extVer) {
+          nameFail = asDict({ _ver: extVer });
+          saveJson(NAME_FAIL_PATH, nameFail, 'nameFail reset for new version');
+          log('info', 'nameFail reset for new version', { version: extVer });
         }
       } catch (e) { /* info.json 读不到就跳过 */ }
       // 退避状态跨重启恢复：failCache 只存失败计数、不存时间，dom-translator 的
@@ -3998,7 +4601,7 @@ function main(context) {
 
   // 右键动作：300 一键重翻（清缓存）/ 301 翻译此模组（单条）/ 302 保留英文
   // 300 必须包箭头函数：Vortex 会往回调塞 instanceIds，直接传会被当成 want
-  reg('mods-action-icons', 300, 'settings', '一键汉化模组名（全部重翻）', () => translateAllFresh());
+  reg('mods-action-icons', 300, 'settings', '一键汉化模组名（全部重翻）', () => translateAllFresh(undefined, undefined, { manual: true }));
   reg('mods-action-icons', 301, 'settings', '翻译此模组', translateSelected);
   reg('mods-action-icons', 302, 'settings', '这个名字保留英文（记入词表）', (ids) => {
     // 右键传的是 UUID，先反查出屏幕上那条名字再记（记中文没有意义）
@@ -4011,17 +4614,46 @@ function main(context) {
             const m = modsRoot[g][mid] || {};
             if (mid !== id && String(m.id) !== id) continue;
             const r = keepNameEn(rawNameOf(m) || displayNameOf(m));
-            notify({ type: r && r.kept ? 'success' : 'info', message: r && r.kept ? '已记入保英文词表（重启后仍生效）' : '没能解析出这个名字' });
+            notify(r && r.kept
+              ? { id: 'modname-zh-keep', type: 'success', displayMS: 10000, title: '已记入保英文词表', message: '以后不再翻译它' }
+              : { id: 'modname-zh-keep', type: 'info', displayMS: 10000, title: '没能解析出名字', message: '换一条再试' });
             return r;
           }
         }
       }
-      notify({ type: 'info', message: '没能解析出这个名字（只在模组行上可用）' });
+      notify({ id: 'modname-zh-keep', type: 'info', displayMS: 6000, title: '没能解析出名字', message: '只能用在模组行上' });
     } catch (e) { log('warn', 'keep name action', String(e)); }
     return null;
   });
-  reg('btn-toolbar', 300, 'settings', '模组名汉化', translateAll);
-  reg('global-toolbar', 300, 'settings', '模组名汉化', translateAll);
+  reg('mods-action-icons', 303, 'settings', '取消保留英文（改回翻译）', (ids) => {
+    // 与 302 对称：只认模组行，反查出名字再摘名单，摘完立刻重翻这一条
+    try {
+      const state = contextRef.api.getState();
+      const modsRoot = (state.persistent && state.persistent.mods) || {};
+      for (const id of normSelection(ids)) {
+        for (const g of Object.keys(modsRoot)) {
+          for (const mid of Object.keys(modsRoot[g] || {})) {
+            const m = modsRoot[g][mid] || {};
+            if (mid !== id && String(m.id) !== id) continue;
+            const r = unkeepName(rawNameOf(m) || displayNameOf(m));
+            if (!r || !r.removed) {
+              notify({ id: 'modname-zh-unkeep', type: 'info', displayMS: 6000, title: '不在保留名单里', message: '这条本来就会翻译' });
+              return r;
+            }
+            notify({ id: 'modname-zh-unkeep', type: 'success', displayMS: 10000, title: '已取消保留英文', message: '正在重翻这一条' });
+            // 摘完立刻重翻：不重翻的话界面上仍是英文，用户会以为没生效。
+            // retranslateName 内部走 gateModel(自动) 路径，模型没开只会发一条提示，不会假装成功。
+            Promise.resolve(retranslateName(r.name)).catch((e) => log('warn', 'unkeep retranslate fail', String(e)));
+            return r;
+          }
+        }
+      }
+      notify({ id: 'modname-zh-unkeep', type: 'info', displayMS: 6000, title: '没能解析出名字', message: '只能用在模组行上' });
+    } catch (e) { log('warn', 'unkeep name action', String(e)); }
+    return null;
+  });
+  reg('btn-toolbar', 300, 'settings', '模组名汉化', () => translateAll({ manual: true }));
+  reg('global-toolbar', 300, 'settings', '模组名汉化', () => translateAll({ manual: true }));
 
   // 新装模组自动汉化（修复：合集下载期间 state 高频变化会不断重置定时器，
   // 改为首次触发后固定延迟执行一次）
@@ -4088,7 +4720,7 @@ function main(context) {
       // 返回值必须接住 —— false 时不能置 domStarted，否则设置页补启条件 (!domStarted)
       // 恒假，该会话 DOM 层静默死亡且无法自救。判据用 === false：undefined（老形态）
       // 按成功，防御性兼容。
-      const domOk = domTranslator.startDomTranslator({
+      const domRes = domTranslator.startDomTranslator({
         cfg,
         cache: domCache,
         failCache: failCache,
@@ -4111,12 +4743,15 @@ function main(context) {
         nameGate,
         unfinishedName,
         nameTranslationOf: nameTranslationOf,
-      }) !== false;
+      });
+      const domOk = domRes !== false;
       if (!domOk) {
         log('warn', 'dom layer not started (body not ready); retry via settings toggle');
         return false;
       }
       domStarted = true;
+      // kick 只在新形态下拿得到（老形态返回 undefined，按成功处理）
+      domKickRef = (domRes && typeof domRes.kick === 'function') ? domRes.kick : null;
       log('info', 'dom layer started');
       return true;
     } catch (e) {
@@ -4141,12 +4776,22 @@ function main(context) {
           saveJson(path.join(DATA_DIR, 'games-available.json'), map, 'games available dump');
           log('info', 'known games dumped', { n: Object.keys(map).length });
         }
-        if (!((cfg.provider && cfg.provider.baseUrl) || '').trim() && !pendingNotice) {
+        // 出厂配置是空接口地址：装完第一眼就要知道「界面中文已好，模组名还差一步」，
+        // 而且要说清差的是哪一步 —— 「缺接口地址」和「有地址没模型名」修法不一样。
+        const pv0 = (cfg && cfg.provider) || {};
+        const missCfg = !String(pv0.baseUrl || '').trim() ? 'baseUrl'
+          : (!String(pv0.model || '').trim() ? 'model' : '');
+        if (missCfg && !pendingNotice) {
           pendingNotice = {
             id: 'modname-zh-no-provider',
-            type: 'info',
-            message: '汉化扩展已就绪：界面已是中文；模组名 / 更新日志还需要一个翻译接口（设置 → 模组名汉化）。',
+            type: 'warning',
+            title: missCfg === 'baseUrl' ? '还没填翻译接口' : '还差一个模型名',
+            message: missCfg === 'baseUrl'
+              ? '界面已中文，模组名还翻不了（设置 → 模组名汉化）'
+              : '模型名空着（设置 → 模组名汉化）',
           };
+          // 上面这条已经把话说清了，别让安装钩子再因同一件事补一条「汉化没有开始」
+          preGateNotified[missCfg === 'baseUrl' ? 'noprovider' : 'nomodel'] = 1;
         }
         flushPendingNotice();          // init 阶段攒下的通知，到这里 api 已经可用
         if (cfg && cfg.enabled) {
@@ -4171,6 +4816,10 @@ function main(context) {
               log('info', 'auto hook bound');
             } catch (e) { log('warn', 'auto hook bind', String(e)); }
           }
+          // 存量结构清洗（v6 配套）已于 2026-10-29 删除：同一次改动给 cache.json 加了
+          // 「按 _ver 清空」，升级时缓存必为空 → 这块永远在空对象上遍历，只多一次无意义写盘。
+          // 老译名的修复实际是靠「清空 → 全量重翻 → finishOne 里的 repairStruct」达成的。
+          // 别再加回来：真要兜某类存量数据，先确认它在清空之后还活着。
           // 词库漂移对账（2026-10-26 用户方案，替代「一键清状态层」）：
           // 词表指纹变了才扫（平时零成本）。漂移条目删缓存键后，随后的
           // 自动翻译 / 立即翻译全部把它当未翻条目重做——走正常管线，
@@ -4209,19 +4858,95 @@ function main(context) {
             }
           } catch (e) { log('warn', 'glossary drift audit', String(e)); }
           applyCachedSilently();
+          // 版本清空后的自动重建（0.16.5）：清 cache.json 只是第一步 ——
+          // 界面判据看状态层（中文=已翻），不主动踢一次全量重翻，界面纹丝不动。
+          // translateAllFresh 的跳过判据是「显示名合格 且 缓存里确有条目」（cachedHas），
+          // 缓存刚被清空 → 每条都判「不一致」→ 必然全量重翻 → applyTranslation
+          // 写 cache 并 dispatch customFileName，界面从英文/旧译名换成新译名。
+          // 只在这里调得到：init 阶段 context.api 未就绪，Vortex 直接拒。
+          if (cacheRebuildPending) {
+            cacheRebuildPending = false;
+            if (liveStatus && liveStatus.modelDown) {
+              // 模型挂机时不清空状态层的显示（本来就还在），只是不白烧一轮请求。
+              // 落盘标志故意留着：下次带着模型启动时接着建。
+              log('warn', 'version rebuild skipped: model down');
+              // 但「更新完第一次」还是要交代：模型挂着正是 DOM 层连续两轮 0 成功判出来的，
+              // 升级首启撞上它，用户只会看到模组名没换、也不见任何弹窗。探一次拿真实原因，
+              // 弹一次（每版本一次）。探活本身不发翻译请求，不烧模型。
+              Promise.resolve()
+                .then(() => modelPreflight(true))
+                .then((r) => {
+                  lastPreflight = r;
+                  if (!r || r.ok) return;
+                  const d = describePreflight(r);
+                  if (d) showGateDialogOnce(d, r.code);
+                })
+                .catch((e) => log('warn', 'gate dialog probe fail', String(e)));
+            } else {
+              // 重建成功收尾才清 _rebuild：跑完一次（哪怕有条目没过验收）就不再自动重跑，
+              // 否则每次启动都白烧一轮全量；中途退出或 running 被占则留着，下次续。
+              const clearRebuildFlag = () => {
+                if (!cache._rebuild) return;
+                delete cache._rebuild;
+                try { saveJson(CACHE_PATH, cache, 'rebuild flag cleared'); } catch (e) { /* 清标志失败不影响翻译 */ }
+              };
+              // 延后 25s：启动期自愈链（healStale* 会调模型）和自动钩子都可能正占着
+              // translateAllFresh 的 running 锁，撞上就会返回 error、一条都翻不了。
+              const tryRebuild = (attempt) => {
+                Promise.resolve()
+                  .then(() => translateAllFresh(undefined, undefined, { dialogOnce: true }))
+                  .then((r) => {
+                    const res = r || {};
+                    log('info', 'version rebuild done', Object.assign({ attempt }, res));
+                    // 被 running 拒（启动期自动钩子正在翻）→ 再等 60s 补一次。
+                    // 不许无限重试：real 失败（模型没开/验收全拒）重试也是白烧。
+                    if (res.error) {
+                      // 预检拦住（模型没开 / 配置缺）→ 重试必然还是同一个结果，
+                      // 直接留 _rebuild 在盘上，等下次带着模型启动再建。
+                      if (res.preflight) {
+                        log('warn', 'version rebuild held by preflight', { code: res.preflight });
+                        return;
+                      }
+                      if (attempt < 2) setTimeout(() => tryRebuild(attempt + 1), 60000);
+                      return;
+                    }
+                    clearRebuildFlag();
+                  })
+                  .catch((e) => log('warn', 'version rebuild fail', String(e)));
+              };
+              setTimeout(() => tryRebuild(1), 25000);
+            }
+          }
           // 界面自愈（存量半中半英）：异步不阻塞启动；轻伤档有 nameFail 有界退让。
           // 模组显示名 / 下载行两条线都在这一步走完 —— 只修显示名会留下整页下载行英文。
-          const state = contextRef.api.getState();
-          Promise.resolve()
-            .then(async () => {
-              let n = 0;
-              // 缓存死账先修：DOM 贴的是 cache.json，先把坏的改对，
-              // 下面两条状态层通道才不会拿坏译文当基准（顺序反了会白跑一轮）。
-              n += await healStaleCacheEntries();
-              n += await healStaleDisplayNames(state);
-              n += await healStaleDownloadNames(state);
+          // 模型晚开是常态（先开 Vortex 再开 LM Studio）：以前探活不过就 return，
+          // 这一轮自愈整批作废到下次重启，用户看到的就是「模型开了也不翻」。
+          // 现在 60 秒后补做，最多 3 次；每次重取 state（旧快照可能已过期）。
+          const runStartupHeal = async (attempt) => {
+            let n = 0;
+            // 缓存死账先修：DOM 贴的是 cache.json，先把坏的改对，
+            // 下面两条状态层通道才不会拿坏译文当基准（顺序反了会白跑一轮）。
+            // 这一步不调模型（只查词表），模型没开也照跑。
+            n += await healStaleCacheEntries();
+            // 下面两条会调模型：先探一次（0.16.5）。模型连不上时硬跑，每条都会被判
+            // 「只翻了一半」，记进 nameFail，试满 3 次就永久放弃 —— 等模型开起来时
+            // 这些条目已经挂了免战牌，得手动清放弃名单才能救。
+            const pre = await modelPreflight(false);
+            if (!pre.ok) {
+              log('warn', 'startup heal skipped: model not ready', { code: pre.code, attempt });
+              if (attempt < 3) {
+                setTimeout(() => {
+                  runStartupHeal(attempt + 1).catch((e) => log('warn', 'heal retry fail', String(e)));
+                }, 60000);
+              }
               return n;
-            })
+            }
+            const st = contextRef.api.getState();
+            n += await healStaleDisplayNames(st);
+            n += await healStaleDownloadNames(st);
+            return n;
+          };
+          runStartupHeal(1)
             .then((n) => { if (n > 0) log('info', 'startup heal done', { n }); })
             .catch((e) => { log('warn', 'heal names fail', String(e)); });
         }

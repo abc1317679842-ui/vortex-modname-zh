@@ -1877,7 +1877,36 @@ function startDomTranslator(opts) {
   }, 120000);
   if (probe && probe.unref) probe.unref();
 
+  /**
+   * 手动最高优先级（0.16.5 补）：用户点「立即翻译 / 全部重翻 / 右键重翻 / 清缓存重翻」时，
+   * 立刻解除「模型挂机暂停」并放行此前的失败记账，不等 2 分钟一次的探活。
+   * 以前的坑（用户实测）：模型先关后开、按钮也点了，界面文本仍冻着最长 120 秒，
+   * 面板上只有「排队 N」不掉 —— 看起来就是卡死。手动动作必须能把这层叫醒。
+   * 放行范围：failed > 0（暂态失败 + 已放弃）全部清零；-1（不可译）保留，那是内容判定。
+   */
+  function kick(reason) {
+    let revived = 0;
+    if (modelDown) {
+      modelDown = false;
+      live.modelDown = false;
+      downStreak = 0;
+      log('info', 'manual kick: model down cleared', { reason: String(reason || '') });
+    }
+    for (const k of Object.keys(failed)) {
+      if (k === '_ver') continue;
+      if (failed[k] > 0) { delete failed[k]; revived++; }
+    }
+    if (revived > 0) {
+      if (saveFail) saveFail(failed);
+      log('info', 'manual kick: failures revived', { n: revived, reason: String(reason || '') });
+    }
+    docDirty = true;
+    if (queue.size > 0) scheduleFlush(120);
+    return revived;
+  }
+
   log('info', 'dom translator started', { dict: Object.keys(lex).length, cache: Object.keys(cache).length, mode: 'block' });
+  return { kick };
 }
 
 // fileStemOf 导出：index.js 的 fileBaseName 已改为调它（同一判据只允许一份实现）。

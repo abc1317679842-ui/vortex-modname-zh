@@ -234,6 +234,90 @@ function restorePaths(s, box) {
   return t;
 }
 
+/**
+ * 结构修复（C5+C7 v6）：治「孤立/错配符号」与「英文驼峰粘连」，只对 mod 模式生效。
+ *
+ * 病根：模型把被遮蔽的『上古卷轴5：天际』改写成 `"上古卷轴5：天际」`（只开不闭/跨族半对），
+ * 而前面三道还原（unmask 只认 `『zh』`、剥壳只认成对、术语括号清理要求左右都有符号）
+ * 全部只认「成对」，于是这种半对一直漏到界面上。
+ *
+ * **本函数的前提（不是实现细节，别当 bug 改掉）**：中文译文里出现的半角 `"` 与 `『』`，
+ * 一律视为「遮蔽残留或模型自产」。依据：91875 行真实模型输出里，译文含 `"` 的 85 行、
+ * 其中原文也含 `"` 的是 **0 行**；且实测原文无引号的 `Skyrim SE - 1.6 Patch` 有 2/3 概率
+ * 被模型自己写成 `"上古卷轴5：天际」SE-1.6补丁`。所以配对后两端一起换空格是安全动作。
+ *
+ * 两段式：
+ *   ① 族感知配对：引号族「」『』" / 书名族《》 / 圆括号族（）() / 方括号族【】[]
+ *      落单闭符号 → 栈里有位置在前的中文开符号就跨族归一（`《X』`→`《X》`），否则换空格（删了会粘连）；
+ *      含 `"`/`『』` 的配对两端一起抹；未闭合开符号换空格，半角 `(` 除外（原文可能本就半个）。
+ *   ② 驼峰粘连：`fooBar` → `foo Bar`，但后半段必须能在原文括号内容里找到，否则不动（幂等保障）。
+ *
+ * 实测：跨 45 份全量 91875 行命中 196 次 / 去重 50 条；76437 条负例 0 误伤；幂等 0；33µs/条。
+ */
+function repairStruct(s, orig) {
+  var FAM = { '\u300c': 'q', '\u300d': 'q', '\u300e': 'q', '\u300f': 'q', '"': 'q', '\u300a': 'b', '\u300b': 'b', '\uff08': 'p', '\uff09': 'p', '\u3010': 'k', '\u3011': 'k', '[': 's', ']': 's' };
+  var ISOPEN = { '\u300c': 1, '\u300e': 1, '\u300a': 1, '\uff08': 1, '\u3010': 1, '[': 1 };
+  var ISMASK = { '"': 1, '\u300e': 1, '\u300f': 1 };
+  var CNOPEN = { '\u300c': 1, '\u300e': 1, '\u300a': 1, '\uff08': 1, '\u3010': 1 };
+  var CLOSE = { q: '\u300d', b: '\u300b', p: '\uff09', k: '\u3011', s: ']' };
+
+  var chars = Array.from(String(s));
+  var out = chars.slice();
+  var stack = [], pairs = [], orphan = [];
+  for (var i = 0; i < chars.length; i++) {
+    var ch = chars[i];
+    if (ch === '"') {
+      var at = -1;
+      for (var k = stack.length - 1; k >= 0; k--) if (stack[k].ch === '"') { at = k; break; }
+      if (at >= 0) { var l0 = stack.splice(at, 1)[0]; pairs.push({ l: l0, r: { ch: ch, idx: i } }); }
+      else stack.push({ ch: ch, idx: i });
+      continue;
+    }
+    if (ISOPEN[ch]) { stack.push({ ch: ch, idx: i }); continue; }
+    if (FAM[ch]) {
+      var fam = FAM[ch], at2 = -1;
+      for (var k2 = stack.length - 1; k2 >= 0; k2--) if (FAM[stack[k2].ch] === fam) { at2 = k2; break; }
+      if (at2 >= 0) { var l1 = stack.splice(at2, 1)[0]; pairs.push({ l: l1, r: { ch: ch, idx: i } }); }
+      else orphan.push(i);
+    }
+  }
+  function blank(ix) { if (out[ix] !== ' ') out[ix] = ' '; }
+  for (var oi = 0; oi < orphan.length; oi++) {
+    var oix = orphan[oi], at3 = -1;
+    for (var k3 = stack.length - 1; k3 >= 0; k3--) if (CNOPEN[stack[k3].ch] && stack[k3].idx < oix) { at3 = k3; break; }
+    if (at3 >= 0) { var l2 = stack.splice(at3, 1)[0]; out[oix] = CLOSE[FAM[l2.ch]] || chars[oix]; }
+    else blank(oix);
+  }
+  for (var pi = 0; pi < pairs.length; pi++) {
+    var L = pairs[pi].l, R = pairs[pi].r;
+    // 配对条件本身就是「同族才配得上」（见上面两处 `FAM[...] === fam` / `ch === '"'`），
+    // 所以原来那句 `else if (FAM[L.ch] !== FAM[R.ch]) out[R.idx] = CLOSE[...]` 永远为假，
+    // 是死分支（审计 0.16.5 实测报告 §4 指出，已核）。跨族归一发生在上面 orphan 分支。
+    if (ISMASK[L.ch] || ISMASK[R.ch]) { blank(L.idx); blank(R.idx); }
+  }
+  for (var si = 0; si < stack.length; si++) { if (stack[si].ch !== '(') blank(stack[si].idx); }
+
+  var t = out.join('');
+  // 括号被吃掉 → 术语贴到英文词尾。后半段必须来自原文括号内容，否则 inZOI 这类品牌驼峰会拆错
+  var origStr = String(orig == null ? '' : orig);
+  var origLower = origStr.toLowerCase();
+  var bro = origStr.match(/[\(\uff08\[\u3010]([^\)\uff09\]\u3011\u300b]{1,24})[\)\uff09\]\u3011\u300b]/g) || [];
+  var toks = bro.map(function (x) { return x.slice(1, -1).trim(); }).filter(Boolean);
+  t = t.replace(/([a-z]{2,})([A-Z][A-Za-z0-9]{2,})/g, function (m, a, b) {
+    if (origLower.indexOf(m.toLowerCase()) >= 0) return m;
+    var hit = false;
+    for (var ti = 0; ti < toks.length; ti++) {
+      if (toks[ti].indexOf(b) === 0 || toks[ti].toLowerCase().indexOf(b.toLowerCase()) === 0) { hit = true; break; }
+    }
+    return hit ? a + ' ' + b : m;
+  });
+
+  return t.replace(/[ \t]{2,}/g, ' ')
+    .replace(/ +([\uff0c\u3002\uff1b\uff1a\u3001\uff01\uff1f\uff09\u300b\u300d\u300f\u3011\]])/g, '$1')
+    .replace(/([\uff08\u300a\u300c\u300e\u3010\[])+ +/g, '$1')
+    .trim();
+}
+
 function buildSystemPrompt(terms, mode) {
   const termHint = (terms || []).map((t) => `${t.en} => ${t.zh}`).join('\n');
   const builtinHint = BUILTIN_TERMS.map((t) => `${t.en} => ${t.zh}`).join('\n');
@@ -676,6 +760,9 @@ async function llmTranslate(cfg, texts, modeOverride) {
       if (!t.zh) continue;
       s = s.replace(new RegExp('[「『\\[(（《]' + escapeRegExp(t.zh) + '[」』\\])）》]', 'g'), t.zh);
     }
+    // 结构修复（C5+C7 v6）：成对的三道还原都跑完之后，剩下的孤立/错配符号交给它。
+    // 只给 mod 模式：ui/html 的正文可能有合法的『』引用与英文引号，全量剥会改坏正常文本。
+    if (mode === 'mod') s = repairStruct(s, src);
     s = toSimplified(s).trim();
     // 模型有时把路径反斜杠多转义一层（C:\\Users 变成 C:\\\\Users），原文没这层就压平
     if (String(src).indexOf('\\\\') === -1 && s.indexOf('\\\\') !== -1) s = s.replace(/\\\\/g, '\\');
@@ -1122,4 +1209,5 @@ module.exports = {
   translateConcurrently,
   protectPaths,
   restorePaths,
+  repairStruct,
 };
