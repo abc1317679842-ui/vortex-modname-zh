@@ -26,7 +26,8 @@ Vortex 状态变化（mods/downloads 表）
                  │   漏传 = isUiBatch 按批长猜（批均>24字符判 ui）→ modOnly 词不遮蔽
                  │   → 产出缺固定译名 → 漂移对账判漂移 → 删键重翻循环
                  └→ 写回：已安装行 → customFileName；下载行 → applyDownloadTranslation → modInfo.name
-                     ★ 写 modInfo.name 无效（Vortex 不读它做显示）；
+                     ★ 只写 modInfo.name；绝不写 nexus.fileInfo.name
+                       （后者会触发 Vortex 重算显示名，产出「英文 - 中文」杂交名，且要手工清）
                      ★ 写前必须把英文原名备份到 zhSourceName
 ```
 
@@ -34,7 +35,7 @@ Vortex 状态变化（mods/downloads 表）
 
 | 层 | 内容 | 性质 |
 |---|---|---|
-| 状态层 | mods 表 `customFileName`、下载行 `modInfo.nexus.fileInfo.name` | **落地成果**，清缓存不清它 |
+| 状态层 | mods 表 `customFileName`、下载行 `modInfo.name` | **落地成果**，清缓存不清它 |
 | cache.json | 原名→中文 键值对（名字缓存） | 派生、可再生 |
 | domCache/failCache | DOM 文本翻译缓存/失败账 | 派生、可再生 |
 

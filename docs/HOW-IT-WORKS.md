@@ -19,7 +19,7 @@ Vortex 的界面文字来自三个完全不同的地方，一种手段治不了�
 
 | 层 | 负责 | 代价 |
 |---|---|---|
-| 界面语言包 | 走 `t()` 的 6166 条（字符串叶子，= 语言包 manifest 的 `entries`） | 0 token，重启生效 |
+| 界面语言包 | 走 `t()` 的 6185 条（字符串叶子，= 语言包 manifest 的 `entries`） | 0 token，重启生效 |
 | DOM 实时翻译 | 硬编码文案、扩展标题、游戏卡片 | 词库命中 0 token，否则走模型 |
 | 批量翻译 | 模组名、合集名、更新日志、简介 | 走模型，结果落缓存 |
 
@@ -41,8 +41,10 @@ Vortex 的 i18next 用 `MultiBackend` 加载语言包，**只认一份来源**�
 2. **按当前语言选目录**。宿主读 `settings.interface.language`，值是 `en` 时不会去看 `locales/zh/`。
    所以 README 让你把界面语言改成中文，不单纯是「选择语言」，而是**不选就不会加载**。
 
-`locale-pack.js` 做的事：扫描 Vortex 内置的 `en` 语言包 → 和 `pack.json` 合并 → 写成**一个**
-`locales/zh/common.json`。
+`locale-pack.js` 做的事：把包内的 `pack.json` **整份**写成**一个** `locales/zh/common.json`。
+
+它不读别人的汉化包当基底，也不读 Vortex 内置的 `en` 语言包 —— 能收的译文在构建期就已经
+烧进 `pack.json` 了。所以 `locales/zh/` 是**写入目标**，不是词库来源。
 
 一个文件为什么够：Vortex 的 i18n 初始化参数是 `fallbackNS: "common"`，
 任何命名空间查不到的 key 都会回退到 `common`。
@@ -124,7 +126,7 @@ Links are now <i1>exposed over IPC</i1> ({{2}} links)
 | 条目 | 写进哪 | 为什么 |
 |---|---|---|
 | 已安装模组 | mods 表的 `customFileName` | Vortex 显示名的第一优先来源 |
-| 下载记录 | `modInfo.nexus.fileInfo.name` | 下载行实际读这个字段；写 `modInfo.name` 无效（Vortex 不拿它显示） |
+| 下载记录 | `modInfo.name` | 写的是这个字段。读取时先取它，没有才回落到 `nexus.fileInfo.name`。**绝不写 `nexus.fileInfo.name`** —— 那会让 Vortex 重新计算显示名，产出「英文 - 中文」的杂交名 |
 
 写之前会把英文原名备份进 `zhSourceName`——右键「还原英文」、换名重翻，都靠它找回原文。
 
@@ -259,7 +261,7 @@ outTokens = clamp(min(want, room, 4096), 256, …)
 
 ### 游戏名对照按需注入
 
-746 条游戏名如果全塞进提示词，既浪费上下文又会被截断。
+759 条游戏名如果全塞进提示词，既浪费上下文又会被截断。
 所以每次只注入「这一批文本里实际出现的那几条」（包含匹配，上限 40）。
 
 ### 其他后处理
@@ -298,9 +300,9 @@ outTokens = clamp(min(want, room, 4096), 256, …)
 index.js              入口、设置页 UI、模组名批量翻译、缓存读写、实时状态
 dom-translator.js     DOM 兜底层：扫描、判定、序列化、回填、队列、重试
 translate-core.js     模型调用层：HTTP、提示词、占位符保护、分批、JSON 解析
-locale-pack.js        语言包接管：扫 en 词条、合并词库、写 common.json
-pack.json             界面词库（6166 条，按字符串叶子计）
-gamenames.json        游戏固定中文名（746 条）
+locale-pack.js        语言包接管：把 pack.json 整份写进 common.json
+pack.json             界面词库（6185 条，按字符串叶子计）
+gamenames.json        游戏固定中文名（759 条）
 gamenames-keep.json   明确保持英文的名单
 domCache.seed.json    种子译文（清缓存升级后垫底）
 config.json           出厂配置（接口地址为空）
