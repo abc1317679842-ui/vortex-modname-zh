@@ -45,6 +45,40 @@ function termIsAllCaps(en) {
   return L.length >= 2 && L === L.toUpperCase();
 }
 
+/** 成人向 / 全年龄两族的判定词。两侧都要求「前后不是字母数字」，
+ *  否则 `NSFW` 里的 `SFW` 会被当成 SFW（子串陷阱），`NSFWMod` 也会误命中。 */
+const ADULT_MARK_I = /(?:^|[^A-Za-z0-9])NSFW(?:[^A-Za-z0-9]|$)|R18|18\+|成人向|成人版|成人内容|色情|工口/i;
+const SAFE_MARK_I = /(?:^|[^A-Za-z0-9])SFW(?:[^A-Za-z0-9]|$)|全年龄|全年齢|安全向|一般向/i;
+
+/** 反向缩写对检测（SFW ↔ NSFW）：模型侧语义反转守卫。
+ *  和遮罩左边界是**两条独立来路**，别混：
+ *    ① 遮罩腰斩：`NSFW` 被 `SFW` 词条遮成 `N『全年龄』`（applyTerms 左边界已修）；
+ *    ② 模型幻觉：原文 `SFW`，译文却写成 `NSFW` —— 本判据管这条。实测 1/525：
+ *       `Hazu_SFW_CrusaderSkin` → 「更干净的十字军战士皮肤**NSFW**模组」。
+ *  判据（确定性，只看两侧的对立词）：
+ *    原文有 SFW 且无 NSFW，译文出现成人向词 → 反转；
+ *    原文有 NSFW 且无 SFW，译文出现全年龄向词 → 反转。
+ *    两侧都没有 / 两侧都有（「无 NSFW 内容」这类对照句）→ 一律不判。
+ *  只给 mod 模式：html/ui 是长段落，正文里正反对照是合法写法，
+ *  为两个词把一整段退回英文，代价远大于收益。
+ *  @returns true = 语义反转，调用方应退回重译 / 保留原文
+ */
+function sfwInverted(src, zh) {
+  const a = String(src == null ? '' : src);
+  const b = String(zh == null ? '' : zh);
+  if (!b) return false;
+  // 子串口径（F-109）：`CompanionDesireSFW` 这种**粘连**写法也要认 —— 边界口径要求
+  // 左侧不是字母数字，实测漏掉 `CompanionDesireSFW V0.4 → 伴侣渴望NSFW版`（treat 臂 3 轮全中）。
+  // 但必须**先把 NSFW 摘掉再找 SFW**：NSFW 里含 SFW，不摘的话「两侧都有」会永远成立。
+  // 语料实测：含 SFW 不含 NSFW 的只有 4 条，边界口径漏的正好这 1 条 → 增量风险≈0。
+  const sNsfw = /NSFW/i.test(a);
+  const sSfw = /SFW/i.test(a.replace(/NSFW/ig, ' '));
+  if (sSfw === sNsfw) return false;          // 两侧都没有 / 两侧都有（对照句）→ 不判
+  if (sSfw && ADULT_MARK_I.test(b)) return true;
+  if (sNsfw && SAFE_MARK_I.test(b)) return true;
+  return false;
+}
+
 function applyTerms(text, terms, direction) {
   let out = text;
   // 排序：长词优先（Faster HDT-SMP 必须先于 HDT-SMP，否则长词被切碎）；
@@ -66,12 +100,35 @@ function applyTerms(text, terms, direction) {
     return String(text).split(/(『[^』]*』)/g).map((seg) => {
       if (/^『[^』]*』$/.test(seg)) return seg;
       return seg.replace(re, (hit, offset, whole) => {
+        // 左边界：左侧紧贴字母或数字就不是词边界，不能遮。
+        // 以前只查右侧，于是「目标词正好落在 token 尾部」时必然腰斩：
+        // NSFW←SFW（语义反了）、Approach←Roach、Community Patch←Unity、
+        // Space Combat←Ace Combat、SpeedWheelControl←Control、EnRAGE←RAGE、
+        // Zenderal←Enderal。现网 2431 条实测 10 条
+        // （exp-out/left-boundary-violations.tsv），但 courage / controller / cockroach
+        // 这类只是还没进语料，真实影响面远大于 10。
+        // 有意接受的代价：WukongUE4SS、ModSummonandMountRoach、JFDAerosteon 这类
+        // 全大写/驼峰粘连**会漏遮**。漏遮只留英文，模型大概率还能译对；误遮则会把
+        // `Community` 切成 `Comm『Unity』`、把 `Approach` 切成 `App『萝卜』` —— 必错。
+        // 所以宁可漏遮，换回数十条正常词不被破坏。
+        // 别指望上游先做驼峰拆分：遮罩路径是 applyTerms(原文) 直接进这里
+        // （translate-core.js:667），`camelSplitWord` 只在 index.js 的词级补翻里用
+        // （处理译文残留），遮罩时**没有**任何 camel 预拆分 —— 实测
+        // `applyTerms('ModSummonandMountRoach',[{en:'Roach',fuzzy:true}],'mask')` 不遮。
+        // 想靠「命中词首字母大写 + 左邻小写」判驼峰也不成立：EnRAGE(R 大写、左邻 n)、
+        // SpeedWheelControl(C 大写、左邻 l) 会一起复活，与左边界要修的东西分不开。
+        // 这是**有意的能力回退**（验收里已按「第 2 条作废，记 F-75/F-76」处理）。
+        // 只管「左边是不是词边界」，与 fuzzy（右边界）和大小写敏感（另一处逻辑）无关。
+        const prev = offset > 0 ? String(whole).charAt(offset - 1) : '';
+        if (/[A-Za-z0-9]/.test(prev)) return hit;
         const next = String(whole).charAt(offset + hit.length);
         if (/[A-Za-z0-9]/.test(next)) {
           // fuzzy 档（专名硬遮蔽）：驼峰里的大写照遮 —— `ModSummonandMountRoach`、
           // `GwentCardSwap` 这类连写名字，只要松一侧边界，模型就会自由发挥
           // （实测 Roach→蟑螂、Gwent 保留英文、Oils→油质）。
           // 小写后缀和数字仍然挡住（OilsX 之外，Roachs / oils2 都不遮）。
+          // 注意左边界先判：`ModSummonandMountRoach` 里的 Roach 左邻是字母，
+          // 这一侧不成立就整条遮不上（见上，属有意回退）；`GwentCardSwap` 的 Gwent 在词首，不受影响。
           if (!(t.fuzzy && /[A-Z]/.test(next))) return hit;
         }
         return '『' + t.zh + '』';
@@ -167,12 +224,22 @@ function normalizeCaseKeepMasks(t) {
  *  模型对缩写极易认错（实测 TW3 被当成《上古卷轴3》，用户的合集名一半带 TW3），
  *  这种错误用后处理救不回来，只能在提示词里先钉死。 */
 const BUILTIN_TERMS = [
-  { en: 'TW3 / TW 3 / Witcher 3 / The Witcher 3 / W3', zh: '巫师3' },
+  // 一条一个词：以前写成 'TW3 / TW 3 / Witcher 3 / The Witcher 3 / W3' 一条，
+  // 模型读成「一整串对应巫师3」，单写 TW3 时反而猜成《上古卷轴3》（用户真机高发）。
+  { en: 'TW3', zh: '巫师3' },
+  { en: 'TW 3', zh: '巫师3' },
+  { en: 'Witcher 3', zh: '巫师3' },
   { en: 'CP2077', zh: '赛博朋克2077' },
   { en: 'BG3', zh: '博德之门3' },
-  { en: 'SKSE / F4SE / NVSE', zh: '原样保留，不要翻译' },
-  { en: 'Cleaner（做前缀时）', zh: '更清晰的 / 更干净的（不是"清洁版"）' },
-  { en: 'Lite / Lightweight', zh: '轻量版' },
+  // 删掉 'SKSE / F4SE / NVSE → 原样保留，不要翻译'：这是**指令**不是术语，
+  // 混在对照表里会被当成「这几个词该译成中文」，实测把 SKSE 译成「天空风」之类。
+  // 缩写该不该保留由规则 2/8 统一管（保留原文只限对照表里没有的）。
+  { en: 'Lite', zh: '轻量版' },
+  { en: 'Lightweight', zh: '轻量版' },
+  // Cleaner 以前写 '更清晰的 / 更干净的（不是"清洁版"）' —— 整串当译文输出，
+  // 真机出现「Belly cns → 腹部猎魔感官模组」「Aerith cns → 艾瑞丝更清晰的模组」，
+  // 即模型把注释性的「更X的」当词义。改成确定的单译法。
+  { en: 'Cleaner', zh: '清理版' },
 ];
 
 /** Vortex 自身的术语约定：界面文案里这几个词误译率最高 */
@@ -343,13 +410,13 @@ function buildSystemPrompt(terms, mode) {
     '任务：把用户给出的每一条英文 MOD 名称翻译成简体中文，让玩家一眼看懂这个 MOD 是干什么的。',
     '规则：',
     '1. 名称里『书名号』标记的是专业术语，输出时原样保留成对应中文，不要改写它。',
-    '2. 保留缩写与版本号（如 CWSO、HD、4K、v1.4.9、Next Gen 等），不要翻译它们。',
+    '2. 版本号和数字原样保留（如 v1.4.9、4K、16x9）；『书名号』里的术语按对照输出，其余缩写见第 8 条。',
     '3. 只输出一个 JSON 数组，元素为字符串，顺序与输入完全一致，不要解释、不要代码块标记。哪怕只有一条输入，也必须输出形如 ["译文"] 的 JSON 数组，绝对禁止直接输出纯文本。',
     '4. 每条结果控制在 20 个汉字以内，宁短勿长。',
     '5. 只输出简体中文（中国大陆用词），严禁繁体字。',
     '6. 全部大写的名称（如 DELUXE PACK NEXT-GEN）也必须翻译成中文，绝对禁止原样返回英文。',
     '7. 成人向（NSFW）模组的名称也照常翻译，这只是游戏模组名，不要拒翻。',
-    '8. 游戏名缩写必须按下面的对照译成正式中文名（TW3 是《巫师3》，不是《上古卷轴3》）；对照表里没有的缩写，保留原文，绝对不要猜成别的游戏。',
+    '8. 游戏名缩写必须按下面的对照译成正式中文名；对照表里没有的缩写，保留原文，绝对不要猜成别的游戏。',
     '内置对照：\n' + builtinHint,
     termHint ? '术语对照：\n' + termHint : '',
   ].filter(Boolean).join('\n');
@@ -374,7 +441,7 @@ function buildHtmlPrompt(terms) {
     '7. 成人向（NSFW）内容照常翻译，这只是游戏软件界面，不要拒翻、不要原样返回英文。',
     '8. 数字、版本号、文件名、URL、代码保持原样。',
     '9. 文件路径必须整段原样复制：凡是带反斜杠 \\ 或斜杠 / 的串（如 The Witcher 3\\mods\\xxx\\、Content/Paks/LogicMods），里面的游戏名也不许翻、反斜杠不许换成斜杠、不许增删斜杠，一个字都不许改。',
-    '10. 游戏名、软件名、模组名的缩写必须按下面的对照译成完整中文名（TW3 是《巫师3》，不是《上古卷轴3》）；对照表里没有的缩写，保留原文，绝对不要猜成另一个作品。',
+    '10. 游戏名、软件名、模组名的缩写必须按下面的对照译成完整中文名；对照表里没有的缩写，保留原文，绝对不要猜成另一个作品。',
     '11. 这是 Vortex 模组管理器，专有词固定译法：' + glossary + '。',
     '内置对照：\n' + builtinHint,
     termHint ? '术语对照：\n' + termHint : '',
@@ -659,6 +726,14 @@ async function llmTranslate(cfg, texts, modeOverride) {
   const safeList = payloadList.map((t, i) => protectPaths(t, boxes[i]));
 
   // 系统提示词先构建：估算输入占用时要连它一起算（见下方 estIn）
+  // ⛔ 2026-11-06 试过「提示词只放 userTerms、砍掉 gameTerms 术语表」，**实测否决，已回滚**：
+  //   · 串味没消失：真实链路（先遮罩再送模型）A/B 20 组，对照 2/40 vs 处理 2/40 打平，
+  //     而且 #20 DOOM 那组处理臂反而 2/2 被污染 —— 串味的主通道是**遮罩后中文进批内上下文**，
+  //     不是术语表；
+  //   · 粘连场景直接变差：游戏名藏在驼峰里遮罩遮不到时，术语表是唯一提示 ——
+  //     `Cjayride.EpicValheimsAdditions` 对照译「英灵神殿」、处理译成音译「瓦尔海姆」；
+  //     `SquadHud` 对照译「战术小队」、处理直接保留英文。
+  // → 术语表在这一层是**净收益**，不要为了那个 3/3 单题材的特例去砍它。
   const sysPrompt = mode === 'html' ? buildHtmlPrompt(terms) : buildSystemPrompt(terms, mode);
 
   // 输出预算必须跟着输入走，但**绝不能超过模型实际加载的上下文**：
@@ -755,14 +830,39 @@ async function llmTranslate(cfg, texts, modeOverride) {
       // 全量剥会把正常文本改坏；模型自造的壳由下面的括号清理和标题壳剥离处理。
       if (mode === 'mod') s = s.replace(/『\s*([\s\S]*?)\s*』/g, '$1');
     }
-    // 模型有时会把带『』标记的术语改写成「」等括号，统一清理掉包裹符号
+    // 模型有时会把带『』标记的术语改写成「」等括号，统一清理掉包裹符号。
+    // 容错要带上引号族：模型常把『术语』写成 '术语' / “术语”，以前只认中文括号，
+    // 于是遮罩壳留在译文里（实测「SF6 迈克'三色'添加模组」）。
     for (const t of terms) {
       if (!t.zh) continue;
-      s = s.replace(new RegExp('[「『\\[(（《]' + escapeRegExp(t.zh) + '[」』\\])）》]', 'g'), t.zh);
+      s = s.replace(new RegExp('[「『\\[(（《"\u2018\u201c]' + escapeRegExp(t.zh) + '[」』\\])）》"\u2019\u201d]', 'g'), t.zh);
     }
     // 结构修复（C5+C7 v6）：成对的三道还原都跑完之后，剩下的孤立/错配符号交给它。
     // 只给 mod 模式：ui/html 的正文可能有合法的『』引用与英文引号，全量剥会改坏正常文本。
     if (mode === 'mod') s = repairStruct(s, src);
+    // 错作品防火墙：模型对不认识的缩写会硬猜，而「巫师3」是它脑子里最响的中文游戏名
+    // （实测 Legendary Edition 3 → 巫师3、Offline Covenants DS2 → 巫师3、DW DLC1 → 巫师3、
+    //   Thedas IO → 《巫师3》泰达斯IO）。原文根本没提巫师系列时，译文里的「巫师3」一定是幻觉。
+    // 边界只能用**左边界** `\bwitcher`，不能用 `\bwitcher\b`：
+    //   · 左边界必须留 —— 裸 `witcher` 会命中 `Window Switcher`（实测），那是「切换器」不是猎魔人；
+    //   · 右边界必须去掉 —— `Witcher3HD` / `WitcherIII` 这类**无空格粘连**里 `r` 后面紧跟字母数字，
+    //     右边界不成立 → 守卫认不出来 → 真巫师模组译文里的「巫师3」会被当幻觉删掉。
+    //     （2026-11-06 `wrong-work-guard-test` 实测：旧正则对这两种形态漏判。）
+    // `wied[zź]min` 是波兰语原名，模型对它更可能音译，但库里有这类条目，漏了同样会误删。
+    // 顺序必须在空格塌陷之前：「离线契约 巫师3」塌成「离线契约巫师3」后就找不到分隔位置了。
+    // 先整段剥带括号的幻觉标题：`《巫师3：骑士圣殿》强化模组` 只剥「《巫师3」会剩一个孤立 `》`
+    // （verify 实测 1/2201），所以凡「括号内出现巫师3」就整块拿掉，四个括号族都覆盖。
+    if (mode === 'mod' && !/\bwitcher|巫师|猎魔人|杰洛特|\bTW\s?3\b|\bW3\b|wied[zź]min/i.test(String(src))) {
+      s = s.replace(/[《【「『][^》】」』]*?巫师\s?3[^》】」』]*[》】」』]/g, ' ')
+        .replace(/[《【「『"'（(]?\s*巫师\s?3\s*[》】」』"')）]?/g, ' ')
+        .replace(/[\s,，、]{2,}/g, ' ')
+        .replace(/^[\s\-–—,，:：、]+|[\s\-–—,，:：、]+$/g, '')
+        .trim();
+    }
+    // 汉字段之间不该有半角空格：遮罩后的中文块（『黑暗之魂：重制版』）模型会当成独立短语，
+    // 两边补空格 ——「烧焦的契约 黑暗之魂：重制版」「BTZ血红色 界面主题」。
+    // 全语料 35/2431；只塌汉字↔汉字，汉字↔数字/英文的空格保留（「第 1 部分」不动）。
+    if (mode === 'mod') s = s.replace(/([\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])/g, '$1');
     s = toSimplified(s).trim();
     // 模型有时把路径反斜杠多转义一层（C:\\Users 变成 C:\\\\Users），原文没这层就压平
     if (String(src).indexOf('\\\\') === -1 && s.indexOf('\\\\') !== -1) s = s.replace(/\\\\/g, '\\');
@@ -812,6 +912,9 @@ async function llmTranslate(cfg, texts, modeOverride) {
     // 正常英译中压缩比 0.4~0.6，低于 0.25 基本可以确定是漏译。
     const srcLen = String(src).length;
     if (mode === 'html' && srcLen > 300 && s.length < srcLen * 0.25) return markReject(src);
+    // 反向缩写对：原文 SFW、译文写成 NSFW（或反过来）→ 语义反转，宁可留英文。
+    // 返回原文后 out[k]===chunk[k]，retryEchoed 会再单条重试一次；仍反转就停在英文。
+    if (mode === 'mod' && sfwInverted(src, s)) return markReject(src);
     return s;
   }
 
@@ -824,6 +927,13 @@ async function llmTranslate(cfg, texts, modeOverride) {
   }
   if (arr && arr.length > 0) {
     const mapped = arr.slice(0, texts.length).map((x, i) => {
+      // 显式 null / "null" / "undefined" 一律归一成**真空位**（第九段）：
+      // 模型偶尔在数组里吐字面量 null，`String(null)` 会把它变成文本 "null"，
+      // 于是补 null 循环判 `!= null` 时它会通过（不补发）、守卫也看不见它，
+      // 最后界面上留一个 "null"（verify 用桩复刻：`["甲",null] → ["甲","null"]`）。
+      // 归一后才能走到补发/重译；正常译文不受影响。
+      if (x == null) return null;
+      if (typeof x === 'string' && /^(null|undefined)$/i.test(x.trim())) return null;
       const raw = String(x);
       const box = boxes[i];
       // 占位符被模型吃掉 = 路径没了。宁可这条留英文，也不要吐出坏路径让人照着删文件
@@ -860,6 +970,10 @@ async function llmTranslate(cfg, texts, modeOverride) {
       if (!parts.some((p, i) => p !== String(texts[i]))) return null;
       return parts;
     };
+    // ⛔ 2026-11-06 试过加第三轮 `：` 拆分（救「模型用冒号连多条」那种失败），**已撤销**：
+    // 冒号在正常中文译文里太常见，条数约束挡不住误拆 —— 实测输入 2 条、模型只回
+    // 「提示：启用此项」1 条时，会被拆成 ["提示","启用此项"] 正好 2 条而被采纳，
+    // 结果是**静默错配**（比整批失败更难发现）。项目铁律：宁可留英文，绝不写错译文。
     const parts = trySplit(/[、，,；;]/) || trySplit(/[、，,；;]|以及/);
     if (parts) {
       const mapped2 = parts.map((p, i) => {
@@ -899,6 +1013,18 @@ async function llmTranslate(cfg, texts, modeOverride) {
     const structurallyOk = mode === 'html'
       ? (raw !== src && cjkN >= 1)
       : (cjkN >= 2 && cjkN / Math.max(1, raw.length) > 0.05);
+    // 元话术拦截（2026-11-05）：模型有时不返回 JSON，而是回一段「这不是 JSON 数组，原因是…」
+    // 的中文说明。单条兜底会把它当译文写进缓存 —— 实测 2 个位置被写成同一串、`_rejects` 空、
+    // 不触发重试，用户看到的是界面文案变成一句解释。判据只留**真实语料零误伤**的三条：
+    // 说明文字专属措辞（`JSON 数组`／`不是 JSON`）、两条长度失控（短标签回几百字、6 倍+200）。
+    // 6420 条出厂译文（pack 6185 + domCache 235）实测三条合计误伤 0；『抱歉』『请注意』
+    // 这类会出现在正常译文里（20/65 条命中），一律不进判据。
+    const looksMeta = /不是\s*JSON|JSON\s*数组|返回的?(?:是)?\s*JSON/i.test(raw)
+      || (src.length < 40 && raw.length > 300)
+      || (src.length < 120 && raw.length > src.length * 6 + 200);
+    // `raw !== src` 才拦：源文本身就是中文（含「JSON 数组」这种字面）时那是回声，
+    // 应当走下面「无需翻译」的原样返回，不该被当成说明文字打回。
+    if (looksMeta && raw !== src) throw new Error('模型回复是说明文字不是译文: ' + raw.slice(0, 200));
     if (raw !== src && structurallyOk) {
       const box0 = boxes[0];
       if (box0 && box0.map.size) {
@@ -978,7 +1104,14 @@ function splitByBudget(texts, budget, minChunks) {
  * 为什么分桶：提示词是按整批平均长度选的（isUiBatch）——
  * 长简介和短模组名混在同一批时，模型会按长句模式处理，把短名整条照抄回来，
  * 实测 32 条混合批里 20 条被照抄；分开后短名批次走 mod 模式就不会了 */
-function splitIndexed(texts, budget, minChunks, maxItems) {
+function splitIndexed(texts, budget, minChunks, maxItems, splitKey) {
+  // S1：可选 splitKey（与 texts 等长）→ 相邻两条 key 不同就强制断车，
+  // 让「不同游戏的模组名」不再混在同一车（模型会拿别的游戏的上下文猜）。三条约定（§28.9）：
+  //  ① 缺省 / 长度不等 → 完全走老路径，groups 与改动前逐字节一致（有断言守）
+  //  ② 不可重编号：车里的 i 仍是**原 texts 的下标** → results 回填、onItem(idx)、
+  //     onGroup({idxs}) 天然正确，**不需要 offset**（别以后看到分车就想加 offset）
+  //  ③ 长度 ≠ texts.length 时按「忽略」处理，不抛错 —— 抛错会让整批失败，比不分组更糟
+  const keys = (Array.isArray(splitKey) && splitKey.length === texts.length) ? splitKey : null;
   const long = [], short = [];
   for (let i = 0; i < texts.length; i++) {
     const t = String(texts[i]);
@@ -998,8 +1131,62 @@ function splitIndexed(texts, budget, minChunks, maxItems) {
     }
     push();
   };
-  build(long);
-  build(short);
+  if (!keys) {
+    build(long);
+    build(short);
+  } else {
+    // 有 splitKey 时：**先按 key 稳定排序，再沿排序后的连续段切，段内做长/短分桶** ——
+    // 等价于「每款游戏按它自己的条目单独切」，长名/短名仍然分开（isUiBatch 那套保护不变）。
+    // 不要改成「在 build 里遇到 key 变化就断」：那样全局长/短两桶会把同一游戏的条目劈到
+    // 两个互不相邻的车里，每款游戏多出 1 车。
+    //
+    // 为什么先排序：不排序就只能按「输入里相邻的连续段」切，车数被输入顺序支配。
+    // pending 现在是 collectTargets 出来的、天然按 gameId 连续，但那是**上游的巧合**：
+    // 以后谁按名字排一次序、或把下载行插到中间，同一游戏就被切成十几段，每段各吃一辆
+    // 装不满的车 —— 实测 304 车能顶到 2431 车（+700%）。排序把这一整类风险一次消掉，
+    // 代价 O(n log n)，且交错输入 == 相邻输入（同 key 结果逐车相同）。
+    // 排序稳定性：同 key 内按原下标升序（a - b），所以段内 long/short 的顺序、
+    // 以及 build() 的装车结果与「不传 keys 的原序」完全一致（有断言守）。
+    //
+    // 请求数代价（2431 条全量 + `audit-corpus/filenames.json` join 的**真 gameId**：
+    // 120 个游戏、每款 13~24 条、中位 20。用**绝对车数**报，百分比容易被误读）：
+    //   装 1 个游戏（23 条）   4 → 4 车（+0）
+    //   装 3 个游戏（62 条）   9 → 10 车（+1）
+    //   装 5 个游戏（96 条）  13 → 16 车（+3）
+    //   装 10 个游戏（204 条） 26 → 33 车（+7）
+    //   全量 120 游戏（2431 条）304 → 387 车（+83）
+    // 这是**结构下界**不是浪费：每款 20 条 + maxItems=8 → 每款至少 ceil(20/8)=3 车，
+    // 120×3=360 是地板，387 已经贴着它。尾车最优合并最多回收 27 车，而合并会把两个游戏
+    // 塞回同一车（正是分车要避免的）→ 不做尾车合并。
+    // 作废的旧数（别再引用）：+18/+17/+24%（抽 N 款游戏的前几条当样本，小语料把边界浪费
+    // 放大一个数量级）、+0.7/+1.6/+2.3%（把 2431 条均分成 k 份，每份 800 条能装满车，
+    // 浪费被摊平）、+40%/+33.6%（同一类均分/极端口径）。
+    //
+    // 副作用（已知、可接受）：多游戏时 groups 的发射顺序变成按 key 字典序，不再跟随
+    // pending 顺序。只影响进度面板里各游戏的先后（本来就是并发乱序），不影响任何回填：
+    // 车里的 i 仍是原 texts 下标。minChunks 补块那段 groups.sort 本来就按长度重排，
+    // 顺序从来不是契约。
+    const isLong = new Set(long);
+    const kOf = (i) => (keys[i] == null ? '' : String(keys[i]));
+    const seq = [];
+    for (let i = 0; i < texts.length; i++) seq.push(i);
+    const order = seq.sort((a, b) => {
+      const ka = kOf(a), kb = kOf(b);
+      if (ka !== kb) return ka < kb ? -1 : 1;
+      return a - b;                     // 同 key 保原下标升序 → 稳定
+    });
+    let st = 0;
+    while (st < order.length) {
+      const k = kOf(order[st]);
+      let en = st + 1;
+      while (en < order.length && kOf(order[en]) === k) en++;
+      const segLong = [], segShort = [];
+      for (let p = st; p < en; p++) { const i = order[p]; (isLong.has(i) ? segLong : segShort).push(i); }
+      build(segLong);
+      build(segShort);
+      st = en;
+    }
+  }
   const need = Math.max(1, Math.min(minChunks || 1, texts.length));
   if (groups.length < need) {
     // 并发保底：块数不够就把最大的几块再均分，保证每条并发车道有活干
@@ -1037,17 +1224,200 @@ async function retryEchoed(cfg, chunk, out, results, idxs, mode) {
   return fixed;
 }
 
-async function translateBatch(cfg, cache, texts, mode) {
+/** 抽出「≥5 个拉丁字母」的词（C1bukii 的字母数够；UE4SS 只有 4 个字母，不算）。
+ *  统一小写比较：mod 模式会把 ALL CAPS 归一化成首字母大写，大小写敏感会对不上。 */
+function misalignWords(text) {
+  const s = String(text == null ? '' : text);
+  const re = /[A-Za-z0-9]+/g;
+  const res = [];
+  let m;
+  while ((m = re.exec(s)) !== null) {
+    if (m[0].replace(/[^A-Za-z]/g, '').length < 5) continue;
+    res.push(m[0].toLowerCase());
+  }
+  return res;
+}
+
+/** 串行错位守卫·路①（词证据）。一批里出现两条「只差标点/大小写」的名字时，
+ *  本地小模型会把它们当成同一条、只给一个译文，再把最后一条译文重复一次补足
+ *  数组长度 —— 长度对得上，`out.length !== chunk.length` 这种 shape 守卫**原理上**
+ *  抓不到，结果后面条目整体位移：用户在界面上看到的是别的模组的译文
+ *  （2431 条语料实测一次，位置 52-56）。
+ *
+ *  判据（两个方向，位移后两行都要命中）：chunk[k] **独有**的拉丁词（本批只出现在
+ *  这一条里）既没留在 out[k] 里、又原样出现在**别的** out[j] 里；或者反过来，
+ *  out[k] 里留着一条只属于 chunk[m] 的词，而 out[m] 自己没留住 —— 那只能是位置串了。
+ *  词被模型翻成中文时无法判断（out[k] 里本来就不该有它），所以宁可漏判不可误判。
+ *  **这条路覆盖率很低**：实测译文里保住锚点的只有 9.8%，纯词判据位置召回 9~15%
+ *  （verify 独立量到 261/1787）。结构证据见 findRepeatPadding。
+ * @returns {number[]} 错位条目下标（升序）；无异常返回 []
+ */
+function misalignLexical(chunk, out) {
+  if (!Array.isArray(chunk) || !Array.isArray(out) || chunk.length === 0) return [];
+  const n = Math.min(chunk.length, out.length);
+  const mine = new Array(n);
+  const seen = new Map();                     // 词 → 出现在几条 chunk 里（去重后按条计）
+  for (let k = 0; k < n; k++) {
+    const ws = Array.from(new Set(misalignWords(chunk[k])));
+    mine[k] = ws;
+    for (const w of ws) seen.set(w, (seen.get(w) || 0) + 1);
+  }
+  const have = new Array(n);                  // 每条译文里保留的拉丁词
+  for (let k = 0; k < n; k++) have[k] = new Set(misalignWords(out[k]));
+  const owner = new Map();                    // 唯一词 → 它唯一属于的那条下标
+  for (let k = 0; k < n; k++) for (const w of mine[k]) if (seen.get(w) === 1) owner.set(w, k);
+  const bad = [];
+  for (let k = 0; k < n; k++) {
+    if (out[k] == null) continue;             // 空条目走单条补发，不在这里判（避免重复烧调用）
+    const lost = (mine[k] || []).filter((w) => seen.get(w) === 1 && !have[k].has(w));
+    // ①「自己的独有词丢了，却出现在别人译文里」→ 自己被挤掉了。
+    // 光「没保留」不算：可能只是被翻成了中文。只有它出现在别人译文里才是串位。
+    const moved = lost.some((w) => {
+      for (let j = 0; j < n; j++) if (j !== k && have[j].has(w)) return true;
+      return false;
+    });
+    // ②「自己译文里留着一条只属于别人的词，而那条自己没留住」→ 自己装的是别人的内容。
+    // 这一半不能省：位移之后「被偷的那条」和「偷的那条」是两行，只修前者等于没修
+    // —— 用户真正看到错译文的恰恰是后者（52 号行显示 53 的译文）。
+    let stole = false;
+    if (!moved) {
+      for (const w of have[k]) {
+        const m = owner.get(w);
+        if (m === undefined || m === k) continue;
+        if (!have[m].has(w)) { stole = true; break; }
+      }
+    }
+    if (moved || stole) bad.push(k);
+  }
+  return bad;
+}
+
+/** 两条源文是不是「本质同一条」：只差版本号/标点/大小写/结尾标记（PT BR T vs PT BR）。
+ *  这种条目译文相同本来就是对的 —— 不能拿「译文重复」当错位证据。
+ *  实测 304 个真实批次里有 4 批正是这种合法重复（Species Viewer Fix-1-1 vs -1-0、
+ *  dao_extradogslot_1_41-664 vs -664、Mojo BetterBiomes ±MojoPrefabs、
+ *  Perisno PT BR T vs PT BR），不设这道闸误报就从 0 变 4/304。 */
+function nearSameSource(a, b) {
+  const A = String(a == null ? '' : a).toLowerCase().replace(/[^a-z]/g, '');
+  const B = String(b == null ? '' : b).toLowerCase().replace(/[^a-z]/g, '');
+  if (!A || !B) return false;
+  if (A === B) return true;
+  if (A.indexOf(B) !== -1 || B.indexOf(A) !== -1) return true;   // 一条是另一条的前缀/子串
+  if (Math.abs(A.length - B.length) > 2) return false;
+  // 编辑距离 ≤2（只有「译文真重复」时才会走到这里，代价可忽略）
+  let prev = [];
+  for (let j = 0; j <= B.length; j++) prev[j] = j;
+  for (let i = 1; i <= A.length; i++) {
+    const cur = [i];
+    let rowMin = i;
+    for (let j = 1; j <= B.length; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (A[i - 1] === B[j - 1] ? 0 : 1));
+      if (cur[j] < rowMin) rowMin = cur[j];
+    }
+    if (rowMin > 2) return false;       // 整行都 >2 → 最终距离必然 >2
+    prev = cur;
+  }
+  return prev[B.length] <= 2;
+}
+
+/** 串行错位守卫·路②（结构证据）。模型少给一条译文后会把最后一条重复一次补足
+ *  数组长度 —— 这一步必然在 out 里留下一对**相邻完全相同**的译文。
+ *  这是唯一不依赖「拉丁词被保留」的证据，而锚点在译文里的存活率只有 9.8%：
+ *  纯词判据位置召回 9~15%，补上这条路后实测事故段（V6 52-56）5 个错位位置全进网。
+ *  两道精度闸（缺一不可）：
+ *    ① 两条译文 trim 后完全相等且非空；
+ *    ② 两条源文不是「本质同一条」（见 nearSameSource）—— 只差版本号/标点的名字
+ *      本来就该得到同一个译文，那种重复不是证据。
+ *  @returns 首个可疑重复对的左下标 j（0..n-2）；没有返回 -1 */
+function findRepeatPadding(chunk, out) {
+  const n = Math.min(chunk.length, out.length);
+  for (let j = 0; j + 1 < n; j++) {
+    const a = String(out[j] == null ? '' : out[j]).trim();
+    const b = String(out[j + 1] == null ? '' : out[j + 1]).trim();
+    if (!a || a !== b) continue;
+    if (nearSameSource(chunk[j], chunk[j + 1])) continue;
+    return j;
+  }
+  return -1;
+}
+
+/** 串行错位守卫（B3）总入口：两路证据取并集。
+ *  路①词证据见 misalignLexical；路②结构证据见 findRepeatPadding，命中后把 0..j
+ *  全部交回单条重译（j 之前都可能被前移）。
+ *  **只到 j，不含 j+1**：实测形态里模型重复的是最后一条、也是**正确**的那条译文
+ *  （V6 的 57 号、构造样本的末条），动它只会白烧一次调用、还引入一次改写噪声。
+ *  宁可漏判不可误判：误判 = 白烧调用 + 可能拿新结果盖掉一条本来正确的译文。
+ *  该 bug 定向复现 60 次未成功，「能抓到」不能当验收判据；误报 0 才是。
+ * @returns {number[]} 需要单条重译的下标（升序）；无异常返回 [] */
+function findMisaligned(chunk, out) {
+  if (!Array.isArray(chunk) || !Array.isArray(out) || chunk.length === 0) return [];
+  const bad = misalignLexical(chunk, out);
+  const j = findRepeatPadding(chunk, out);
+  if (j >= 0) {
+    const n = Math.min(chunk.length, out.length);
+    for (let k = 0; k <= j && k < n; k++) {
+      if (out[k] != null) bad.push(k);    // 空条目已由补 null 循环处理，不重复烧
+    }
+  }
+  return Array.from(new Set(bad)).sort((x, y) => x - y);
+}
+
+async function translateBatch(cfg, cache, texts, mode, splitKey) {
   const rejects = new Set();
   const budget = Math.max(400, cfg.batchCharBudget || 2400);
-  const groups = splitIndexed(texts, budget, 1);
+  const groups = splitIndexed(texts, budget, 1, 0, splitKey);
   const res = new Array(texts.length).fill(null);
+  // 最近一次取结果的失败原因（shape 不符 / 网络异常）。挂到返回值上给 DOM 层
+  // 的 `err:` 字段看，否则日志里只有 `nullN` 没有原因。
+  let batchErr = '';
   const run = async (g) => {
     const chunk = g.map((i) => texts[i]);
+    // 逐条兜底（cache 优先 → 单条重发 → 可选 LibreTranslate）。
+    // 抽成函数是因为有**两个入口**，两条必须走同一份实现，否则口径又漂：
+    //   ① 取结果失败（返回不是 JSON 数组 / 条数不符 / 网络异常）—— 唯一的实际入口
+    //   ② 正常处理段抛了非 CTX_OVER 的异常后落下来（罕见）
+    // （早先这里还写过「②单条 shape 失败（拆不动了）」—— 那是拆半递归重试时代的话，
+    //   拆半已删，见下面取结果那段注释。）
+    const fallbackOne = async () => {
+      for (let k = 0; k < chunk.length; k++) {
+        const t = chunk[k];
+        let r = cache[t];
+        if (!r) {
+          try {
+            const single = await llmTranslate(cfg, [t], mode);
+            r = single[0];
+          } catch (e) {
+            // 公共 LibreTranslate 是隐私暗通道（文本逐条发往第三方服务器）：
+            // 出厂配置不再预置 fallbackLibre / libreEndpoints，只有用户**显式**打开
+            // 开关**并且**自己配了端点才启用（README 有说明）。单有条件都不触发。
+            if (cfg.fallbackLibre === true && Array.isArray(cfg.libreEndpoints) && cfg.libreEndpoints.length > 0) {
+              r = await libreTranslate(cfg, t);
+            }
+          }
+        }
+        res[g[k]] = r || null;
+        await delay(cfg.requestDelayMs || 150);
+      }
+    };
+    // 取结果失败（返回不是 JSON 数组 / 条数不符 / 网络异常）→ **逐条兜底重发**，不整批认输。
+    // ⛔ 2026-11-06 这里曾经写过「拆半递归重试」，**已删除——改错地方了**：
+    //   DOM 层走的是 translateConcurrently（index.js 同时注入了两个，DOM 层优先用并发版），
+    //   translateBatch 只服务「预检探针」「探活」「并发版缺失时的 fallback」——全是 1 条调用，
+    //   chunk.length===1，拆半分支**永远不会触发**，是纯死代码。
+    //   真机实测（measure-real-dom-full.cjs，714 条真素材，concurrency=2/batchSize=20/budget=1200）：
+    //   组级 shape 失败 1/15 批（6.7%），全部被下面 fallbackOne 的逐条重发救回，最终 null 0 条。
+    //   → 真机需要的兜底本来就有，不用新加机制。
+    let out;
     try {
-      const out = await llmTranslate(cfg, chunk, mode);
-      if (out && out._rejects) for (const r of out._rejects) rejects.add(r);
+      out = await llmTranslate(cfg, chunk, mode);
       if (!out || out.length !== chunk.length) throw new Error('batch shape ' + (out ? out.length : 'null') + '/' + chunk.length);
+    } catch (e) {
+      batchErr = String((e && e.message) || e).slice(0, 120);
+      await fallbackOne();
+      return;
+    }
+    try {
+      if (out && out._rejects) for (const r of out._rejects) rejects.add(r);
       for (let k = 0; k < chunk.length; k++) res[g[k]] = out[k];
       await retryEchoed(cfg, chunk, out, res, g, mode);
       // 模型少返条目（max_tokens 截断后 salvage 的尾巴，或干脆漏译——实测 37 条
@@ -1061,42 +1431,48 @@ async function translateBatch(cfg, cache, texts, mode) {
         } catch (e) { /* 保持 null，上层计失败 */ }
         await delay(cfg.requestDelayMs || 150);
       }
+      // 串行错位守卫（B3）：shape 守卫抓不到「长度对、内容整体位移」。
+      // 放在补 null 之后，重译结果不会被补空循环盖掉。
+      // ★ 判**补完 null 之后的有效结果**（同下标取 res），不要判原始 out：
+      //   实测形态是「模型末位返 null、前一位填的是下一条的译文」，补 null 之后
+      //   才出现相邻重复；判原始 out 会因为末位是 null 而看不见（verify 撞到的
+      //   「命中却没救回」就是这一条，不是重译失败）。
+      // 只给 mod 模式：本 bug 的实测证据全在模组名上，html/ui 的长文本单条重译贵得多，
+      // 误判一次的成本不成比例 → 宁可那边不做（见 S4-T1 硬约束）。
+      const eff = g.map((gi) => res[gi]);
+      const shifted = mode === 'mod' ? findMisaligned(chunk, eff) : [];
+      for (const k of shifted) {
+        try {
+          const one = await llmTranslate(cfg, [chunk[k]], mode);
+          // 照抄原文不算修好：模型对 P1/Mods/BepInEx 这类短名的常见形态就是原样抄回。
+          // 不加这个判据，一条**本来正确的中文译文**会被覆盖成英文原文 —— 那是把好的改坏，
+          // 比不修更糟。口径与 retryEchoed 完全一致。
+          if (one && one[0] != null && one[0] !== chunk[k]) res[g[k]] = one[0];
+        } catch (e) { /* 保持原译文，交给上层计失败 */ }
+        await delay(cfg.requestDelayMs || 150);
+      }
       return;
     } catch (e) {
       // 上下文超限：劈半重发（模组简介动辄上千字符，整批塞进去会直接被服务端拒）
       if (e && e.code === 'CTX_OVER' && g.length > 1) {
         const half = Math.ceil(g.length / 2);
-        await run(g.slice(0, half));
-        await run(g.slice(half));
+        // 与上面同一个理由：两半各自吞异常，不许把另一半和整次调用一起拖下水
+        try { await run(g.slice(0, half)); } catch (e1) { batchErr = String((e1 && e1.message) || e1).slice(0, 120); }
+        try { await run(g.slice(half)); } catch (e2) { batchErr = String((e2 && e2.message) || e2).slice(0, 120); }
         return;
       }
     }
-    for (let k = 0; k < chunk.length; k++) {
-      const t = chunk[k];
-      let r = cache[t];
-      if (!r) {
-        try {
-          const single = await llmTranslate(cfg, [t], mode);
-          r = single[0];
-        } catch (e) {
-          // 公共 LibreTranslate 是隐私暗通道（文本逐条发往第三方服务器）：
-        // 出厂配置不再预置 fallbackLibre / libreEndpoints，只有用户**显式**打开
-        // 开关**并且**自己配了端点才启用（README 有说明）。单有条件都不触发。
-        if (cfg.fallbackLibre === true && Array.isArray(cfg.libreEndpoints) && cfg.libreEndpoints.length > 0) {
-          r = await libreTranslate(cfg, t);
-        }
-        }
-      }
-      res[g[k]] = r || null;
-      await delay(cfg.requestDelayMs || 150);
-    }
+    await fallbackOne();
   };
   for (const g of groups) await run(g);
   try { res._rejects = rejects; } catch (e) { /* ignore */ }
+  // 失败原因带给调用方（DOM 层日志的 `err:` 读的就是这个字段）。
+  // 以前 translateBatch 从不设 __err，DOM 日志里只有 nullN 没有原因。
+  try { res.__err = batchErr; } catch (e) { /* ignore */ }
   return res;
 }
 
-async function translateConcurrently(cfg, cache, texts, concurrency, onProgress, mode, onItem, onGroup) {
+async function translateConcurrently(cfg, cache, texts, concurrency, onProgress, mode, onItem, onGroup, splitKey) {
   const rejects = new Set();
   const lanes = Math.max(1, Math.min(10, concurrency || 5));
   // 按字符预算切块（不再固定每批 20 条）：20 条长文一批输出会爆 max_tokens 被截断，
@@ -1107,7 +1483,7 @@ async function translateConcurrently(cfg, cache, texts, concurrency, onProgress,
   // 设置页那一项写的是 batchSize，这里以前只读 batchMaxItems（这个键 UI 里根本不存在），
   // 所以「每批送翻条数」改成 20 也没有任何效果，恒定 8 条。
   const maxItems = Math.max(1, Math.min(12, cfg.batchMaxItems || cfg.batchSize || 8));
-  const groups = splitIndexed(texts, budget, lanes, maxItems);
+  const groups = splitIndexed(texts, budget, lanes, maxItems, splitKey);
   if (groups.length === 0) return [];
 
   const results = new Array(texts.length).fill(null);
@@ -1135,6 +1511,22 @@ async function translateConcurrently(cfg, cache, texts, concurrency, onProgress,
           const one = await llmTranslate(cfg, [chunk[k]], mode);
           if (one && one[0] != null) results[g[k]] = one[0];
           else lastErr = 'empty single';
+        } catch (e) { lastErr = String((e && e.message) || e).slice(0, 140); }
+        await delay(cfg.requestDelayMs || 150);
+      }
+      // 串行错位守卫（B3）：只差标点的两条名字会让模型少给一条译文再重复最后一条，
+      // 长度刚好对上（shape 守卫看不见），后面整体位移。命中的条目单条重译并覆盖。
+      // 放在补 null 之后，判**补完 null 的有效结果**（理由见 translateBatch 同处注释：
+      // 实测是「末位 null + 前一位填了下一条译文」，判原始 out 会漏）。
+      // 只给 mod 模式（同 translateBatch）。
+      const eff = g.map((gi) => results[gi]);
+      const shifted = mode === 'mod' ? findMisaligned(chunk, eff) : [];
+      for (const k of shifted) {
+        try {
+          const one = await llmTranslate(cfg, [chunk[k]], mode);
+          // 同 translateBatch：照抄原文不算修好（短名常态），否则会把一条正确的中文
+          // 覆盖成英文原文。retried 只记真正被换掉的条数，照抄不计。
+          if (one && one[0] != null && one[0] !== chunk[k]) { results[g[k]] = one[0]; retried++; }
         } catch (e) { lastErr = String((e && e.message) || e).slice(0, 140); }
         await delay(cfg.requestDelayMs || 150);
       }
@@ -1183,6 +1575,8 @@ async function translateConcurrently(cfg, cache, texts, concurrency, onProgress,
   for (let i = 0; i < Math.min(lanes, groups.length); i++) workers.push(worker());
   await Promise.all(workers);
   try { results.__err = lastErr; } catch (e) { /* ignore */ }
+  // retried 只记「真被换掉」的条数（照抄不计）。挂出来给验收方核对口径用。
+  try { results.__retried = retried; } catch (e) { /* ignore */ }
   try { results._rejects = rejects; } catch (e) { /* ignore */ }
   return results;
 }
@@ -1205,6 +1599,9 @@ module.exports = {
   _ctxCache: () => ctxCache,
   llmTranslate,
   libreTranslate,
+  findMisaligned,
+  findRepeatPadding,
+  sfwInverted,
   translateBatch,
   translateConcurrently,
   protectPaths,

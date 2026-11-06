@@ -4789,7 +4789,7 @@
   "Version: Choose whether the collection will install exactly the version you have yourself or whatever is current on Nexus Mods.": "版本：选择整合包是安装您自己拥有的确切版本，还是 Nexus Mods 上当前的版本。",
   "Version: {{version}}; InstallTime: {{installTime}}; Variant: {{variant}}": "版本：{{version}}; 安装时间： {{installTime}}; 变体： {{variant}}",
   "Very old versions of Vortex will be locked out of network features eventually so please do keep Vortex up-to-date.": "很旧版本的 Vortex 最终将被锁定所有的网络功能，因此请务必使 Vortex 保持最新。",
-  "Veröffentlichungsdatum": "Veröffentlichungsdatum",
+  "Veröffentlichungsdatum": "发布日期",
   "View": "视图",
   "View Advanced Settings": "查看设置",
   "View All Collections": "查看全部整合包",

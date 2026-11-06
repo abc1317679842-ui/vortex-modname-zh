@@ -148,6 +148,20 @@ const WORD_FIXES = {
   Dandelion: '丹德里恩', dandelion: '丹德里恩',
   // 通用模组后缀（高频，模型有时翻「重生」有时照抄 Reborn）
   Reborn: '重生', reborn: '重生',
+  // 《合金装备崛起：复仇》机制名（judge3 v3 序 13/104 实测译「群殴模式」两处同错）。
+  // Bethesda 官方中文页作「斩夺」：「由日语翻译而来的 Zandatsu 技能意为斩切和夺取」。
+  // 驼峰连写（ZandatsuBlade）会遮成『斩夺』Blade —— team-lead 裁定接受：遮词干、留修饰词，
+  // 比整串漏遮好；这是 fuzzy「右边界放行大写」的设计目的，不是误伤。
+  Zandatsu: '斩夺', zandatsu: '斩夺',
+  // shirtless 被模型读成 sleeveless（judge3 v3 序 75 →「无袖衬衫」）。
+  // 词典义为赤膊/赤裸上身；sleeveless 是另一个词，拼写不重叠，不会被这条咬到。
+  Shirtless: '赤膊', shirtless: '赤膊',
+  // 辐射系列变异蟹（judge3 v3 序 82 →「迷雾潜行者」，把 mire/lurk 硬拆成雾+潜行者）。
+  // 官方中文「泥沼蟹」（Fallout 中文 Wiki / 萌娘百科）。**单双两条都列**：整词匹配不做词形
+  // 还原，只列复数会让单数在用户语料里漏遮（本语料 2431 条只有复数，真实库几十万条必然有单数）。
+  // 排序按长度降序，Mirelurks 先遮，Mirelurk 不会二次咬进『泥沼蟹』。
+  Mirelurk: '泥沼蟹', mirelurk: '泥沼蟹',
+  Mirelurks: '泥沼蟹', mirelurks: '泥沼蟹',
   // 版别短语：原 EDITION_PHRASES 唯一条目（审计 ③ 死链拆除后挪到这里走遮蔽通道）。
   // 词级补翻（refineByWords 逐词查表）用不上短语键 —— 残留词拆分后是 ULTRA / Plus
   // 各查各的；短语键只服务 wordFixTerms 的整词遮蔽（fuzzy gi，大小写都能中）。
@@ -160,6 +174,11 @@ let runtimeTerms = null; // 游戏名对照表（运行时，绝不写回 config
 let domStarted = false;  // DOM 层是否已启动（它是一次性注入的，启停不对称）
 let startDomRef = null;  // 由 main() 赋值的启动函数，供设置页「打开实时翻译」时补启
 let domKickRef = null;   // DOM 层的 kick：手动翻译时立刻解除「模型挂机暂停」，不等 2 分钟探活
+// pruneDomCacheNames 的有界重试计数（启动竞态下状态树还没就绪时用）。
+// 必须在这里声明：以前只写了 `domCachePruneTries++` / `= 0`（非严格模式下那是隐式全局），
+// 于是「第一次就读」的启动竞态路径抛 ReferenceError，被 startDomRef 的 catch 吞成一条 warn，
+// 5 秒重试一次都不排 —— domCache 里的模组名条目活到下次重启，D1 双写者复发。
+let domCachePruneTries = 0;
 
 /** 手动动作叫醒 DOM 层（0.16.5 补）。用户点了按钮却要等最长 120 秒才开始翻界面文本，
  *  就是缺这一下：探活是自动路径的兜底节奏，不能拿来当手动操作的响应时间。 */
@@ -168,7 +187,17 @@ function kickDomLayer(reason) {
   try { domKickRef(reason); } catch (e) { log('warn', 'kick dom fail', String(e)); }
 }
 // DOM 层写入的实时翻译状态，设置页「实时队列」面板直接读它（每秒刷新）
-const liveStatus = { inflight: [], recent: [], queued: 0, ok: 0, fail: 0, hits: 0, lanes: 0, per: 0, modelDown: false, lastBatchAt: 0, lastDoneAt: 0, groups: 0 };
+// batch：批量路径（「清空缓存并全部重翻」「翻译选中」等按钮）自己的进度。
+// 单独放一个子对象是必须的：DOM 层和批量路径可能同时在跑，共用一个 inflight/queued
+// 会互相覆盖 —— 面板上的数字就会来回跳，两边都看不清。（F-61）
+const liveStatus = {
+  inflight: [], recent: [], queued: 0, ok: 0, fail: 0, hits: 0, lanes: 0, per: 0,
+  modelDown: false, lastBatchAt: 0, lastDoneAt: 0, groups: 0,
+  batch: {
+    inflight: [], recent: [], queued: 0, ok: 0, fail: 0, hits: 0, groups: 0,
+    lanes: 0, per: 0, total: 0, running: false, startedAt: 0, doneAt: 0, gen: 0,
+  },
+};
 
 function resetLiveStatus() {
   liveStatus.inflight = [];
@@ -181,10 +210,49 @@ function resetLiveStatus() {
   liveStatus.lastBatchAt = 0;
   liveStatus.lastDoneAt = 0;
   liveStatus.groups = 0;
+  // 就地改字段，不能换成新对象：批量钩子手里攥的是这个引用
+  const B = liveStatus.batch;
+  if (B) {
+    B.inflight = [];
+    B.recent = [];
+    B.queued = 0;
+    B.ok = 0;
+    B.fail = 0;
+    B.hits = 0;
+    B.groups = 0;
+    B.lanes = 0;
+    B.per = 0;
+    B.total = 0;
+    B.running = false;
+    B.startedAt = 0;
+    B.doneAt = 0;
+  }
 }
 let running = false;
 
 let logBytes = -1;
+// 数据目录还没定的那几十行（main() 开头）产生的东西先攒着，别直接写进扩展目录：
+// 扩展目录在升级时被整个覆盖，「react missing / vortex-api missing / data dir setup」
+// 这三条恰恰是用户求助时最需要看的根因，写在那儿等于写进废纸篓。
+let earlyLogBuf = [];
+function earlyLog(level, msg, meta) {
+  try {
+    earlyLogBuf.push(`${new Date().toISOString()} [${level}] ${msg} ${meta === undefined ? '' : JSON.stringify(meta)}\n`);
+    if (earlyLogBuf.length > 200) earlyLogBuf.splice(0, earlyLogBuf.length - 200);
+  } catch (e) { /* ignore */ }
+}
+/** 把攒下的早期日志补写进当前 LOG_PATH（数据目录成功 → 那份；失败 → 扩展目录兜底）。
+ *  这里刻意不走 log()：log 在沙箱里被整套抽取测试（不能引新的模块级变量），
+ *  而早期日志的路径决策只属于 main() 开头这一段。 */
+function flushEarlyLog() {
+  if (!earlyLogBuf.length) return;
+  const body = earlyLogBuf.join('');
+  earlyLogBuf = [];
+  try {
+    fs.appendFileSync(LOG_PATH, body, 'utf8');
+    logBytes = -1;   // 让下一次 log 重新 stat 体积
+  } catch (e) { /* 连兜底位置都写不了就只能放弃 */ }
+}
 function log(level, msg, meta) {
   try {
     const line = `${new Date().toISOString()} [${level}] ${msg} ${meta === undefined ? '' : JSON.stringify(meta)}\n`;
@@ -839,7 +907,20 @@ function modNameOk(raw, out) {
   // R3 只在两参模式生效：单参自判时 src 就是 zh，「原文照抄 + ≤2 汉字凑数」退化成
   // 「≤2 汉字就拒」，会把 `样例42` 这种合法短译名误杀（probe 组 6 实录）——
   // 单参模式下真有照抄残留由下面的残留规则管（Remastered版 / Gwent卡牌12 都拦得住）。
-  if (!single && aSrc && aZh.length >= aSrc.length * 0.9 && cjkN <= 2) return false; // R3
+  if (!single && aSrc && aZh.length >= aSrc.length * 0.9 && cjkN <= 2) {
+    // 例外（2026-11-06）：原文剥掉版本号/数字后**只剩 ≤1 个可翻词** → 它本来就没有
+    // 该翻的实词，「原文 + 模组/版本」是唯一可能的正确输出，不是蒙混凑数。
+    // 真机：kaya1.0.1 → kaya1.0.1模组 被 R3 判拒 → 每次启动重试 → 记满 3 次封杀 7 天，
+    // 用户症状「这条怎么都不翻、点几次都没反应」。放行它，界面至少可读。
+    // **仍然收紧**：可翻词 ≥2 时照旧拒。
+    //   ⚠ 如实记：这条守卫**平时很少触发**。R3 的 0.9 长度比要求「输出几乎照抄原文
+    //   ASCII」，真翻过一遍比例就掉下去了，够不到这里。`Gwent卡牌12` 那种是**单参模式**
+    //   下的残留词守卫（下面 `if (single)` 那段）在拦。留这条只是双保险，别当主力判据。
+    //   （实证：`modNameOk('Gwent Card 12','Gwent卡牌12')` 现在返回 true，改前也返回 true。）
+    // 为什么不在 nothingToTranslate 那边跳过：那条路要用「不在词库」判专名，实测语料
+    // 会误跳 107 条真词（SmartHunter/InstaGather/FasterWorkers…），已在 where 注释里作废。
+    if (residueWords(src.replace(/_+/g, ' ')).length > 1) return false;
+  }
   const runs = zh.match(/[A-Za-z][A-Za-z0-9._]{11,}/g) || [];
   if (runs.some((r) => src.indexOf(r) !== -1)) return false; // R4
   // 单参自判的补充规则：残留英文词里有「真词」（≥4 字母）就不算翻好。
@@ -850,6 +931,14 @@ function modNameOk(raw, out) {
   if (single) {
     for (const w of residueWords(zh)) if (w.length >= 4) return false;
   }
+  // R5：译文尾巴混进压缩包后缀就拒收。
+  // 真机 2026-11-06：`VAXIS Blood Physics v1.5` 被译成 `VAXIS血迹物理效果v1.5.zip`，
+  // 原文根本没有这个后缀 —— 模型把文件名尾巴一起翻进去了。这类值一旦进缓存，
+  // 界面就永远显示成「…v1.5.zip」，而且它还是 nameFail 里 `dl:VAXIS血迹物理效果v1.5.zipv1.4`
+  // 那个怪键的来源（键本身是干净的，脏的是值）。
+  // 只判「原文没有、译文才有」：原文真是 `xxx.zip` 时照常放行。
+  const extTail = /\.(zip|7z|rar)$/i;
+  if (extTail.test(zh) && !extTail.test(src)) return false;
   return true;
 }
 
@@ -1230,7 +1319,19 @@ function canonicalName(text) {
   const at = s.search(/\d\d\d\d-\d\d-\d\dT\d\d[-:]\d\d/);
   if (at > 0) {
     const seg = s.slice(0, at).trim().split(' ').filter(Boolean);
+    // 日期戳前是「名字 + fileId + 版本」→ 剥 2 段。但**下载行常见形态没有 fileId**：
+    //   `<名字> <版本> <日期T时-分Z> <hash>.zip`  ← 只有 2 段
+    // 旧条件 `>= 3` 会直接跳过，于是日期戳和 hash 全留在规范键里 → 键永远查不到缓存
+    // （真机 2026-11-06：`ModjiggleRR中等级别 1 2026-10-06T14-20Z 6VaC3PeVm.7z` 一直显示
+    //   半中半英；`CWSO 1.4.5（亚洲语言版）1.4.5 2026-…` 同理）。
+    // 改成：2 段剥 1 段（版本），≥3 段仍剥 2 段（fileId + 版本）。
+    // 只有**带日期戳**才会走到这里，所以 `Enemy Scaling Offset 1.2.0` 这类真名字不受影响。
+    // 2 段分支必须确认第 2 段「长得像版本号」才剥：
+    //   `ModjiggleRR中等级别 1` → 第 2 段 `1` → 剥，键 `Modjiggle RR中等级别` ✅
+    //   `CWSO 1.4.5（亚洲语言版）1.4.5` → 第 2 段带中文括号 → **不剥**，
+    //   否则整段被吞掉只剩 `CWSO`（已验证过的副作用）。
     if (seg.length >= 3) s = seg.slice(0, seg.length - 2).join(' ');
+    else if (seg.length === 2 && /^[vV]?\d+(\.\d+)*[a-z]?$/i.test(seg[1])) s = seg[0];
   }
   // 下划线是文件名的分词符，不是名字的一部分
   s = s.replace(/_+/g, ' ');
@@ -1844,20 +1945,52 @@ function flushCfgWrite() {
 // 以前 100% 发不出去（日志里 6 次启动全是 locale pack built → notify fail）。
 // 现在遇到这个错就先存着，等 api 可用（首个 tick / 设置页打开）再发。
 let pendingNotice = null;
+let noticeFlushTimer = null;
+let noticeRetry = 0;
+/** 补发排队中的通知（1.5 秒一次，最多 6 次）。
+ *  非 init 类的 sendNotification 异常（api 有了但方法还没挂上、宿主偶发抛错）以前直接丢，
+ *  「界面语言包已更新」「模组名重翻完成」这类一次性提示就永久消失、也没有任何重试。
+ *  现在统一入队重试，仍失败就在日志里留一条 dropped（有界，不刷屏、不死循环）。 */
+function scheduleNoticeFlush() {
+  if (noticeFlushTimer || !pendingNotice) return;
+  if (noticeRetry >= 6) {
+    log('warn', 'notify dropped after retries', { id: (pendingNotice && pendingNotice.id) || '' });
+    pendingNotice = null;
+    noticeRetry = 0;
+    return;
+  }
+  noticeRetry++;
+  try {
+    noticeFlushTimer = setTimeout(() => {
+      noticeFlushTimer = null;
+      flushPendingNotice();
+    }, 1500);
+    if (noticeFlushTimer && noticeFlushTimer.unref) noticeFlushTimer.unref();
+  } catch (e) { /* 定时器都起不来就算了，保持原行为 */ }
+}
 function notify(payload) {
   try { contextRef.api.sendNotification(payload); }
   catch (e) {
     const msg = String(e);
     if (/uses api in init/i.test(msg)) { pendingNotice = payload; log('info', 'notify deferred (init phase)'); return; }
-    log('warn', 'notify fail', msg);
+    pendingNotice = payload;
+    log('warn', 'notify fail (queued)', msg);
+    scheduleNoticeFlush();
   }
 }
 function flushPendingNotice() {
   if (!pendingNotice) return;
   const p = pendingNotice;
   pendingNotice = null;
-  try { contextRef.api.sendNotification(p); log('info', 'deferred notify sent'); }
-  catch (e) { pendingNotice = p; log('warn', 'deferred notify fail', String(e)); }
+  try {
+    contextRef.api.sendNotification(p);
+    noticeRetry = 0;
+    log('info', 'deferred notify sent');
+  } catch (e) {
+    pendingNotice = p;
+    log('warn', 'deferred notify fail', String(e));
+    scheduleNoticeFlush();
+  }
 }
 
 // ─── 通知三档（0.16.5，规则从 renderer.js 里读出来的，不是猜的）──────────────
@@ -2392,6 +2525,91 @@ function makeProgressNotifier(nid, total) {
     notify({ id: nid, type: 'info', displayMS: 6000, title: '翻译进度', message: `${done}/${total}` });
   };
 }
+/** 批量路径写「实时队列」面板用的钩子（F-61）。
+ *  症状：点「清空缓存并全部重翻」→ 铃铛弹「正在翻译 300 条」→ 面板一片空白。
+ *  原因：面板唯一的实时数据源 liveStatus 只有 DOM 层在写，translateConcurrently 的
+ *  onItem / onGroup 一直支持，只是 index.js 的四个调用点都没传。
+ *  这里把三者打包，写进 liveStatus.batch（不碰 DOM 层的 inflight/queued）。
+ *  onProgress 的通知节流原样复用 makeProgressNotifier：<40 条仍然一条都不弹。
+ *  ── 单批次语义（verify 实测确认）──
+ *  translate / 全部重翻 / 翻译选中 三处入口都有 `if (running) return` 守卫，同一时刻
+ *  只有一个批次在写面板；所以 queued/ok/recent 不聚合多批（聚合了反而分不清是谁的）。
+ *  gen 只为「将来有人放开入口守卫」兜底：二次进入时新批次接管面板，旧批次迟到的回调
+ *  不许再改 running/total，免得先收尾的那批把还在跑的这批显示成空闲 —— 当前进不到这条分支。
+ *  gen 不随 resetLiveStatus 推进：重置只发生在批量开始之前（清缓存 → 立刻重翻），
+ *  那一刻没有批次在飞，所以不需要靠 gen 去作废旧钩子。
+ *
+ *  ── idx 顺序（S1 之后）──
+ *  批量模式下 onItem/onGroup 的 idx 顺序按 gameId 分组排，与 pending 顺序不同。
+ *  这是 S1 的**设计后果**：面板只做集合运算（B.inflight.filter(it => !gone.has(it.idx))），
+ *  不依赖顺序。**不要**为了「观感一致」再加一层排序 —— 多一层排序就多一处判据，
+ *  今天已经有一次「交错等价」判据写错（把 key 轮转重分配当成只改顺序，得 414 vs 387 假红）。 */
+function makeLiveHooks(nid, total, texts, lanes) {
+  const B = liveStatus.batch || (liveStatus.batch = {
+    inflight: [], recent: [], queued: 0, ok: 0, fail: 0, hits: 0, groups: 0,
+    lanes: 0, per: 0, total: 0, running: false, startedAt: 0, doneAt: 0, gen: 0,
+  });
+  const arr = Array.isArray(texts) ? texts : [];
+  const n = Math.max(0, Number(total) || 0);
+  const gen = (B.gen || 0) + 1;      // 接管面板（正常路径只有一批，见函数头注释）
+  B.gen = gen;
+  B.running = true;
+  B.startedAt = Date.now();
+  B.doneAt = 0;
+  B.total = n;
+  B.queued = n;
+  B.ok = 0;
+  B.fail = 0;
+  B.groups = 0;
+  B.lanes = Math.max(0, Number(lanes) || 0);
+  B.inflight = [];
+  B.recent = [];
+  const live = () => B.gen === gen;
+  const notifyProgress = nid ? makeProgressNotifier(nid, n) : () => {};
+  const finish = () => {
+    if (!live() || !B.running) return;
+    B.running = false;
+    B.doneAt = Date.now();
+    B.queued = 0;
+  };
+  return {
+    /** done/total 由 core 回调给出；ok 只在这里维护（onItem 不写，免得两边抢同一格跳变） */
+    onProgress(done, tot) {
+      try { notifyProgress(done); } catch (e) { /* 通知失败不影响翻译 */ }
+      if (!live()) return;
+      const d = Math.max(0, Number(done) || 0);
+      const t = Math.max(n, Number(tot) || 0);   // 单条重试那处初值传 1，真实总数以回调为准
+      if (t > 0) B.total = t;
+      B.ok = Math.min(d, B.total || d);
+      B.queued = Math.max(0, (B.total || 0) - d);
+      if (B.total > 0 && d >= B.total) finish();
+    },
+    /** 一条译文回来：只进「最近完成」，失败数在这里记；ok 交给 onProgress */
+    onItem(idx, raw, zh) {
+      if (!live()) return;
+      const ok = !!zh;
+      if (!ok) B.fail = (B.fail || 0) + 1;
+      B.recent.unshift({ text: String(raw == null ? '' : raw), zh: ok ? String(zh) : '', ok, ms: 0 });
+      if (B.recent.length > 20) B.recent.length = 20;
+    },
+    /** 一组真的发出去了 / 回来了 —— 「在飞」只算真在飞的，不把整批算成在翻 */
+    onGroup(ev) {
+      if (!live() || !ev) return;
+      const idxs = Array.isArray(ev.idxs) ? ev.idxs : [];
+      if (ev.type === 'start') {
+        B.groups = (B.groups || 0) + 1;
+        for (const i of idxs) B.inflight.unshift({ idx: i, text: String(arr[i] == null ? '' : arr[i]), start: Date.now() });
+        if (B.inflight.length > 24) B.inflight.length = 24;
+      } else if (ev.type === 'end') {
+        B.groups = Math.max(0, (B.groups || 0) - 1);   // 上下文超限劈半时 end 会来两次，别减成负数
+        const gone = new Set(idxs);
+        B.inflight = B.inflight.filter((it) => !gone.has(it.idx));
+      }
+    },
+    /** 收尾兜底：正常路径 onProgress 到 100% 就关了，这里防 core 抛错时 running 永远挂着 */
+    end() { finish(); },
+  };
+}
 /** 译文被拒的具体原因（只给用户看的一句话）。
  *  合格与否仍由 modNameOk 独家判定，这里只是把「被拒」再分个类，不改判据。 */
 function whyRejected(raw, zh) {
@@ -2408,6 +2626,15 @@ function applyTranslation(item, zh) {
   if (!zh) return false;
   // let：下面同族统一要把结果写回 clean（const 会抛 TypeError 中断整批 —— dlname 组 4 实录）
   let clean = String(zh).replace(/^["'\s]+|["'\s]+$/g, '');
+  // 模型偶尔把文件名尾巴（`.zip/.7z/.rar`）一起打进译文。原文自带该后缀才保留；
+  // 否则切掉 —— **切完合格的就该算翻好了，不该拒收**。
+  // 真机：`VAXIS Blood Physics v1.5` → `VAXIS血迹物理效果v1.5.zip`；语料 19448 对真译文里
+  // 命中 1 对（`gpsmod-v0.3.0.zip-…` → `GPS模组 v0.3.0.zip`，剥掉就合格）。
+  // 拒收的代价是记一次失败，试满 3 次封杀 7 天 → 用户看到「这条永远英文」，白丢一个正确译文。
+  // 与 applyDownloadTranslation 同一行逻辑（两处刻意镜像，判据仍在 modNameOk 的 R5 唯一）。
+  if (/\.(zip|7z|rar)$/i.test(clean) && !/\.(zip|7z|rar)$/i.test(String(item.raw || '').trim())) {
+    clean = clean.replace(/(\.(zip|7z|rar))+$/i, '').trim();
+  }
   lastApplyFail = 'blank';
   if (!clean) return false;
   // 译文=原文 分两种，以前混为一谈（2026-10-29 真机：右键「取消保留英文」后
@@ -2461,6 +2688,10 @@ function applyDownloadTranslation(item, zh) {
   if (!zh) return false;
   // let：同族统一写回（与 applyTranslation 同一个坑）
   let clean = String(zh).replace(/^["'\s]+|["'\s]+$/g, '');
+  // 同上（applyTranslation）：原文没有的压缩包后缀直接切掉，别拿它当拒收理由
+  if (/\.(zip|7z|rar)$/i.test(clean) && !/\.(zip|7z|rar)$/i.test(String(item.raw || '').trim())) {
+    clean = clean.replace(/(\.(zip|7z|rar))+$/i, '').trim();
+  }
   lastApplyFail = 'blank';
   if (!clean) return false;
   // 译文=原文 = 无需翻译：不写 Vortex 状态，只标记缓存（同 applyTranslation）
@@ -2650,11 +2881,20 @@ async function translate(list, opts) {
     });
 
     const texts = pending.map((p) => p.raw);
+    // S1：按 gameId 分车（下载行没有 gameId → 落空串桶）。索引仍是 texts 的下标，面板不需要 offset。
+    const splitKey = pending.map((p) => (p && p.gameId) || "");
+    const h = makeLiveHooks(nid, pending.length, texts, lanes);
     // 显式 mode='mod'（审计 v10 发现 1）：模组名批必须走全遮蔽，不能让 isUiBatch
     // 按批长度猜——批均 >24 字符的真实长名会被误判 ui，modOnly 词条（Oils→剑油/
     // Reborn→重生）不遮蔽，产出缺固定译名的「合格译文」→ 对账全量词表判漂移 →
     // 删键重翻 → 再缺 → 循环。遮蔽是硬保证，提示词对照只是模型自觉。
-    const results = await core.translateConcurrently(cfg, cache, texts, lanes, makeProgressNotifier(nid, pending.length), 'mod');
+    // try/finally：core 若改为抛错（当前三种失败都返回 null + __err，不抛），面板也不能永远停在「批量翻译中」
+    let results;
+    try {
+      results = await core.translateConcurrently(cfg, cache, texts, lanes, h.onProgress, 'mod', h.onItem, h.onGroup, splitKey);
+    } finally {
+      h.end();
+    }
     const why = {};
     for (let k = 0; k < pending.length; k++) {
       if (applyTranslation(pending[k], results[k])) applied++;
@@ -2837,6 +3077,12 @@ function scanUntranslated(limit) {
 function nothingToTranslate(name) {
   const s = String(name == null ? '' : name);
   if (!s || CJK.test(s)) return false;   // 已含中文的不归它管（交给 needsTranslate）
+  // ⛔ 2026-11-06 撤销过一版「专名+版本号 → 判为无需翻译」的规则。它拿「不在词库」当
+  // 「专名」的判据，而词库只有 39+759 条 —— 实测语料 2206 条里**新增误跳 107 条（4.9%）**，
+  // 全是该翻的真词：SmartHunter / InstaGather / FasterWorkers / ExpandedParks / DevMode /
+  // EnemyMoveset / BellumCivile…「不在词库」不等于「不可翻」，这条判据从根上就站不住。
+  // 正确解法在验收侧（见 rejectName）：原文可翻词 ≤1 时放行「原文 + 中文后缀」，
+  // 让 kaya1.0.1 → kaya1.0.1模组 能落地，同时 SmartHunter 照样照翻。
   return residueWords(s.replace(/_+/g, ' ')).length === 0;
 }
 
@@ -2930,7 +3176,7 @@ function isGivenUp(key) {
   const ck = cacheKeyOf(k);
   return !!ck && ck !== k && live(ck);
 }
-function bumpNameFail(key, model) {
+function bumpNameFail(key, model, name) {
   const k = String(key == null ? '' : key);
   // 空键不记账：`cacheKeyOf` 拒绝中文后可能返回 `''`，若调用方没判空就写出
   // `nameFail['']` —— 又造一个所有条目共用的桶。与 `clearNameFail` 的判空对齐。
@@ -2939,6 +3185,9 @@ function bumpNameFail(key, model) {
   e.n = (e.n || 0) + 1;
   e.ts = Date.now();
   if (model) e.model = String(model);
+  // 附带名字只为**排查用**：新键是 modId / dlId（稳定但不可读），没这行就没人知道
+  // `sh:0f3a-...` 是哪条模组翻不了。它不参与任何判据，长度截断防脏串膨胀。
+  if (name) e.name = String(name).slice(0, 120);
   nameFail[k] = e;
   saveJson(NAME_FAIL_PATH, nameFail, 'nameFail bump');
   return e.n;
@@ -3208,7 +3457,15 @@ async function translateAllFresh(want, dlIds, opts) {
       notify({ id: nid, type: 'info', displayMS: 6000, title: '开始重翻模组名', message: `${batch.length} 条` });
       const lanes = Math.max(1, Math.min(10, cfg.concurrency || 5));
       const texts = batch.map((p) => p.raw);
-      const results = await core.translateConcurrently(cfg, cache, texts, lanes, makeProgressNotifier(nid, batch.length), 'mod');
+      // S1：同车只放同一个游戏的条目（下载行 gameId 为空 → 空串桶）
+      const splitKey = batch.map((p) => (p && p.gameId) || "");
+      const h = makeLiveHooks(nid, batch.length, texts, lanes);
+      let results;
+      try {
+        results = await core.translateConcurrently(cfg, cache, texts, lanes, h.onProgress, 'mod', h.onItem, h.onGroup, splitKey);
+      } finally {
+        h.end();
+      }
       let applied = dlApplied;
       let failed = 0;
       const retry = [];
@@ -3232,7 +3489,17 @@ async function translateAllFresh(want, dlIds, opts) {
       // 只在「部分失败」时做：全失败说明模型/接口有问题，重试只是白等。
       if (retry.length > 0 && retry.length < batch.length && retry.length <= 10) {
         notify({ id: nid, type: 'info', displayMS: 6000, title: '单独重试', message: `${retry.length} 条没过验收，再试一次` });
-        const once = await core.translateConcurrently(cfg, cache, retry.map((p) => p.raw), 1, null, 'mod');
+        // 单条重试也进面板（total 先给 1，真实总数由 core 的 onProgress 回调补齐）；
+        // nid 传 null：这条路径以前完全静默，不该因为面板多弹一串进度条。
+        const rTexts = retry.map((p) => p.raw);
+        const rKey = retry.map((p) => (p && p.gameId) || "");
+        const hr = makeLiveHooks(null, 1, rTexts, 1);
+        let once;
+        try {
+          once = await core.translateConcurrently(cfg, cache, rTexts, 1, hr.onProgress, 'mod', hr.onItem, hr.onGroup, rKey);
+        } finally {
+          hr.end();
+        }
         for (let k = 0; k < retry.length; k++) {
           const item = retry[k];
           const okOne = item.dlId ? applyDownloadTranslation(item, once[k]) : applyTranslation(item, once[k]);
@@ -3243,8 +3510,11 @@ async function translateAllFresh(want, dlIds, opts) {
           }   // 重试救回来的算成功，不再计入失败数
         }
       }
-      saveJson(CACHE_PATH, cache, 'retranslate fresh');
-      log('info', 'fresh translate done', { applied, failed, skipped, retried: retry.length, why });
+      // ★ 写盘结果必须被接住：saveJson 失败时只写一条 warn，返回值以前没人接，
+      //   于是磁盘满 / 无权限 / 目标被锁（三重兜底全废）时照样报「N 条成功」，
+      //   用户重启后发现译文全丢，日志里也没有任何面向用户的说明。
+      const persisted = saveJson(CACHE_PATH, cache, 'retranslate fresh');
+      log('info', 'fresh translate done', { applied, failed, skipped, retried: retry.length, why, persisted });
       if (failed > 0) {
         const whole = failed >= batch.length;
         notifyAnomaly({
@@ -3255,6 +3525,13 @@ async function translateAllFresh(want, dlIds, opts) {
             ? `${failed} 条全部失败` + failCauseText(why) + hintShort()
             : `${applied} 条成功，${failed} 条失败` + failCauseText(why) + (givenUp ? `，${givenUp} 条已暂停` : ''),
         });
+      } else if (!persisted) {
+        // 翻成功了但没落盘：这是「数据会丢」级别的事，必须永久卡片说清楚，
+        // 不能混在「N 条成功」里（那种提示等于骗人）。
+        notifySticky({
+          id: nid, type: 'error', title: '模组名重翻完成，但译文没存进磁盘',
+          message: `${applied} 条译文只在内存里，重启 Vortex 就会丢。检查磁盘空间、目录写权限或杀软/同步盘占用后，再点一次「一键汉化模组名」。`,
+        });
       } else {
         clearAnomaly();
         notify({
@@ -3262,13 +3539,16 @@ async function translateAllFresh(want, dlIds, opts) {
           message: `${applied} 条成功` + (givenUp ? `，${givenUp} 条已暂停` : ''),
         });
       }
-      return { applied, failed, skipped };
+      return { applied, failed, skipped, persisted };
     };
     // 「一键全部」（未指名）也要扫下载记录：通用批量翻译只认模组条目，
     // 下载行必须由 healStaleDownloadNames 补扫，否则点一次「全部」就漏掉整页下载行。
-    if (!want) return translate(full).then((r) => healStaleDownloadNames(state)
+    // ★ 必须 await：`return translate(full)` 只求值出 promise 就立刻进 finally，
+    //   running 在 gateModel 刚发出时就被清成 false，锁形同不存在 —— 300ms 内点两次
+    //   会并发跑两轮完整管线（两轮 fresh translate / 两轮通知 / 同一 modId 被写两遍）。
+    if (!want) return await translate(full).then((r) => healStaleDownloadNames(state)
       .then((h) => Object.assign({}, r, { dlHealed: h })));
-    return translate(full);
+    return await translate(full);
   } catch (e) {
     log('error', 'translateAllFresh crashed', String((e && e.stack) || e));
     notifyAnomaly({ id: 'modname-zh-crash', type: 'error', title: '重翻出错', message: String(e).slice(0, 50) });
@@ -3357,13 +3637,37 @@ function englishBaseNameOf(mod, modId) {
       const at = t.search(/\d\d\d\d-\d\d-\d\dT[\d:Z.\-]+/i);
       if (at <= 0) return;                      // 日期在开头 → 整条不是名字
       const parts = t.slice(0, at).trim().split(/\s+/).filter(Boolean);
-      if (parts.length < 3) return;             // 名字段 + fileId + 版本，至少 3 段
-      t = parts.slice(0, parts.length - 2).join(' ');
+      // 名字段 + fileId + 版本 = 3 段是最常见的；但**下载行没有 fileId**，
+      // 形态是「名字 + 版本 + 日期 + hash.zip」= 2 段。旧条件 `< 3 → return`
+      // 会让这类整串原样送模型，译出来就是「中文名 + 1.0.6 + 2026-10-07T21-37Z + hash.zip」
+      // （真机 2026-11-06 下载列表一整片都是这个形态）。
+      if (parts.length < 2) return;
+      t = parts.length >= 3 ? parts.slice(0, parts.length - 2).join(' ') : parts[0];
       if (!t || !/[A-Za-z]/.test(t)) return;
       // 净化后 t 被重新赋过值，开头那次剥扩展名已经失效 —— 这里必须再剥一次
       // （`VAXIS_Blood_Physics_v1.4.zip 13506 1.4 2026-…` 切完尾巴正好剩个 .zip）
       t = t.replace(/\.(zip|7z|rar)$/i, '').trim();
       if (!t) return;
+    }
+    // 横线式 modId 尾巴：`名字-2253-1-0-1760098058`（名字-fileId-版本-子版本-epoch）。
+    // 以前这条只在 out.length===0 的兜底分支里剥，属性里本来就有名字时**走不到**——
+    // 真机实证（2026-11-06 剑星）：`bellyband for eve(CNS)-2253-1-0-1760098058` 整串送模型，
+    // 译成「《巫师3》肚带模组（CNS版）」，而同名的短串 `bellyband for eve(CNS)` 译对了。
+    // 同一模组两个形态一对一错，纯粹是数字尾巴让模型分心。
+    // 判据只认「尾部是 10 位以上纯数字（epoch）」：2010 年后的秒级时间戳都是 10 位，
+    // 名字自带的版本号（`Cool-Mod-1.8` 带点、`Mod-2` 只有 1 位）位数不够，不会被误剥。
+    // 实测（2026-11-06，`verify-hyphen-id.cjs` 可复现）：语料 `exp-out/matrix-t02.tsv`
+    // in_V0 去重 2206 条 → 剥 437 条（19.8%），20 条反例零误伤。
+    {
+      const seg = t.split('-');
+      if (seg.length >= 2 && /^\d{10,}$/.test(seg[seg.length - 1].trim())) {
+        let n = seg.length;
+        while (n > 1 && /^\d+$/.test(seg[n - 1].trim())) n--;
+        if (n < seg.length) {
+          const base = seg.slice(0, n).join('-').trim().replace(/\.(zip|7z|rar)$/i, '').trim();
+          if (base && /[A-Za-z]/.test(base)) t = base;
+        }
+      }
     }
     const lw = t.toLowerCase();
     if (seen.has(lw)) return;
@@ -3376,9 +3680,14 @@ function englishBaseNameOf(mod, modId) {
   add(a.name);
   add(a.modName);
   add(stripExt(a.fileName));
-  // 键/id 兜底：先试空格式（时间戳锚定），再试横线式（剥尾部纯数字段）
+  // 键/id 兜底：**只在属性里一个可用英文名都没有**时才走（合集 / 无属性模组）。
+  // 以前无条件跑一遍，属性里有名字的模组也会被多塞一条候选：
+  // 横线式 id（`m-gwent`）剥不出纯数字尾巴 → 整串 id 当英文原名送模型 →
+  // 译文又写回同一条 modId，把刚翻好的正确译文覆盖成「m-昆特牌」。真机那 2 条
+  // dash id 就是这样白烧一次模型、再记一条 nameFail 假失败。UUID 纯 id 直接跳过。
   const key = String((mod && mod.id) || modId || '').trim();
-  if (key) {
+  const isOpaqueId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(key);
+  if (key && out.length === 0 && !isOpaqueId) {
     const parts = key.split(/\s+/);
     let base = '';
     for (let i = parts.length - 1; i >= 0; i--) {
@@ -3554,7 +3863,18 @@ async function translateSelected(instanceIds) {
     }
     notify({ id: 'modname-zh-sel', type: 'info', displayMS: 6000, title: '开始翻译模组名', message: `${pending.length} 条` });
     const lanes = Math.max(1, Math.min(10, cfg.concurrency || 5));
-    const results = await core.translateConcurrently(cfg, cache, pending.map((p) => p.raw), lanes, () => {}, 'mod');
+    const selTexts = pending.map((p) => p.raw);
+    // S1：右键翻译同一批也按 gameId 分车
+    const selKey = pending.map((p) => (p && p.gameId) || "");
+    // nid 传 null：这条路径以前是 () => {}（不报进度），别给右键翻译加一串进度通知，
+    // 只让它往面板里写状态。
+    const h = makeLiveHooks(null, pending.length, selTexts, lanes);
+    let results;
+    try {
+      results = await core.translateConcurrently(cfg, cache, selTexts, lanes, h.onProgress, 'mod', h.onItem, h.onGroup, selKey);
+    } finally {
+      h.end();
+    }
     for (let k = 0; k < pending.length; k++) {
       const item = pending[k];
       const okOne = item.dlId ? applyDownloadTranslation(item, results[k]) : applyTranslation(item, results[k]);
@@ -3602,6 +3922,13 @@ async function healStaleDisplayNames(state) {
       const a = mod.attributes || {};
       const cur = String(a.customFileName || a.name || a.logicalFileName || '').trim();
       if (!cur || !CJK.test(cur)) continue;      // 纯英文归正常翻译流程，自愈不插手
+      // 记账键用 **modId**（Vortex 的稳定内部 ID）：
+      //   · 永不变 —— 显示名/英文原名都可能随译文或版本变，ID 不会；
+      //   · 不含中文 —— 以前拿半中半英的显示名当键（sh:Kpop佐伊EVE），封杀后再也对不上；
+      //   · 同一模组的所有版本共用一个键 —— 这才符合语义：这个模组翻不了，就该整体退让，
+      //     而不是每个版本各记各的账、谁也到不了 3 次、每次启动都白烧一遍。
+      // baseForFail 只作 modId 缺失时的兜底（老数据 / 沙箱未注入）。
+      const baseForFail = (typeof englishBaseNameOf === 'function' ? (englishBaseNameOf(mod, modId)[0] || '') : '');
       // 元数据污染（2026-10-26 真机 11 条）：状态键被当原名送翻，模型把 fileId / 更新日期 /
       // 随机 id 一起翻进中文 —— `清洁水源功能 13392 1 2026-10-03T17-14Z GpMW8t9md`。
       // 这不是「半中半英」，refineByWords 换不掉数字串，只会白烧一次调用然后记失败。
@@ -3631,7 +3958,7 @@ async function healStaleDisplayNames(state) {
       // 轻伤档（P1-c）：只准词级补翻，绝不拿缓存里另一份译文整句覆盖 ——
       // 整句覆盖正是「剑星 Vortex 扩展包 → 星辰之刃漩涡扩展模组」事故的来源。
       if (!strict && healWorthy(cur)) {
-        const failKey = 'sh:' + cur;
+        const failKey = 'sh:' + String(modId || baseForFail || cur);
         if (isGivenUp(failKey)) continue;        // 有界退让：不每次启动烧一次调用
         const refined = await refineByWords(cur);
         if (refined && refined !== cur && modNameOk(refined)) {
@@ -3640,13 +3967,13 @@ async function healStaleDisplayNames(state) {
           // 再失败一次就永久 given-up（TTL 内）。销账与 bump 必须成对出现在同一分支上。
           if (typeof clearNameFail === 'function') clearNameFail(failKey);
         } else {
-          bumpNameFail(failKey, cfg && cfg.provider && cfg.provider.model);
+          bumpNameFail(failKey, cfg && cfg.provider && cfg.provider.model, cur);
           continue;                              // 补不上就不写（不留半成品）
         }
       }
       if (!zh && strict) {
         // 重伤档缓存也没命中：同样只做词级补翻，一样不许跨条目整句覆盖
-        const failKey = 'sh:' + cur;
+        const failKey = 'sh:' + String(modId || baseForFail || cur);
         if (isGivenUp(failKey)) continue;
         const refined = await refineByWords(cur);
         if (refined && refined !== cur && modNameOk(refined)) {
@@ -3654,7 +3981,7 @@ async function healStaleDisplayNames(state) {
           if (typeof clearNameFail === 'function') clearNameFail(failKey);  // 同上：救回即销账
         }
         else {
-          bumpNameFail(failKey, cfg && cfg.provider && cfg.provider.model);
+          bumpNameFail(failKey, cfg && cfg.provider && cfg.provider.model, cur);
           continue;
         }
       }
@@ -3695,14 +4022,18 @@ async function healStaleDownloadNames(state, only) {
     // 两份判据并存时，将来谁改 modNameOk 的残留口径，两条通道就会各走一边
     // （审计 v4 #1：同一判据两份实现，0.16.3 已经吃过这个亏）。
     if (!healWorthy(cur)) continue;               // 已合格 / 无残留 → 不动
-    // 记账键 = 显示名原串，**绝不能过 `cacheKeyOf`**。
+    // 记账键**绝不能过 `cacheKeyOf`**。
     // 2026-10-26 v7.1 事故：写成 `'dl:' + cacheKeyOf(cur)`，而 `cur` 上一行刚被
     // `if (!CJK.test(cur)) continue` 保证含中文，`cacheKeyOf` 对中文返回 `''`
     // → failKey 恒为裸 `'dl:'`，全通道共用一个桶。任意 3 行补不上就
     // `isGivenUp('dl:')` 恒真 → 之后每一行都被跳过，且无人 `clearNameFail('dl:')`，
     // TTL 7 天内不可恢复（用户症状：翻到某行之后再也不自愈，躺一周又突然好了）。
-    // 与 sh: 通道（`'sh:' + cur`）保持一致：记账键是**显示名**，不是规范键。
-    const failKey = 'dl:' + cur;
+    // 同理也**不能拿显示名当键**：同名的那 3 条 `dl:Kpop佐伊EVE` 就是这么锁死的——
+    // 显示名会变（`Kpop佐伊EVE` → `Kpop佐伊EVE 2`），一旦封杀就再也对不上。
+    // 定：用 **dlId**（下载记录的稳定 ID）作键，拿不到才退回英文原名、再退回显示名。
+    const miFail = f.modInfo || {};
+    const enForFail = String(miFail.zhSourceName || (((miFail.nexus || {}).fileInfo || {}).name) || '').trim();
+    const failKey = 'dl:' + String(dlId || ((enForFail && !CJK.test(enForFail)) ? enForFail : cur));
     if (isGivenUp(failKey)) continue;             // 有界退让：不每次启动烧一次调用
     let zh = '';
     if (typeof refineByWords === 'function') {
@@ -3710,13 +4041,13 @@ async function healStaleDownloadNames(state, only) {
     }
     zh = String(zh == null ? '' : zh).trim();
     if (!zh || zh === cur || !CJK.test(zh) || !modNameOk(zh)) {
-      bumpNameFail(failKey, cfg && cfg.provider && cfg.provider.model);
+      bumpNameFail(failKey, cfg && cfg.provider && cfg.provider.model, cur);
       continue;                                   // 补不上就不写（不留半成品）
     }
     // 只写 modInfo.name —— 安全字段。界面靠 DOM 层从 cache 贴，
     // 绝不写 nexus.fileInfo.name（会触发 Vortex 的 fuzzRatio 拼名，见 PITFALLS P-NAME-03）。
     if (!setDownloadShownName(dlId, zh)) {
-      bumpNameFail(failKey, cfg && cfg.provider && cfg.provider.model);
+      bumpNameFail(failKey, cfg && cfg.provider && cfg.provider.model, cur);
       continue;
     }
     // 缓存键必须是英文原名：只读 fileInfo.name（我们从不写它），没留底就别硬拼中文键。
@@ -3807,7 +4138,11 @@ function makeSettingsComponent() {
       this._tick = setInterval(() => {
         if (!this._alive) return;
         const L = liveStatus || {};
-        const busy = (Array.isArray(L.inflight) && L.inflight.length > 0) || (L.queued || 0) > 0 || this.state.queueOpen;
+        // 批量路径只写 L.batch；不把它算进来，点「全部重翻」时这里永远判空闲，
+        // 面板就按 4 秒一次刷，看起来像「一片空白」。（F-61）
+        const B = (L.batch) || {};
+        const busy = (Array.isArray(L.inflight) && L.inflight.length > 0) || (L.queued || 0) > 0
+          || B.running === true || (B.queued || 0) > 0 || this.state.queueOpen;
         const gap = busy ? 1000 : 4000;
         const now = Date.now();
         if (now - last < gap) return;
@@ -4055,6 +4390,50 @@ function makeSettingsComponent() {
                   (it && it.ok) ? h('span', { style: { opacity: 0.8 } }, ' → ' + String(it.zh || '').slice(0, 34)) : null,
                   h('span', { style: { opacity: 0.45 } }, '  ' + secs(it && it.ms)))))
               : null,
+            // ── 批量翻译（「清空缓存并全部重翻」「翻译选中」等按钮触发的路径）──
+            // 以前这一段不存在：批量路径根本不写 liveStatus，面板全空，
+            // 用户只看到铃铛说「正在翻译 300 条」，却不知道翻到哪了。（F-61）
+            (() => {
+              const B = (L.batch) || {};
+              const bRecent = arr(B.recent);
+              const bInflight = arr(B.inflight);
+              if (!B.running && !B.doneAt && bRecent.length === 0) return null;
+              const bTotal = Math.max(0, Number(B.total) || 0);
+              const bDone = Math.max(0, Math.min(bTotal || Infinity, Number(B.ok) || 0));
+              return h('div', { style: { marginTop: 8, paddingTop: 6, borderTop: '1px solid rgba(127,127,127,0.25)' } },
+                h('div', { style: { fontWeight: 600, opacity: 0.9 } }, '批量翻译'),
+                h('div', { style: { opacity: 0.9 } },
+                  B.running
+                    ? h('span', null,
+                      h('b', null, '批量翻译中 ' + bDone + '/' + bTotal),
+                      ' · 并发 ' + Math.max(0, Number(B.lanes) || 0) + ' 路 · 最近 ' + bRecent.length + ' 条')
+                    : h('span', { style: { opacity: 0.8 } },
+                      '上次批量完成'
+                      + (B.doneAt ? ' ' + Math.max(0, Math.round((nowMs - B.doneAt) / 1000)) + ' 秒前' : '（时间未知）')),
+                  h('span', { style: { opacity: 0.7 } },
+                    ' ｜ 在飞 ' + bInflight.length + ' 条 · ' + Math.max(0, Number(B.groups) || 0) + ' 组 · 排队 '
+                    + Math.max(0, Number(B.queued) || 0) + ' 条 · 失败 ' + Math.max(0, Number(B.fail) || 0))),
+                bInflight.length > 0
+                  ? h('div', null,
+                    h('div', { style: { opacity: 0.65, margin: '6px 0 2px' } }, '正在发送（批量）'),
+                    bInflight.slice(0, 12).map((it, i) => h('div', {
+                      key: 'bi' + i, style: { whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
+                    },
+                      h('span', { style: { opacity: 0.5 } }, ' › '),
+                      String((it && it.text) || '').slice(0, 90),
+                      h('span', { style: { opacity: 0.55 } }, '  ' + secs(nowMs - ((it && it.start) || nowMs))))))
+                  : null,
+                bRecent.length > 0
+                  ? h('div', null,
+                    h('div', { style: { opacity: 0.65, margin: '6px 0 2px' } }, '最近完成（批量）'),
+                    bRecent.slice(0, 5).map((it, i) => h('div', {
+                      key: 'br' + i, style: { whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
+                    },
+                      h('span', { style: { color: (it && it.ok) ? '#4caf6a' : '#d9534f' } }, (it && it.ok) ? ' ✓ ' : ' ✗ '),
+                      String((it && it.text) || '').slice(0, 46),
+                      (it && it.ok) ? h('span', { style: { opacity: 0.8 } }, ' → ' + String(it.zh || '').slice(0, 34)) : null)))
+                  : null);
+            })(),
             h('div', { style: { opacity: 0.5, marginTop: 6 } },
               '失败数一直涨、页面还是英文 → 多半是模型上下文不够（日志里会写 Context size has been exceeded）：把 LM Studio 的 Context Length 调大，或把「每批送翻条数」调小。正在发送的条目卡很久 → 本地 7B 算力不够，并发填成和 LM Studio 的 Parallel Requests 一样。'));
         } catch (e) {
@@ -4242,7 +4621,15 @@ function makeSettingsComponent() {
           }, (() => {
             const infl = Array.isArray(liveStatus.inflight) ? liveStatus.inflight.length : 0;
             const q = liveStatus.queued || 0;
-            const tag = infl > 0 ? `正在翻 ${infl} · 排队 ${q}` : (q > 0 ? `排队 ${q}` : '空闲');
+            // 批量路径的数字也要算进按钮标签：点「清空缓存并全部重翻」时按钮上
+            // 写着「空闲」，和铃铛里的「正在翻译 300 条」自相矛盾。（F-61）
+            const Bb = liveStatus.batch || {};
+            const bInfl = Array.isArray(Bb.inflight) ? Bb.inflight.length : 0;
+            const bq = Bb.queued || 0;
+            const bBusy = Bb.running === true || bInfl > 0 || bq > 0;
+            const tag = bBusy
+              ? `批量 ${Bb.ok || 0}/${Bb.total || 0} · 排队 ${bq}`
+              : (infl > 0 ? `正在翻 ${infl} · 排队 ${q}` : (q > 0 ? `排队 ${q}` : '空闲'));
             return (this.state.queueOpen ? '收起实时队列' : '实时队列') + ' · ' + tag;
           })())),
         // 按钮说明：每个按钮旁边都必须能读懂它到底清不清缓存、发不发请求
@@ -4370,17 +4757,39 @@ function makeSettingsComponent() {
 function main(context) {
   contextRef = context;
   try { React = require('react'); } catch (e) {
-    log('error', 'react missing', String(e));
+    earlyLog('error', 'react missing', String(e));
   }
   try { va = require('vortex-api'); } catch (e) {
-    log('error', 'vortex-api missing', String(e));
+    earlyLog('error', 'vortex-api missing', String(e));
+    // 没有 vortex-api 就谈不上数据目录，只能在扩展目录留痕（extLog 兜底后返回）
+    flushEarlyLog();
     return false;
   }
   // 配置与缓存搬到 userData（扩展目录升级会被覆盖）。失败就继续用扩展目录，不影响功能。
+  let dataDirOk = false;
   try {
     const ud = localePack.resolveUserData(va);
-    if (ud) { useDataDir(path.join(ud, 'vortex-modname-zh')); migrateFromExtDir(); }
-  } catch (e) { log('warn', 'data dir setup', String(e)); }
+    if (ud) {
+      useDataDir(path.join(ud, 'vortex-modname-zh'));
+      // 先补早期日志再迁移：迁移那条 info 是在数据目录里写的第一行，
+      // 顺序反了日志时间线会出现「先迁移、后报错」的倒挂。
+      flushEarlyLog();
+      migrateFromExtDir();
+      dataDirOk = true;
+    }
+  } catch (e) { earlyLog('warn', 'data dir setup', String(e)); }
+  // 数据目录定了（或确定失败）才把刚开始攒的几行落盘：成功 → 写进 userData 那份日志，
+  // 失败 → 落到扩展目录（唯一的兜底位置）。
+  flushEarlyLog();
+  if (!dataDirOk) {
+    // 用户看到的症状以前是「没填接口地址」——因为配置在 userData 里，数据目录一失败
+    // 就只能读到出厂空配置，根因（数据目录不可用）一个字都不说。必须显式讲。
+    log('warn', 'data dir unavailable; fallback to extension dir', { dir: DATA_DIR });
+    notifySticky({
+      id: 'modname-zh-datadir', type: 'warning', title: '数据目录不可用',
+      message: `这次配置和译文会写到扩展目录（${DATA_DIR}），升级扩展时可能被覆盖。请检查 %APPDATA%\\Vortex 是否存在、可写。`,
+    });
+  }
 
       // 兜底必须深拷贝：readJson 失败时返回的就是 fallback 本身，
       // 若直接传 DEFAULT_CFG，cfg 会和这个常量变成同一个对象，
@@ -4537,7 +4946,15 @@ function main(context) {
       const skipSeed = seedSkip();
       const domCount = Object.keys(domCache).filter((k) => typeof domCache[k] === 'string' && k !== '_ver').length;
       if (!skipSeed && domCount === 0) {
-        const seed = readJson(SEED_PATH, {});
+        // 类型守卫：readJson 对「合法 JSON 的 null」会原样返回 null（不是 fallback），
+        // 而 Object.keys(null) 直接抛 TypeError。这段在 main() 里没有外层 try，
+        // 一抛就是整次启动全废（0 设置页 / 0 右键动作 / 0 通知 / DOM 层不启动）。
+        // 判据只认「真对象」：数组、字符串、数字、null 一律当空 seed 跳过，不崩。
+        const seedRaw = readJson(SEED_PATH, {});
+        if (!seedRaw || typeof seedRaw !== 'object' || Array.isArray(seedRaw)) {
+          log('warn', 'seed not an object, skip restore', { type: seedRaw === null ? 'null' : (Array.isArray(seedRaw) ? 'array' : typeof seedRaw) });
+        }
+        const seed = (seedRaw && typeof seedRaw === 'object' && !Array.isArray(seedRaw)) ? seedRaw : {};
         // seed 质检：引号壳/空值/假翻译/占位符丢/伪标签错/引号不配对/BBCode 重复不灌
         const good = {};
         for (const k of Object.keys(seed)) {
@@ -4947,7 +5364,22 @@ function main(context) {
             return n;
           };
           runStartupHeal(1)
-            .then((n) => { if (n > 0) log('info', 'startup heal done', { n }); })
+            .then((n) => {
+              if (n > 0) {
+                log('info', 'startup heal done', { n });
+                // 自愈以前只写日志，用户看不到「它到底跑没跑」——真机反馈原话：
+                // 「我不知道治愈功能生效了没，因为这是自动化的」。自动化如果没有可见回执，
+                // 就等于不存在：用户会反复怀疑、反复手点重翻。
+                // 只在**真救了东西**时提示（n>0）。没救就不响，避免每次启动都弹一条噪音。
+                notify({
+                  id: 'heal-done', type: 'success', displayMS: 8000,
+                  title: '已自愈旧译文',
+                  message: `${n} 条缓存/显示名已按新词库同步（无需手动重翻）`,
+                });
+              } else {
+                log('info', 'startup heal done', { n: 0 });
+              }
+            })
             .catch((e) => { log('warn', 'heal names fail', String(e)); });
         }
       } catch (e) { log('warn', 'autostart', String(e)); }

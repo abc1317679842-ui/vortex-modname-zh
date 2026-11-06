@@ -310,8 +310,8 @@ if (nk !== t) { ...查 lexNorm... }
 
 | 文件 | 作用 | 发版时 |
 |---|---|---|
-| `pack.json` | 界面词库 6166 条（字符串叶子数，= 语言包 manifest 的 `entries`） | 保留 |
-| `gamenames.json` | 游戏名固定表 746 条 | 保留 |
+| `pack.json` | 界面词库 6185 条（字符串叶子数，= 语言包 manifest 的 `entries`） | 保留 |
+| `gamenames.json` | 游戏名固定表 759 条 | 保留 |
 | `gamenames-keep.json` | 明确保持英文的名单 | 保留 |
 | `domCache.json` | 运行时译文缓存 | **清空** |
 | `domCache.seed.json` | 清缓存前的快照 | 保留（升级后不整页回英文） |

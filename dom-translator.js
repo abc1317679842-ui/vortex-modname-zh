@@ -362,13 +362,28 @@ function startDomTranslator(opts) {
   // 1) 拉锯熔断：同一文本节点被改写超过 WRITE_PATIENCE 次就判定「写了被还原、还原了再写」
   const writeCount = new WeakMap();     // el -> Map<原文, 已改写次数>（不能按 textNode 记，会被重建）
   const WRITE_PATIENCE = 6;
-  const PINGPONG_COOL_MS = 60000;       // 熔断后的冷却时长，到点再给一次机会
+  const PINGPONG_COOL_MS = 60000;       // 熔断后的**首轮**冷却时长，之后逐轮翻倍
+  // 同一节点最多解冻几轮。以前每 60 秒无条件解冻一次，真机上出现过一个会话冻 1500 次的
+  // 节点（日志 n max=1500 / 149 条，约 2980 次熔断 = 2 万多次被回滚的写入）：
+  // 那是 React 每次重渲染都把文本还原、我们每次又写回去的死循环，解冻只是让它再来一遍。
+  // 现在按轮次翻倍退避（60s→120s→240s），到第 4 轮就不再解冻（本会话放弃该节点）。
+  // 节点被重建时 WeakMap 自然失效，换页/重渲染后新节点仍会正常翻译。
+  const PINGPONG_MAX_ROUNDS = 4;
   let pingPong = 0;                     // 被熔断的节点总数（面板可看）
+  const coolRounds = new WeakMap();     // el -> 已冻结轮次
+
+  /** 第 round 轮冷却时长（毫秒）。baseMs 由调用方传入而不是直接读模块常量：
+   *  tests/ 的沙箱按函数名切源码再 new Function，函数体碰模块级变量就是 ReferenceError。 */
+  function pingPongCoolMs(round, baseMs) {
+    const base = Number(baseMs) > 0 ? Number(baseMs) : 60000;
+    const n = Math.max(1, Number(round) || 1);
+    return base * Math.pow(2, n - 1);
+  }
 
   /** 拉锯熔断唯一实现（node / name / attr / block / author / applyUnit 六个入口共用）。
    *  返回 true = 这次改写放行；false = 已熔断，调用方必须放弃本次写入。
-   *  冷却而不是永久放弃：拉锯多半是「那阵子在高频重渲染」，60 秒后摘标记、清计数，
-   *  再给一次机会；还在拉锯就再冻一轮。
+   *  冷却而不是永久放弃：拉锯多半是「那阵子在高频重渲染」，冷却后摘标记、清计数，
+   *  再给一次机会；还在拉锯就按轮次翻倍退避，冻满 PINGPONG_MAX_ROUNDS 轮就本会话放弃。
    *  kind 只进日志口径（'write ping-pong cooled (name)'），测试按它分辨是哪条路径。 */
   function coolIfPingPong(el, key, kind) {
     let bucket = writeCount.get(el);
@@ -376,17 +391,21 @@ function startDomTranslator(opts) {
     const wc = (bucket.get(key) || 0) + 1;
     bucket.set(key, wc);
     if (wc <= WRITE_PATIENCE) return true;
+    const round = (coolRounds.get(el) || 0) + 1;
+    coolRounds.set(el, round);
     try { el.setAttribute('data-zh-skip', '1'); } catch (e) { /* ignore */ }
-    try {
-      setTimeout(() => {
-        try { el.removeAttribute('data-zh-skip'); } catch (e) { /* ignore */ }
-        const b = writeCount.get(el);
-        if (b) b.delete(key);
-      }, PINGPONG_COOL_MS);
-    } catch (e) { /* ignore */ }
+    if (round < PINGPONG_MAX_ROUNDS) {
+      try {
+        setTimeout(() => {
+          try { el.removeAttribute('data-zh-skip'); } catch (e) { /* ignore */ }
+          const b = writeCount.get(el);
+          if (b) b.delete(key);
+        }, pingPongCoolMs(round, PINGPONG_COOL_MS));
+      } catch (e) { /* ignore */ }
+    }
     pingPong += 1;
     if (pingPong === 1 || pingPong % 20 === 0) {
-      log('warn', 'write ping-pong cooled (' + kind + ')', { n: pingPong, sec: PINGPONG_COOL_MS / 1000, sample: String(key).slice(0, 60) });
+      log('warn', 'write ping-pong cooled (' + kind + ')', { n: pingPong, sec: pingPongCoolMs(round, PINGPONG_COOL_MS) / 1000, round, sample: String(key).slice(0, 60) });
     }
     return false;
   }
@@ -436,6 +455,13 @@ function startDomTranslator(opts) {
   function isNoise(s) {
     if (/^#[0-9a-f]{3,8}$/i.test(s)) return true;
     if (/^[vV]?\d+(\.\d+)+([-a-z0-9.]*)?$/i.test(s)) return true;
+    // 版本名（`Alpha2` / `Beta 1` / `RC3` / `Build 42`）必须一起跳过。
+    // 真机实证 2026-11-06：剑星模组列表的「版本」列显示 `Alpha2`，被当成界面文案送翻，
+    // 而同一批里还有一条更新日志 `APIs now return native…`，模型把那条的译文串了过来，
+    // 版本列显示成「Alpha2版本中，现在的API接口会返回原生格式的数据。」整句话。
+    // 上面那条 `^[vV]?\d+` 只认数字开头，`Alpha2` 以字母开头所以漏了。
+    // 版本列是每行都有的高频短文本，送翻价值为零、串味代价极高 → 直接跳过。
+    if (/^(alpha|beta|rc|pre|preview|build|hotfix|patch|update|rev)[\s._-]*\d+([.\d]*)?$/i.test(s)) return true;
     if (/^\d+(\.\d+)?\s?(B|KB|MB|GB|TB|KiB|MiB|GiB)$/i.test(s)) return true;
     // 下载速度 / 进度百分比这类动态数值：每刷新一次就是一个新串（"384 KB/s"），
     // 而且常被拼成一坨（实测 "384 KB/s640 KB/s896 KB/s"）。翻不出任何东西，还会
@@ -470,9 +496,18 @@ function startDomTranslator(opts) {
     // 句子碎片：富文本把一句话拆成 with / Added / Fixed 这种单词，单独送翻既翻不出东西
     // 又会让整批失败（模型对着没有上下文的单词只会照抄）→ 判断依据：它只是父块里的一小段
     if (!/\s/.test(s) && s.length <= 12 && /^[A-Za-z]+$/.test(s) && el) {
-      const box = el.parentElement;
-      const whole = box ? (box.textContent || '').trim() : '';
-      if (whole.length > s.length + 4) return false;
+      // ⚠ 但**控件上的短词是标签，必须翻**：真机实证 2026-11-06 —— 剑星「UE4SS 加载顺序」
+      // 页右侧按钮文字（Load / Image 这类）全程留英文，因为按钮里除了文字还有一个图标文本
+      // 节点，`whole.length > s.length + 4` 成立，于是被当成「句子碎片」永久跳过。
+      // 这条规则本来是为了防「更新日志被拆成 with / Added / Fixed」，不该管按钮。
+      // 判据：自己或祖先命中交互控件 → 直接放行；否则才按原规则跳过。
+      const ctl = (el.closest && el.closest('button,a,[role="button"],[role="tab"],[role="menuitem"],label,summary'))
+        || (el.parentElement && el.parentElement.closest && el.parentElement.closest('button,a,[role="button"],[role="tab"],[role="menuitem"],label,summary'));
+      if (!ctl) {
+        const box = el.parentElement;
+        const whole = box ? (box.textContent || '').trim() : '';
+        if (whole.length > s.length + 4) return false;
+      }
     }
     // 首字符白名单：以前要求必须是 ASCII 字母或括号，结果 `· Added support…`、
     // `1. Fixed crash`、`- 新增难度` 这类 bullet 行整行被跳过，更新日志一片英文。
