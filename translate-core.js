@@ -220,6 +220,60 @@ function normalizeCaseKeepMasks(t) {
     .join('');
 }
 
+/** 专用工具 / 框架 / 脚本扩展器名（0.18 新增）。en === zh：模组名里必须原样保留。
+ *
+ *  为什么需要：这些词是玩家认路的路标，译成中文就找不到东西了。0.18 实测
+ *  （116 条真实 N 网文件名 × 48 个工具、本机 hy-mt2-7b、**走真实链路**即含
+ *  cfg.gameTerms 遮罩与「只带本批出现的术语」、**3 轮取均值**）：
+ *  **旧版 81.3~83.0% → 本表 97.4%**（新版三轮 95.7 / 98.3 / 98.3，旧版两次三轮 81.3 / 83.0）。
+ *  剩下 2 条是 `BodySlide`（遮罩后仍被模型删掉/黏连），其余全部保住。
+ *  ⚠ 单轮数字会在 83~98% 之间跳（温度 0.2 也有 ±3 条抖动），**别拿单轮结果当结论**；
+ *  裸文本口径（不遮罩、术语表全带）的 68.5% 更不代表生产——它把词库遮罩的功劳算没了。
+ *
+ *  ⚠ 两处都要用，但**只在 mod 模式**（`mergeToolTerms` 同时服务于提示词与遮罩表）：
+ *    ✅ 提示词（术语对照表）：让模型知道这些词是名字，不是待译英文。
+ *    ✅ 遮罩表：`cfg.gameTerms` 只覆盖 190 条词库里有的那 29 个工具词，剩下 19 个
+ *       （ImprovedUI / EquipmentEX / TTW / ISL / ME3Tweaks / Baka …）只靠提示词管不住。
+ *       并进遮罩后 116 条 × 3 轮：88.5% → **95.4%**（三轮一致），且黏连从 2 条降到 **0**。
+ *    ⛔ ui / html 模式一律不加：整句遮罩会把长句拆碎（`maskTerms` 分支有注释）。
+ *
+ *  ⚠ 别再走「全量遮罩 + 不区分是否已在词库」的老路：那个版本（P1P4）在裸文本口径下
+ *    保留率更高，但会把 `3BA Bodyslide` 黏成 `3BABodySlide`、`SB UE4SS` 颠倒成
+ *    `UE4SS SB`、无据加「版」+12 条、还让别的专名不翻（`Dwemer→带粒子灯的Dwemer提灯`）。
+ *
+ *  ⚠ 与 BUILTIN_TERMS 上方那条历史教训的区别（别据此删掉本表）：
+ *    以前删的是 `SKSE / F4SE / NVSE → 原样保留，不要翻译` —— 那条把**中文指令**写进了
+ *    对照表，模型读成「这几个词该译成中文」，于是 SKSE 变成「天空风」。
+ *    本表每条都是 `en => en` 同形，模型读到的是「原文就是译文」。0.18 实测有效。
+ *
+ *  ⚠ 规模硬约束：本表只准放**工具名**，不许把 gamenames-keep.json 那 190 条品牌词并进来。
+ *    每条术语约 +17 token：48 条后 mod 提示词 1316 token（8192 余量 6684，4096 余量 2588）；
+ *    再叠 190 条 = 4579 token，4096 窗口余量为负，会直接 CTX_OVER 劈批发不出去。 */
+const TOOL_TERMS = [
+  'ALOT', 'AMUMSS', 'ArchiveXL', 'Baka', 'BepInEx', 'BodySlide', 'CBBE', 'CET',
+  'CNS', 'Codeware', 'ContentPatcher', 'DynDOLOD', 'ENB', 'EquipmentEX', 'F4SE',
+  'FNIS', 'FOMOD', 'Fluffy', 'ISL', 'ImprovedUI', 'JIP', 'JohnnyGuitar', 'Jotunn',
+  'LOOT', 'MCM', 'ME3Tweaks', 'MO2', 'NVSE', 'OBSE', 'OXA', 'QModManager',
+  'REFramework', 'RaceMenu', 'Redscript', 'SFSE', 'SKSE', 'SKSE64', 'SMAPI',
+  'SkyUI', 'SpaceCore', 'Stracker', 'TTW', 'TexGen', 'TweakXL', 'UE4SS', 'UXM',
+  'YUP', 'red4ext',
+].map((en) => ({ en, zh: en }));
+
+/** 把 TOOL_TERMS 并进术语表 / 遮罩表（mod 模式专用）。已有同名词条不覆盖（用户自定义优先）。 */
+function mergeToolTerms(terms) {
+  const list = (terms || []).slice();
+  const seen = new Set();
+  for (const t of list) {
+    const k = String((t && t.en) || '').trim().toLowerCase();
+    if (k) seen.add(k);
+  }
+  for (const t of TOOL_TERMS) {
+    if (seen.has(t.en.toLowerCase())) continue;
+    list.push(t);
+  }
+  return list;
+}
+
 /** 内置对照：写死在提示词里，不依赖用户术语表。
  *  模型对缩写极易认错（实测 TW3 被当成《上古卷轴3》，用户的合集名一半带 TW3），
  *  这种错误用后处理救不回来，只能在提示词里先钉死。 */
@@ -386,7 +440,12 @@ function repairStruct(s, orig) {
 }
 
 function buildSystemPrompt(terms, mode) {
-  const termHint = (terms || []).map((t) => `${t.en} => ${t.zh}`).join('\n');
+  // 这个函数的 else 分支是「非 ui 即 mod」（html 生产走 buildHtmlPrompt，不经过这里），
+  // 所以术语表与 9/10/11 三条必须用同一个判据，否则直接调用时会拿到
+  // 「有规则、没对照表」的半套提示词。
+  const modLike = mode !== 'ui';
+  const termList = modLike ? mergeToolTerms(terms) : (terms || []);
+  const termHint = termList.map((t) => `${t && t.en} => ${t && t.zh}`).join('\n');
   const builtinHint = BUILTIN_TERMS.map((t) => `${t.en} => ${t.zh}`).join('\n');
   const glossary = VORTEX_GLOSSARY.join('；');
   if (mode === 'ui') {
@@ -419,6 +478,14 @@ function buildSystemPrompt(terms, mode) {
     '8. 游戏名缩写必须按下面的对照译成正式中文名；对照表里没有的缩写，保留原文，绝对不要猜成别的游戏。',
     '内置对照：\n' + builtinHint,
     termHint ? '术语对照：\n' + termHint : '',
+    // 9-11 是 0.18 新增。措辞是 A/B 选出来的，别改写成条件句：
+    // 实测「**第 6 条的例外**：…英文与中文完全相同的条目」这种写法只有 91.4%，
+    // 换成直白的「术语对照表里英文与中文相同的那些词…必须原样保留」是 94.0%
+    // （全大写工具词 100%）。7B 不擅长解析条件判断，要给它直接命令。
+    // 改这三条前先读 TOOL_TERMS 上方注释与 local-docs/0.18 文档。
+    '9. 术语对照表里英文与中文相同的那些词（例如 SKSE => SKSE、BodySlide => BodySlide）是工具、框架、脚本扩展器名，必须原样保留、大小写也不许改，禁止翻译、改写成别的词或删除。',
+    '10. 对照表里没有的词一律译成中文，哪怕它看起来像专有名词或作者名。',
+    '11. 输出里不许出现「译文」「译名」这类字样。',
   ].filter(Boolean).join('\n');
 }
 
@@ -641,7 +708,28 @@ async function pickModel(base, key) {
   }
 }
 
-async function llmTranslate(cfg, texts, modeOverride) {
+/** 出口判据（0.18）：原文明明有这些工具词，译文里一个都不剩 → 返回丢失清单。
+ *  只认 TOOL_TERMS 里确定的词（不猜形态），所以实测误杀 0 条。
+ *  ⚠ 大小写用**不敏感**匹配，是有意取舍（2026-11-09 真机数据定）：
+ *    敏感匹配能放过 `Narrative Loot → 叙事战利品 GDPR`（普通词 Loot，译文正确），
+ *    但会漏掉 `Belly cns → 腹部猎魔感官模组`（N 网作者写小写 cns，译文丢了它）这类
+ *    真错译——两类在形态上无法区分，只能二选一。取「抓全真错译」：
+ *    误伤的代价是该条被重翻成保留 `Loot` 的版本（Loot 本就是模组名组成部分，
+ *    符合保留政策）；漏掉的代价是 6 条错译永远抓不到。
+ *  用在两处：translateConcurrently 的单条重发闸门、index.js 收养分支的拒收闸门。 */
+function lostToolTerms(src, zh) {
+  const s = String(src || '');
+  const o = String(zh || '');
+  if (!s || !o) return [];
+  const out = [];
+  for (const t of TOOL_TERMS) {
+    const re = new RegExp('(?<![A-Za-z])' + escapeRegExp(t.en) + '(?![A-Za-z])', 'i');
+    if (re.test(s) && !re.test(o)) out.push(t.en);
+  }
+  return out;
+}
+
+async function llmTranslate(cfg, texts, modeOverride, extraRule) {
   const base = String((cfg.provider && cfg.provider.baseUrl) || '').replace(/\/+$/, '');
   const key = (cfg.provider && cfg.provider.apiKey) || '';
   const model = String((cfg.provider && cfg.provider.model) || '').trim();
@@ -713,8 +801,13 @@ async function llmTranslate(cfg, texts, modeOverride) {
   //     绝不 modOnly，裸送 ui/html 必夹英文。
   // 逐条遮，不要 join('\n') 再 split：只要任意一条文本自身含换行，拆出来的条数就比原来多，
   // payloadList / boxes / safeList 全部跟着错位 —— 第 N 条拿到的是前一条的一部分，静默错译。
+  // mod 模式额外的工具词遮罩（0.18）：`cfg.gameTerms` 只覆盖 190 条词库里有的那 29 个
+  // 工具词，剩下 19 个（ImprovedUI / EquipmentEX / TTW / ISL / ME3Tweaks / Baka …）只能
+  // 靠提示词说，实测管不住。并进遮罩后：116 条 × 3 轮从 88.5%（其中两轮还出现黏连）
+  // 提到 95.4%（三轮完全一致、零黏连）。合并用 mergeToolTerms，已被词库盖住的不重复遮。
+  // ui/html 不加：整句遮罩会把长句拆碎（见下方分支的注释）。
   const maskTerms = (mode === 'mod')
-    ? terms
+    ? mergeToolTerms(terms)
     : terms.filter((t) => t.brand || (!t.modOnly && String(t.en || '').trim().split(/\s+/).length <= 3));
   const masked = maskTerms.length
     ? texts.map((t) => applyTerms(t, maskTerms, 'mask'))
@@ -734,7 +827,10 @@ async function llmTranslate(cfg, texts, modeOverride) {
   //     `Cjayride.EpicValheimsAdditions` 对照译「英灵神殿」、处理译成音译「瓦尔海姆」；
   //     `SquadHud` 对照译「战术小队」、处理直接保留英文。
   // → 术语表在这一层是**净收益**，不要为了那个 3/3 单题材的特例去砍它。
-  const sysPrompt = mode === 'html' ? buildHtmlPrompt(terms) : buildSystemPrompt(terms, mode);
+  // `extraRule` 只给出口判据的单条重发用（指名「这一条必须保留 X」），默认不传，
+  // 现有调用一个字节都不变；它进 sysPrompt，所以下面的 estIn 估算会自动把它算进去。
+  const sysPrompt = (mode === 'html' ? buildHtmlPrompt(terms) : buildSystemPrompt(terms, mode))
+    + (extraRule ? '\n' + extraRule : '');
 
   // 输出预算必须跟着输入走，但**绝不能超过模型实际加载的上下文**：
   // 之前写死 4096 撞 4096 的窗口，动态放大到 8192 更是直接超限，
@@ -833,7 +929,10 @@ async function llmTranslate(cfg, texts, modeOverride) {
     // 模型有时会把带『』标记的术语改写成「」等括号，统一清理掉包裹符号。
     // 容错要带上引号族：模型常把『术语』写成 '术语' / “术语”，以前只认中文括号，
     // 于是遮罩壳留在译文里（实测「SF6 迈克'三色'添加模组」）。
-    for (const t of terms) {
+    // 0.18：这里必须遍历 maskTerms 而不是 terms —— TOOL_TERMS 里有一批词（CNS、CBBE、
+    // ImprovedUI…）不在 190 条词库里，只存在于 maskTerms。用 terms 的话，模型把
+    // 『CNS』改写成「CNS」时这一层就还原不了，界面上会留下「CNS」款赛车服模组（真机实录）。
+    for (const t of maskTerms) {
       if (!t.zh) continue;
       s = s.replace(new RegExp('[「『\\[(（《"\u2018\u201c]' + escapeRegExp(t.zh) + '[」』\\])）》"\u2019\u201d]', 'g'), t.zh);
     }
@@ -1530,6 +1629,29 @@ async function translateConcurrently(cfg, cache, texts, concurrency, onProgress,
         } catch (e) { lastErr = String((e && e.message) || e).slice(0, 140); }
         await delay(cfg.requestDelayMs || 150);
       }
+      // 出口判据（0.18）：原文里的工具词在译文里一个都不剩 → 单条重问一次，指名要求保留。
+      // 实测（116 条 × 1 轮、真实链路）：判可疑 5 条、**误杀 0 条**、救回 4 条 → 95.4% → 99.1%。
+      // 三条保险：①只重试一次（不递归）②只在「全部丢失的词都回来」时才覆盖，
+      // 只回来一部分就保留原译文 ③重试抛错也保留原译文 —— 任何情况都不丢条。
+      if (mode === 'mod') {
+        for (let k = 0; k < chunk.length; k++) {
+          const cur = results[g[k]];
+          if (cur == null) continue;
+          const lost = lostToolTerms(chunk[k], cur);
+          if (!lost.length) continue;
+          try {
+            const one = await llmTranslate(cfg, [chunk[k]], mode,
+              '这一条必须原样保留这些词：' + lost.join('、') + '，一个字都不许改，也不许删除。');
+            const cand = one && one[0];
+            // cand !== chunk[k]：照抄原文不算修好（短名常态），与上面错位守卫同一口径
+            if (cand != null && cand !== chunk[k] && !lostToolTerms(chunk[k], cand).length) {
+              results[g[k]] = cand;
+              retried++;
+            }
+          } catch (e) { lastErr = String((e && e.message) || e).slice(0, 140); }
+          await delay(cfg.requestDelayMs || 150);
+        }
+      }
       finished += chunk.length;
       if (onProgress) onProgress(finished, texts.length);
       if (typeof onItem === 'function') {
@@ -1585,6 +1707,9 @@ module.exports = {
   httpRequest,
   applyTerms,
   buildSystemPrompt,
+  TOOL_TERMS,
+  mergeToolTerms,
+  lostToolTerms,
   isUiBatch,
   normalizeCase,
   normalizeCaseKeepMasks,

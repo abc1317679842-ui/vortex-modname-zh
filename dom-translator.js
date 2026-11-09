@@ -146,6 +146,8 @@ function startDomTranslator(opts) {
   const nameGate = typeof opts.nameGate === 'function' ? opts.nameGate : null;
   const unfinishedName = typeof opts.unfinishedName === 'function' ? opts.unfinishedName : null;
   const nameTranslationOf = typeof opts.nameTranslationOf === 'function' ? opts.nameTranslationOf : null;
+  // 0.18：状态层「同值异义」（名字==版本）集合，与 index.js 共用同一份判据
+  const isMetadataValue = typeof opts.isMetadataValue === 'function' ? opts.isMetadataValue : null;
   // 采集是跨会话累积的素材，启动时接着上次的攒，不能每次清空
   const collected = new Set(Array.isArray(opts.collected) ? opts.collected : []);
   // 采集上限（审计 E5）：collected.json 出厂是空的、开关关着时完全静止，
@@ -452,7 +454,71 @@ function startDomTranslator(opts) {
     return false;
   }
 
+  /** 0.18 元数据列护栏（结构判定，不看文本内容）。
+   *  Vortex 2.10.1 asar 实证：经典视图 `renderAttribute` 拼 `cell-<attribute.id>`，
+   *  版本列 `{id:"version"}` → `td.cell-version`；测试版 `TableCell` 只有
+   *  `nxm-table-cell` + `role=gridcell`，不带列 id → 必须靠表头行 + 列序号。
+   *  护栏内全部常量自包含（沙箱可抽），表头解析按 grid 缓存 5 秒。 */
+  function columnGuard(el) {
+    if (!el || !el.closest) return false;
+    const IDS = columnGuard.IDS || (columnGuard.IDS = new Set([
+      'version', 'size', 'filesize', 'modsize', 'author', 'date', 'installed',
+      'endorsements', 'endorsement', 'status', 'category', 'source', 'rating', 'id',
+    ]));
+    // 不能用 \b：中文不是 \w，「版本 」后面接空格不构成词边界（桩测试第一轮 4 红）
+    const RE = columnGuard.RE || (columnGuard.RE = /^(安装时间|启用时间|下载时间|模组大小|已点赞|版本|版号|大小|作者|日期|时间|点赞|状态|分类|来源|评分|Endorsements?|Mod size|Version|Ver\.?|Category|Author|Rating|Source|Status|Size|Date|Time)(?![A-Za-z\u4e00-\u9fa5])/i);
+    const CACHE = columnGuard.CACHE || (columnGuard.CACHE = new WeakMap());
+    const cellEl = el.closest('td, [role="gridcell"], [role="columnheader"]');
+    if (!cellEl) return false;
+    // 表头自己交给词库翻，不护栏
+    if (cellEl.getAttribute && cellEl.getAttribute('role') === 'columnheader') return false;
+    // A 路：经典视图 td.cell-<id>，与列顺序无关、不依赖表头
+    try {
+      const m = /(?:^|\s)cell-([A-Za-z0-9_-]+)(?:\s|$)/.exec(String(cellEl.className || ''));
+      if (m && IDS.has(m[1].toLowerCase())) return true;
+    } catch (e) { /* 退化到 B 路 */ }
+    // B 路：表头文案 → 列序号（测试版视图 / class 变更后的兜底）
+    const row = cellEl.closest('tr, [role="row"]');
+    if (!row) return false;
+    let idx = -1;
+    try {
+      if (cellEl.tagName === 'TD' && typeof cellEl.cellIndex === 'number') idx = cellEl.cellIndex;
+      else {
+        const cells = Array.prototype.filter.call(row.children || [], (c) => c.tagName === 'TD'
+          || (c.getAttribute && (c.getAttribute('role') === 'gridcell' || c.getAttribute('role') === 'columnheader')));
+        idx = cells.indexOf(cellEl);
+      }
+    } catch (e) { return false; }
+    if (idx < 0) return false;
+    const grid = row.closest('table, [role="grid"], [role="table"]');
+    if (!grid) return false;
+    let hit = CACHE.get(grid);
+    if (!hit || Date.now() - hit.at > 5000) {
+      let labels = [];
+      try {
+        const heads = grid.querySelectorAll('th.table-header-cell, [role="columnheader"]');
+        if (heads && heads.length) {
+          labels = Array.prototype.map.call(heads, (h) => String(h.textContent || '').replace(/\s+/g, ' ').trim());
+        } else {
+          const hrow = grid.querySelector('.nxm-table-header[role="row"], thead tr');
+          if (hrow) {
+            labels = Array.prototype.slice.call(hrow.children || [])
+              .filter((c) => c.tagName === 'TH' || (c.getAttribute && c.getAttribute('role') === 'columnheader'))
+              .map((h) => String(h.textContent || '').replace(/\s+/g, ' ').trim());
+          }
+        }
+      } catch (e) { labels = []; }
+      hit = { labels: labels, at: Date.now() };
+      CACHE.set(grid, hit);
+    }
+    const label = hit.labels[idx] || '';
+    if (!label) return false;
+    return RE.test(label) || (label.length <= 12 && /(版本|Version|Ver\.)/i.test(label));
+  }
+
   function isNoise(s) {
+    // 0.18：状态层已判「这段值同时是版本字段」→ 一律不送模型、不写 domCache
+    if (typeof isMetadataValue === 'function' && isMetadataValue(s)) return true;
     if (/^#[0-9a-f]{3,8}$/i.test(s)) return true;
     if (/^[vV]?\d+(\.\d+)+([-a-z0-9.]*)?$/i.test(s)) return true;
     // 版本名（`Alpha2` / `Beta 1` / `RC3` / `Build 42`）必须一起跳过。
@@ -1386,6 +1452,9 @@ function startDomTranslator(opts) {
   }
 
   function handleTextNode(node, visited) {
+    // 0.18：元数据列（版本/大小/作者/日期…）既不送翻也不贴名。
+    // 必须排在所有分支之前：文件名剥骨架、名字闸门贴名、块级送翻都在这之后。
+    if (typeof columnGuard === 'function' && node.parentElement && columnGuard(node.parentElement)) return false;
     const raw = node.nodeValue;
     if (!raw) return false;
     const t = raw.trim();
