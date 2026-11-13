@@ -148,6 +148,16 @@ function startDomTranslator(opts) {
   const nameTranslationOf = typeof opts.nameTranslationOf === 'function' ? opts.nameTranslationOf : null;
   // 0.18：状态层「同值异义」（名字==版本）集合，与 index.js 共用同一份判据
   const isMetadataValue = typeof opts.isMetadataValue === 'function' ? opts.isMetadataValue : null;
+  // 出厂固定词/短语表（F-019-36，index.js 从 domCache.seed.json 筛出后注入）：
+  // 常驻内存、不写 domCache、**不受「清空缓存」与 seed-skip 影响**。
+  // 作用：固定 UI 词永远有稳定译文，不再送模型（本地 7B 会把 `Nexus Mods ID`
+  // 串成别的模组译文，云端则每次口径可能不同）。
+  // 0.19 审计修正（F-019-39）：它排在 lookupRaw 的**最后**（术语 → 词库 → cache →
+  // 静态表），只当兜底。原先排在 cache 之前是为了压住 domCache 脏值，但 domCache 是
+  // 活缓存、seed 是历史快照，压在上面等于让旧值盖住模型新译的；而 seed 本身还混着
+  // 模组名/合集名，压在上面反而会盖坏名字。详见 lookupRaw 内的注释。
+  const seedUiTerms = (opts.seedUiTerms && typeof opts.seedUiTerms === 'object' && !Array.isArray(opts.seedUiTerms))
+    ? opts.seedUiTerms : null;
   // 采集是跨会话累积的素材，启动时接着上次的攒，不能每次清空
   const collected = new Set(Array.isArray(opts.collected) ? opts.collected : []);
   // 采集上限（审计 E5）：collected.json 出厂是空的、开关关着时完全静止，
@@ -468,6 +478,25 @@ function startDomTranslator(opts) {
     // 不能用 \b：中文不是 \w，「版本 」后面接空格不构成词边界（桩测试第一轮 4 红）
     const RE = columnGuard.RE || (columnGuard.RE = /^(安装时间|启用时间|下载时间|模组大小|已点赞|版本|版号|大小|作者|日期|时间|点赞|状态|分类|来源|评分|Endorsements?|Mod size|Version|Ver\.?|Category|Author|Rating|Source|Status|Size|Date|Time)(?![A-Za-z\u4e00-\u9fa5])/i);
     const CACHE = columnGuard.CACHE || (columnGuard.CACHE = new WeakMap());
+    // 0.19 B：隐藏列 / colSpan 会让「第几个单元格」和「第几列」不是一回事。
+    // 表头侧与数据行侧必须用同一套「可见单元格 + colSpan 展开」逻辑对齐。
+    // 判定只看显式标记（hidden / aria-hidden / display:none / 常见隐藏 class），
+    // 不看 offsetParent —— 沙箱桩和未挂载的 React 节点没有布局，全判隐藏会把护栏全灭。
+    const hiddenCell = (c) => {
+      try {
+        if (!c || !c.getAttribute) return false;
+        if (c.getAttribute('aria-hidden') === 'true' || c.getAttribute('hidden') !== null) return true;
+        if (/display\s*:\s*none/i.test(String(c.getAttribute('style') || ''))) return true;
+        return /(?:^|\s)(?:hidden|is-hidden|d-none)(?:\s|$)/i.test(String(c.className || ''));
+      } catch (e) { return false; }
+    };
+    const spanCell = (c) => {
+      try {
+        const raw = c && c.getAttribute ? c.getAttribute('colspan') : null;
+        const v = raw != null ? parseInt(raw, 10) : (c && typeof c.colSpan === 'number' ? c.colSpan : 1);
+        return (Number.isFinite(v) && v > 1 && v <= 16) ? v : 1;
+      } catch (e) { return 1; }
+    };
     const cellEl = el.closest('td, [role="gridcell"], [role="columnheader"]');
     if (!cellEl) return false;
     // 表头自己交给词库翻，不护栏
@@ -480,13 +509,16 @@ function startDomTranslator(opts) {
     // B 路：表头文案 → 列序号（测试版视图 / class 变更后的兜底）
     const row = cellEl.closest('tr, [role="row"]');
     if (!row) return false;
+    // 0.19 B：不再用 cellIndex 捷径（它不展开 colSpan），统一按逻辑列序号算
     let idx = -1;
     try {
-      if (cellEl.tagName === 'TD' && typeof cellEl.cellIndex === 'number') idx = cellEl.cellIndex;
-      else {
-        const cells = Array.prototype.filter.call(row.children || [], (c) => c.tagName === 'TD'
-          || (c.getAttribute && (c.getAttribute('role') === 'gridcell' || c.getAttribute('role') === 'columnheader')));
-        idx = cells.indexOf(cellEl);
+      const cells = Array.prototype.filter.call(row.children || [], (c) =>
+        (c.tagName === 'TD' || (c.getAttribute && (c.getAttribute('role') === 'gridcell'
+          || c.getAttribute('role') === 'columnheader'))) && !hiddenCell(c));
+      let logical = 0;
+      for (const c of cells) {
+        if (c === cellEl) { idx = logical; break; }
+        logical += spanCell(c);
       }
     } catch (e) { return false; }
     if (idx < 0) return false;
@@ -496,15 +528,25 @@ function startDomTranslator(opts) {
     if (!hit || Date.now() - hit.at > 5000) {
       let labels = [];
       try {
+        // 0.19 B：表头同样跳过隐藏列、按 colSpan 展开（与数据行 idx 同源）
+        const expand = (headsList) => {
+          const out = [];
+          for (const h of Array.prototype.slice.call(headsList)) {
+            if (hiddenCell(h)) continue;
+            const lab = String(h.textContent || '').replace(/\s+/g, ' ').trim();
+            const span = spanCell(h);
+            for (let i = 0; i < span; i++) out.push(lab);
+          }
+          return out;
+        };
         const heads = grid.querySelectorAll('th.table-header-cell, [role="columnheader"]');
         if (heads && heads.length) {
-          labels = Array.prototype.map.call(heads, (h) => String(h.textContent || '').replace(/\s+/g, ' ').trim());
+          labels = expand(heads);
         } else {
           const hrow = grid.querySelector('.nxm-table-header[role="row"], thead tr');
           if (hrow) {
-            labels = Array.prototype.slice.call(hrow.children || [])
-              .filter((c) => c.tagName === 'TH' || (c.getAttribute && c.getAttribute('role') === 'columnheader'))
-              .map((h) => String(h.textContent || '').replace(/\s+/g, ' ').trim());
+            labels = expand(Array.prototype.slice.call(hrow.children || [])
+              .filter((c) => c.tagName === 'TH' || (c.getAttribute && c.getAttribute('role') === 'columnheader')));
           }
         }
       } catch (e) { labels = []; }
@@ -682,6 +724,22 @@ function startDomTranslator(opts) {
     if (nth && nth !== t) return nth;
     const c = cache[t];
     if (c && c !== t) return c;
+    // 出厂固定词/短语（F-019-36）—— **排在 cache（domCache.json）之后，当最后的兜底**。
+    // 0.19 审计修正（F-019-39）：原先排在词库与 cache 之前。当时理由是「压住 domCache
+    // 里已经写脏的值」，但代价更大：
+    //   ① domCache 是 DOM 层自己写的活缓存（值来自模型），seed 是打包时的**历史快照**；
+    //      让快照永久压住活缓存 = 模型后来翻好的译文永远显示不出来（那次调用白烧）；
+    //   ② 更要命的是 seed 里本来就混着模组名/合集名（`Ultimate Mod List` `Goon`
+    //      `PsychoDraugrResurrected` …，72 条里约 44 条是名字不是 UI 词），
+    //      这些名字一旦在 domCache 里有了新译文，静态表会把旧译盖回去。
+    // 脏值不再靠这条顺序兜：pruneDomCacheNames、purgeBrandTranslations、
+    // 写侧 cacheLooksDone 验收三条通道各管一段，比「用快照盖住」可控。
+    // 挪到最后不丢 F-019-36 的原意：清空缓存后 cache 查不到，这里照样兜住，固定 UI 词
+    // 不会退回英文；命中即用、不送模型的语义也没变。
+    if (seedUiTerms) {
+      const st = seedUiTerms[t];
+      if (st && st !== t) return st;
+    }
     return null;
   }
 
@@ -1269,6 +1327,12 @@ function startDomTranslator(opts) {
     return applyUnit(el, got.join(''), map, slots, { key: src, kind: 'longblock' });
   }
 
+  // ── F-019-31 / F-019-32 已整档移除（2026-11-13 用户裁决）──
+  // 原实现给名字元素 + 所在单元格打 data-zh-fit → 注入 <style> 放宽换行规则。
+  // 用户实测后判定不需要，且要求「不影响 Vortex 本身的功能表现」，故 CSS、
+  // 打标属性、观察器跳过分支、启动注入一并删除，配置项 fitNameLayout 不再被读。
+  // 复现老行为请回滚到 0.18 的 dom-translator.js，不要在这里加回半截。
+  //
   // ── 名字闸门（D1/D2/D3）──────────────────────────────────────────
   // 模组名的译文只来自状态层 cache.json（nameTranslationOf，已过验收），
   // DOM 层只读不写 domCache；查不到就按 step2 老行为——不贴、也不送模型
@@ -1382,7 +1446,10 @@ function startDomTranslator(opts) {
       // 第二参数用回调：直接传字符串的话，译文里的 $& / $` / $1 会被当成替换模式展开，
       // 该段文字会被吞掉半截，而且结果还会进缓存，重扫也修不回来。
       const next = raw.replace(t, () => hit);
-      if (next !== raw) { writing = true; node.nodeValue = next; endWrite(); live.hits++; scheduleSave(); return true; }
+      if (next !== raw) {
+        writing = true; node.nodeValue = next;
+        endWrite(); live.hits++; scheduleSave(); return true;
+      }
       return false;
     }
     // 采集是 Set，天然去重，但**没有上限**：开着采集模式长期挂机，
@@ -1664,8 +1731,10 @@ function startDomTranslator(opts) {
     flushing = true;
 
     const lanes = Math.max(1, Math.min(10, cfg.concurrency || 5));
-    // 每组条数：设置页的「每批送翻条数」按组上限算，但组内条数再多也就 12 条
-    // （本地 7B 一次输出十几条 JSON 很容易跑偏/被截断）
+    // 取样基准：决定「一次从队列取多少条待翻」（cap 在下面算），**不是实际送翻的每组条数**。
+    // 实际每组上限由 translate-core.js 的 endpointProfileOf 唯一判据决定（F-019-22：
+    // 本地 12 / 云端 24）；这里保持 12 只影响取样量，不覆盖档位、不另写第二份判据。
+    // 本地 7B 一次输出十几条 JSON 很容易跑偏/被截断，故取样也不放大。
     const per = Math.max(1, Math.min(12, cfg.batchMaxItems || cfg.batchSize || 8));
     // 一次取多少条：够喂满并发车道就行。之前是 per*lanes*4（20×2×4=160 条），
     // 一页合集 200+ 条文本会整批塞进上下文，直接撞模型窗口

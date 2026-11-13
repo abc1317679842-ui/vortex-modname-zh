@@ -632,11 +632,81 @@ function estInputTokens(s) {
   return tok;
 }
 
-/** 探测模型「实际加载」的上下文窗口。
- *  LM Studio 的 /api/v0/models 会给出 loaded_context_length（比如模型本身 256k，
- *  但界面里只加载了 4096）。请求超过它，LM Studio 直接 400
+/** 端点类型判据（全项目唯一一份）：只看地址，不猜模型名、不发厂商字段。
+ *  F-019-22：以前只有 probeContext 里一句 /127\.0\.0\.1|localhost/ 的正则，
+ *  分档要复用判据就必须抽出来，绝不在第三处再写一遍。
+ *  环回 / 本机别名 → 本地档；其余（含局域网自建、远程、云端）→ 云端档。
+ *  局域网端点也按云端档：窗口通常远大于本地 7B，且 learnCtxFrom400 只减不增
+ *  会自己收敛，估保守不会撞车。 */
+function isLocalBase(base) {
+  const s = String(base == null ? '' : base).trim().toLowerCase();
+  if (!s) return false;
+  // 去协议与路径，只留主机；再去端口（IPv6 字面量单独处理）
+  let host = s.replace(/^[a-z][a-z0-9+.-]*:\/\//, '').split('/')[0];
+  // F-019-27：Basic Auth 形态 http://user:pass@127.0.0.1:1234/v1 —— 认证前缀
+  // 不剥掉会把整串当主机名，漏判成云端档
+  host = host.replace(/^.*@/, '');
+  // 先剥端口：IPv6 字面量按 ] 收口，其余按 :数字 收口（顺序反了带端口的
+  // [::ffff:127.0.0.1]:8080 会整个被当主机名，仍然漏判）
+  const bracketEnd = host.indexOf(']');
+  if (host.charAt(0) === '[' && bracketEnd > 0) host = host.slice(0, bracketEnd + 1);
+  else host = host.replace(/:\d+$/, '');
+  // 再判 IPv4 映射的 IPv6 字面量 → 只看 IPv4 尾巴
+  const mapped = host.match(/^\[::ffff:(\d+\.\d+\.\d+\.\d+)\]$/);
+  if (mapped) host = mapped[1];
+  return host === 'localhost' || /\.localhost$/.test(host)
+    || host === '127.0.0.1' || host === '[::1]'
+    || host === '0.0.0.0' || host === '[::]' || host === 'host.docker.internal'
+    // 127.a.b.c 完整回环 / 127.1 这类 BSD 简写；`127.example.com` 是域名不是本地
+    || /^127\.\d+\.\d+\.\d+$/.test(host) || /^127\.\d+$/.test(host);
+}
+
+/** 按地址给出工程参数档位（唯一一份）。
+ *  F-019-22 / §5.2：调的是我方能算的工程旋钮，**不是各家 thinking 强度**
+ *  （F-019-17 ⛔：reasoning_effort / thinkingBudget / enable_thinking 一律不碰），
+ *  也不按模型名分叉。用户已配的 concurrency / requestDelayMs / batchCharBudget
+ *  一律不覆盖 —— 分档只改「探测失败时的 fallback」与「每组条数上限」。
+ *  ctxFallback 是「probeContext 探测失败时的窗口估值」，**不是给模型设上限卡**（§5.3）：
+ *  本地 8192、云端 1048576（「窗口未知」哨兵）。它只喂给 room / CTX_OVER 闸门，
+ *  输出预算另由 outBudgetOf 的 8192 ceiling 决定、输入另由 batchCharBudget=1200 切批 ——
+ *  所以这个值对云端几乎不改变实际行为，真正决定批次的是 maxItems 与字符预算。
+ *  真超窗口时 learnCtxFrom400 取报错里最小的数字（即 n_ctx 真窗口）**一步收敛**，不是逐次减半。
+ *  本地兜底 2026-11-13 从 4096 抬到 8192（F-019-46）：4096 会让「探测不到窗口但实际
+ *  能有 8K」的服务把窗口白瞎（每批条数被砍半、请求数翻倍）。抬高的风险由
+ *  learnCtxFrom400 兜住 —— 真只有 4K 时首请求 400，从报错里取 n_ctx 一步收敛。 */
+function endpointProfileOf(base) {
+  // 空地址按最保守的本地档：没配地址时预检本来就不发请求，档位不该反而放松
+  const local = !String(base == null ? '' : base).trim() || isLocalBase(base);
+  return {
+    kind: local ? 'local' : 'cloud',
+    ctxFallback: local ? 8192 : 1048576,
+    maxItems: local ? 12 : 24,
+    keyRequired: !local,     // 只用于设置页提示分类，不做阻断
+  };
+}
+
+/** 探测模型「实际加载」的上下文窗口（多后端，F-019-46）。
+ *  三家本地服务端各有一套端点，只认 LM Studio 会把 Ollama / llama.cpp / vLLM
+ *  的窗口全部落到「探测失败」档，窗口再大也白瞎（用户 2026-11-13 提的就是这个）。
+ *  按顺序试，谁先给出**运行时真实窗口**就用谁：
+ *    ① LM Studio  GET  /api/v0/models  → loaded_context_length（优先）/ max_context_length
+ *    ② Ollama     GET  /api/ps         → 已加载模型的 context_length（= 运行时 num_ctx）
+ *    ③ llama.cpp  GET  /props          → default_generation_settings.n_ctx（或顶层 n_ctx）
+ *    ④ vLLM/通用  GET  {base}/models   → max_model_len（或 context_length）
+ *  都拿不到才落到 endpointProfileOf().ctxFallback。
+ *
+ *  ⚠ **故意不用 Ollama 的 /api/show**：它给的是 model_info.<arch>.context_length，
+ *  那是**模型训练窗口**（可能 128K），不是运行时 num_ctx（常见 2048/4096）。拿它当
+ *  窗口会估高，而 Ollama 超窗口不是报 400 而是**静默截断**——等于悄悄译半句，
+ *  比估低还糟。宁可用 /api/ps 的已加载值，模型没加载就先按兜底跑，加载后下一轮
+ *  （TTL 60 秒）自动读到真值。
+ *
+ *  LM Studio 的 /api/v0/models 必须优先用 loaded_context_length：模型本身 262144，
+ *  界面里只加载了 8192 是常态。请求超过它，LM Studio 直接 400
  *  "Context size has been exceeded" —— 整批作废、队列看起来像空跑，
- *  这就是合集页等几分钟还是英文的根因。拿不到就按本地 4096 / 云端 8192 保守估。 */
+ *  这就是合集页等几分钟还是英文的根因。云端这些端点实测 401/404，拿不到窗口，
+ *  于是按档位 fallback（本地 8192 / 云端 1048576 哨兵，F-019-26）。
+ *  真撞到窗口时 learnCtxFrom400 从 400 报错里取最小数字（即 n_ctx 真窗口）一步收敛。 */
 let ctxCache = { key: '', ctx: 0, at: 0, learned: false };
 const CTX_TTL_MS = 60000;          // 探测值的有效期
 const CTX_LEARNED_TTL_MS = 300000; // 从服务端 400 学到的值的有效期（长一些，避免每 60 秒重新撞同一堵墙）
@@ -644,18 +714,61 @@ async function probeContext(base, key, model) {
   const k = String(base) + '|' + String(model);
   const ttl = ctxCache.learned ? CTX_LEARNED_TTL_MS : CTX_TTL_MS;
   if (ctxCache.key === k && Date.now() - ctxCache.at < ttl) return ctxCache.ctx;
+
+  const root = String(base).replace(/\/v1\/?$/i, '').replace(/\/+$/, '');
+  const auth = key ? { Authorization: 'Bearer ' + key } : {};
+  const getJson = async (url, ms) => {
+    try {
+      const r = await httpRequest(url, 'GET', auth, null, ms);
+      if (r.status >= 200 && r.status < 300) return JSON.parse(r.body);
+    } catch (e) { /* 端点不存在 / 超时 → 当作这家没有 */ }
+    return null;
+  };
+  const num = (v) => { const n = Number(v); return Number.isFinite(n) && n >= 1024 ? n : 0; };
+
+  // 四家**并发**问，谁有按优先级取 —— 串行的话「四家都没有」要等 4 次超时叠起来
+  // （云端最坏 6+4+4+6=20 秒，一次翻译开头就白等）；并发最坏只是最慢那一个（6 秒），
+  // 和改动前「只问一家」的等待一致。局域网里的 LM Studio 也能覆盖到（不按地址分档）。
+  const [jLm, jOl, jLl, jVl] = await Promise.all([
+    getJson(root + '/api/v0/models', 4000),
+    getJson(root + '/api/ps', 4000),
+    getJson(root + '/props', 4000),
+    getJson(String(base).replace(/\/+$/, '') + '/models', 6000),
+  ]);
+
   let ctx = 0;
-  try {
-    const root = String(base).replace(/\/v1\/?$/i, '');
-    const r = await httpRequest(root + '/api/v0/models', 'GET',
-      key ? { Authorization: 'Bearer ' + key } : {}, null, 6000);
-    if (r.status >= 200 && r.status < 300) {
-      const j = JSON.parse(r.body);
-      const m = (j.data || []).find((x) => x.id === model) || {};
-      ctx = Number(m.loaded_context_length || m.max_context_length || 0) || 0;
+  // ① LM Studio：loaded 优先于 max（模型 262144 但只加载 8192 是常态）
+  if (jLm) {
+    const m = (jLm.data || []).find((x) => x.id === model) || {};
+    ctx = num(m.loaded_context_length) || num(m.max_context_length);
+  }
+  // ② Ollama：/api/ps 的 context_length 就是已加载模型的运行时 num_ctx
+  if (!ctx && jOl) {
+    const list = jOl.models || [];
+    const m = list.find((x) => x.name === model || x.model === model
+      || String(x.name || '').indexOf(model) === 0) || list[0] || {};
+    ctx = num(m.context_length);
+  }
+  // ③ llama.cpp server：n_ctx 是启动参数里的真实窗口
+  if (!ctx && jLl) {
+    ctx = num(jLl.default_generation_settings && jLl.default_generation_settings.n_ctx) || num(jLl.n_ctx);
+  }
+  // ④ vLLM / 其它 OpenAI 兼容：max_model_len 是 served 窗口
+  if (!ctx && jVl) {
+    const list = jVl.data || [];
+    const m = list.find((x) => x.id === model) || list[0] || {};
+    ctx = num(m.max_model_len) || num(m.context_length);
+  }
+  if (!ctx) {
+    // 探测失败时**保留从 400 学到的真实窗口**：否则 4K 服务器会被兜底 8192 顶回去，
+    // 每过一个 learned TTL 就重新撞一次同一堵墙（用户侧表现＝周期性整批失败）。
+    if (ctxCache.key === k && ctxCache.learned && ctxCache.ctx > 0) {
+      ctxCache.at = Date.now();
+      return ctxCache.ctx;
     }
-  } catch (e) { ctx = 0; }
-  if (!ctx) ctx = /127\.0\.0\.1|localhost/i.test(String(base)) ? 4096 : 8192;
+    // F-019-22：地址判据与档位值唯一一份，不再在这里另写正则 / 另写数字
+    ctx = endpointProfileOf(base).ctxFallback;
+  }
   ctxCache = { key: k, ctx, at: Date.now(), learned: false };
   return ctx;
 }
@@ -727,6 +840,76 @@ function lostToolTerms(src, zh) {
     if (re.test(s) && !re.test(o)) out.push(t.en);
   }
   return out;
+}
+
+/** 输出预算（F-019-15）：正文需求 + 思考余量，受窗口余量与硬上限约束。
+ *  `max_tokens` 是**上限不是预分配**：不思考的模型（本地 hy-mt2-7b）到 stop 就结束，
+ *  放大它不增加生成长度和耗时（本地对照实测 12 条 3.6s / 49 completion tokens）；
+ *  思考型模型（deepseek-flash / Qwen3-Thinking / vLLM 推理族）的 reasoning_content
+ *  与正文**共用这份预算**，不给余量就会得到 HTTP 200 + content:"" +
+ *  finish_reason:"length"（2026-11-13 真机连出 6 次）。
+ *  统一实现，不识别本地/云端：本地会被较小的 room 自动卡住，云端自然放开。
+ *  自包含（不引模块级常量）：沙箱按函数名抽源码时可直接 new Function 执行。 */
+function outBudgetOf(want, room, opts) {
+  const o = opts || {};
+  const headroom = Number(o.thinkHeadroom) > 0 ? Number(o.thinkHeadroom) : 4096;
+  const ceiling = Number(o.ceiling) > 0 ? Number(o.ceiling) : 8192;
+  const floor = 256;
+  const w = Number(want) > 0 ? Number(want) : floor;
+  const r = Number(room) > 0 ? Number(room) : floor;
+  return Math.max(floor, Math.min(Math.max(w, floor) + headroom, r, ceiling));
+}
+
+/** 空正文后的重试预算：翻倍一次，仍受窗口余量与 2× 硬上限约束。
+ *  拿不到更大的值就返回 0 = 不再重试（有界，绝不无限加倍）。 */
+function retryBudgetOf(used, room, opts) {
+  const o = opts || {};
+  const ceiling = (Number(o.ceiling) > 0 ? Number(o.ceiling) : 8192) * 2;
+  const u = Number(used) || 0;
+  const r = Number(room) > 0 ? Number(room) : 0;
+  const next = Math.min(u * 2, r, ceiling);
+  return next > u ? next : 0;
+}
+
+/** 统一解析 chat/completions 响应：不只取 content，把判空要用的信号一起拿出来。
+ *  旧实现只读 message.content / choices[0].text / j.content，看不见 finish_reason，
+ *  于是把「预算被思考吃光」当成「模型不肯翻」，进逐条补发（单条预算更小，必然也空）。 */
+function readChatCompletion(j) {
+  const ch = (j && j.choices && j.choices[0]) || null;
+  const msg = (ch && ch.message) || {};
+  let content = '';
+  if (msg.content != null) content = String(msg.content);
+  else if (ch && ch.text != null) content = String(ch.text);
+  else if (j && j.content != null) content = String(j.content);
+  return {
+    content: content,
+    finishReason: String((ch && ch.finish_reason) || ''),
+    reasoningLen: String(msg.reasoning_content || '').length,
+    completionTokens: (j && j.usage && j.usage.completion_tokens) || 0,
+  };
+}
+
+/** 空正文要不要加预算重发？返回新的预算；0 = 不重发。
+ *  只认「content 空 + finish_reason=length」这一指纹：那是思考吃光预算，
+ *  不是内容翻不了、也不是审核拦截。其它原因的空正文保持旧行为（不重试）。
+ *  抽成单独函数是为了让判据能行为级测，而不是散在 llmTranslate 的胶水里。 */
+function shouldRetryEmpty(parsed, used, room, opts) {
+  const p = parsed || {};
+  if (p.content) return 0;
+  if (p.finishReason !== 'length') return 0;
+  return retryBudgetOf(used, room, opts);
+}
+
+/** 空正文错误的结构化探针（F-019-16）。带现场判据，不把响应体整段塞进日志。 */
+function emptyProbeOf(parsed, outTokens, body) {
+  const p = parsed || {};
+  return JSON.stringify({
+    finishReason: p.finishReason || '',
+    reasoningLen: p.reasoningLen || 0,
+    completionTokens: p.completionTokens || 0,
+    outTokens: Number(outTokens) || 0,
+    body: String(body || '').slice(0, 220),
+  });
 }
 
 async function llmTranslate(cfg, texts, modeOverride, extraRule) {
@@ -856,31 +1039,46 @@ async function llmTranslate(cfg, texts, modeOverride, extraRule) {
     e.code = 'CTX_OVER';
     throw e;                                                 // 上层把这批劈半重发
   }
-  const outTokens = Math.max(256, Math.min(want, room, 4096));
-
-  const body = JSON.stringify({
-    model: model,
-    messages: [
-      { role: 'system', content: sysPrompt },
-      { role: 'user', content: JSON.stringify(safeList) },
-    ],
-    temperature: 0.2,
-    max_tokens: outTokens,
-  });
+  // F-019-15：见 outBudgetOf 注释。统一实现，不识别本地/云端 —— 本地 4K 窗口算出的
+  // room 会把预算自然卡住，云端窗口大就自然放开，不需要按地址分叉，也不需要发任何
+  // 厂商专属的「关思考」字段（各家拼法不同、实测 28% 路由不认，见版本文档 §5.1）。
+  const outTokens = outBudgetOf(want, room);
 
   const url = base + '/chat/completions';
   const headers = Object.assign({ 'Content-Type': 'application/json' },
     key ? { Authorization: 'Bearer ' + key } : {});
-  let r = await httpRequest(url, 'POST', headers, body, 180000);
 
-  // 429 / 502 / 503 / 504 是「服务端暂时不收」，不是「这段内容翻不了」。
-  // 不在这里退避重试的话，云端一次限流就把整批打成失败、再逐条各失败一次，
-  // 几轮之后条目被判放弃，用户只能清缓存重来。按 Retry-After 等，最多两次。
-  for (let attempt = 0; attempt < 2 &&
-    (r.status === 429 || r.status === 502 || r.status === 503 || r.status === 504); attempt++) {
-    const ra = Number((r.headers && (r.headers['retry-after'] || r.headers['Retry-After'])) || 0);
-    await delay(ra > 0 ? Math.min(ra * 1000, 15000) : 1200 * (attempt + 1));
-    r = await httpRequest(url, 'POST', headers, body, 180000);
+  // 一次 POST（含原有 429/502/503/504 退避，最多两次）。抽成闭包是为了让
+  // 「空正文 + finish_reason=length → 加倍预算重发一次」复用同一套退避逻辑。
+  const postChat = async (tokens) => {
+    const payload = JSON.stringify({
+      model: model,
+      messages: [
+        { role: 'system', content: sysPrompt },
+        { role: 'user', content: JSON.stringify(safeList) },
+      ],
+      temperature: 0.2,
+      max_tokens: tokens,
+    });
+    let rr = await httpRequest(url, 'POST', headers, payload, 180000);
+    for (let attempt = 0; attempt < 2 &&
+      (rr.status === 429 || rr.status === 502 || rr.status === 503 || rr.status === 504); attempt++) {
+      const ra = Number((rr.headers && (rr.headers['retry-after'] || rr.headers['Retry-After'])) || 0);
+      await delay(ra > 0 ? Math.min(ra * 1000, 15000) : 1200 * (attempt + 1));
+      rr = await httpRequest(url, 'POST', headers, payload, 180000);
+    }
+    return rr;
+  };
+
+  let r = await postChat(outTokens);
+  // 只在「成功响应 + 空正文 + finish_reason=length」时加预算重发一次。
+  // 结构化 JSON 输出被截断时不能续写拼接（会漂移 / 重开键），只能整批丢弃重发。
+  // 非 length 的空正文（模型真没吐东西 / 审核）保持旧行为，不重试。
+  if (r.status >= 200 && r.status < 300) {
+    let peek = null;
+    try { peek = readChatCompletion(JSON.parse(r.body)); } catch (e) { peek = null; }
+    const bigger = shouldRetryEmpty(peek, outTokens, room);
+    if (bigger) r = await postChat(bigger);
   }
 
   if (r.status < 200 || r.status >= 300) {
@@ -894,14 +1092,14 @@ async function llmTranslate(cfg, texts, modeOverride, extraRule) {
     throw new Error('HTTP ' + r.status + ' ' + r.body.slice(0, 200));
   }
 
-  const j = JSON.parse(r.body);
-  let content = '';
-  if (j && j.choices && j.choices[0]) {
-    content = (j.choices[0].message && j.choices[0].message.content) || j.choices[0].text || '';
-  } else if (j && j.content) {
-    content = j.content;
+  const got = readChatCompletion(JSON.parse(r.body));
+  const content = got.content;
+  if (!content) {
+    // 探针（F-019-16）：把 finish_reason / reasoning 长度 / 用量结构化带上。
+    // 上层 lastErr 已从 140 提到 600，这些字段能完整落到 translator.log，
+    // 下次真机一翻译就能看到，不需要用户额外跑探针。
+    throw new Error('模型返回为空: ' + emptyProbeOf(got, outTokens, r.body));
   }
-  if (!content) throw new Error('模型返回为空: ' + r.body.slice(0, 300));
 
   // 拒收要分原因：finishOne 里 5 个「宁可留英文」的出口都是**格式不合规**，
   // 不是「模型不肯翻」。以前它们统一返回原文，上层就按「照抄」处理，两次即判 -1 不可译、
@@ -1461,6 +1659,113 @@ function findMisaligned(chunk, out) {
   return Array.from(new Set(bad)).sort((x, y) => x - y);
 }
 
+/** F-019-33：全批「译文归属」守卫（跨组 / 跨车道）。
+ *
+ *  B3（findMisaligned）只在**同一组内**找「相邻重复译文」+「拉丁锚点保留」，
+ *  而 splitIndexed 按字符预算 / `mod:`+`dl:` 分车把一批切成多组：云端模型把
+ *  A 的译文填到 B 的位置时，两组各自都看不出异常；中文译文又几乎没有 ≥5 字母的
+ *  拉丁锚点（注释自认存活率 9.8%）→ 两路证据同时失效，错译文直写 cache.json。
+ *  这里拿**全批** texts + results 一起判，分强 / 弱两档：
+ *    S1 强：同一译文被多条「非本质同源」的源文占用 → 至少一条串位。
+ *           nearSameSource 复用 B3 的精度闸（同族 / 只差标点 / mod 与 dlname
+ *           同键 属合法重复，不判）。
+ *    S2 强：源文没有版本号，译文却带了**本批别的源文里出现过**的版本号 →
+ *           这条译文是别人的（真机 `Lily…` 译文里冒出 `v2.7.4`）。
+ *    W1 弱：源文带版本号、译文一个版本号都没有 → 可能串位，也可能只是模型
+ *           省略版本号。所以弱档只触发一次单条重译、且只在「重译把版本号带
+ *           回来」时才覆盖，**绝不置 null**（不能把合格译文改成英文）。
+ *  @returns {{strong:number[], weak:number[]}} 下标升序、去重、weak 不含 strong
+ */
+function findCrossGroupClash(texts, results) {
+  const strong = new Set();
+  const weak = new Set();
+  if (!Array.isArray(texts) || !Array.isArray(results)) return { strong: [], weak: [] };
+  const n = Math.min(texts.length, results.length);
+  if (n < 2) return { strong: [], weak: [] };       // 单条批次没有「跨组」概念
+  const vals = new Array(n);
+  for (let i = 0; i < n; i++) vals[i] = String(results[i] == null ? '' : results[i]).trim();
+
+  // S1：按译文分组，只要组里存在两条源文不是「本质同一条」，整组标强可疑。
+  const byVal = new Map();
+  for (let i = 0; i < n; i++) {
+    if (!vals[i]) continue;                        // 空条目走补 null，不在这里判
+    if (!byVal.has(vals[i])) byVal.set(vals[i], []);
+    byVal.get(vals[i]).push(i);
+  }
+  for (const idxs of byVal.values()) {
+    if (idxs.length < 2) continue;
+    let clash = false;
+    for (let a = 0; a < idxs.length && !clash; a++) {
+      for (let b = a + 1; b < idxs.length; b++) {
+        if (!nearSameSource(texts[idxs[a]], texts[idxs[b]])) { clash = true; break; }
+      }
+    }
+    if (clash) for (const i of idxs) strong.add(i);
+  }
+
+  // S2 / W1：版本号证据。正则内联字面量，避免全局正则的 lastIndex 与模块级常量依赖。
+  const srcVers = new Set();
+  for (let i = 0; i < n; i++) {
+    const m = String(texts[i] == null ? '' : texts[i]).match(/\d+\.\d+(?:\.\d+)*/g) || [];
+    for (const v of m) srcVers.add(v);
+  }
+  for (let i = 0; i < n; i++) {
+    if (!vals[i] || strong.has(i)) continue;
+    const sv = String(texts[i] == null ? '' : texts[i]);
+    const hasSrcVer = (sv.match(/\d+\.\d+(?:\.\d+)*/g) || []).length > 0;
+    const outVers = vals[i].match(/\d+\.\d+(?:\.\d+)*/g) || [];
+    if (!hasSrcVer && outVers.some((v) => srcVers.has(v))) strong.add(i);
+    else if (hasSrcVer && outVers.length === 0) weak.add(i);
+  }
+  const strongArr = Array.from(strong).sort((x, y) => x - y);
+  const weakArr = Array.from(weak).filter((i) => !strong.has(i)).sort((x, y) => x - y);
+  return { strong: strongArr, weak: weakArr };
+}
+
+/** F-019-33：把 findCrossGroupClash 的判据结果兑现成修复动作。
+ *  强档：单条重译一次；新值不再触发强判据才覆盖，否则置 null（宁可留英文，绝不写错译文）。
+ *  弱档：单条重译一次；只有「把版本号带回来」才覆盖，否则**保留原值**。
+ *  两档都沿用「照抄原文不算修好」；每次重译之间照常 delay，不并发打模型。
+ *  @returns {{changed:number[], retried:number}} changed 含「被置 null」的下标，
+ *           调用方要据此撤掉按组贴屏已写下的旧值。
+ */
+async function repairCrossGroupClash(cfg, texts, results, mode) {
+  const { strong, weak } = findCrossGroupClash(texts, results);
+  const changed = [];
+  let retried = 0;
+  const askOne = async (i) => {
+    try {
+      const one = await llmTranslate(cfg, [texts[i]], mode);
+      if (one && one[0] != null && one[0] !== texts[i]) return one[0];
+    } catch (e) { /* 交给上层按失败处理 */ }
+    return null;
+  };
+  // ★ 判据必须基于**事故现场快照**：串行重译时 results 会被前面的修复改掉，
+  //   若拿「边修边变的中间态」去判，一条与原值一模一样的错译文会因为重复组
+  //   已被前一条置 null 而不再构成重复 → 被误当成修好覆盖回去（审计实测）。
+  const snapshot = results.slice();
+  const stillStrong = (i, val) => {
+    const probe = snapshot.slice();
+    probe[i] = val;
+    return findCrossGroupClash(texts, probe).strong.indexOf(i) >= 0;
+  };
+  for (const i of strong.slice(0, 20)) {
+    const cand = await askOne(i);
+    if (cand != null && !stillStrong(i, cand)) { results[i] = cand; retried++; }
+    else results[i] = null;                    // 强证据仍成立 → 保持英文，绝不写错译文
+    changed.push(i);
+    await delay(cfg.requestDelayMs || 150);
+  }
+  for (const i of weak.slice(0, 10)) {
+    const cand = await askOne(i);
+    // 弱证据只有「原本无版本号 → 重译后有版本号」才算改善；照抄 / 抛错都保留原值。
+    const candHasVer = (String(cand == null ? '' : cand).match(/\d+\.\d+(?:\.\d+)*/g) || []).length > 0;
+    if (cand != null && candHasVer && !stillStrong(i, cand)) { results[i] = cand; changed.push(i); retried++; }
+    await delay(cfg.requestDelayMs || 150);
+  }
+  return { changed, retried };
+}
+
 async function translateBatch(cfg, cache, texts, mode, splitKey) {
   const rejects = new Set();
   const budget = Math.max(400, cfg.batchCharBudget || 2400);
@@ -1568,10 +1873,13 @@ async function translateBatch(cfg, cache, texts, mode, splitKey) {
   // 失败原因带给调用方（DOM 层日志的 `err:` 读的就是这个字段）。
   // 以前 translateBatch 从不设 __err，DOM 日志里只有 nullN 没有原因。
   try { res.__err = batchErr; } catch (e) { /* ignore */ }
+  // F-019-33：与 translateConcurrently 共用同一份全批归属守卫（同一判据不许两份实现）。
+  // 本入口主要服务单条探针 / 探活（n===1 恒不命中，零开销）；DOM 层若走多文本批次同样受保护。
+  if (mode === 'mod' && texts.length > 1) await repairCrossGroupClash(cfg, texts, res, mode);
   return res;
 }
 
-async function translateConcurrently(cfg, cache, texts, concurrency, onProgress, mode, onItem, onGroup, splitKey) {
+async function translateConcurrently(cfg, cache, texts, concurrency, onProgress, mode, onItem, onGroup, splitKey, onGroupDone, onCorrection) {
   const rejects = new Set();
   const lanes = Math.max(1, Math.min(10, concurrency || 5));
   // 按字符预算切块（不再固定每批 20 条）：20 条长文一批输出会爆 max_tokens 被截断，
@@ -1581,7 +1889,10 @@ async function translateConcurrently(cfg, cache, texts, concurrency, onProgress,
   // 每组条数上限：小批更容易并行、单批输出不会爆 max_tokens；同类插件默认也是 8 条/批
   // 设置页那一项写的是 batchSize，这里以前只读 batchMaxItems（这个键 UI 里根本不存在），
   // 所以「每批送翻条数」改成 20 也没有任何效果，恒定 8 条。
-  const maxItems = Math.max(1, Math.min(12, cfg.batchMaxItems || cfg.batchSize || 8));
+  // F-019-22：硬上限不再写死 12，按地址档位取（本地 12 / 云端 24），仍受用户
+  // batchSize 与下面 1200 字符预算双重约束。**不覆盖用户已配的并发 / 延迟 / 字符预算**。
+  const ep = endpointProfileOf(cfg.provider && cfg.provider.baseUrl);
+  const maxItems = Math.max(1, Math.min(ep.maxItems, cfg.batchMaxItems || cfg.batchSize || 8));
   const groups = splitIndexed(texts, budget, lanes, maxItems, splitKey);
   if (groups.length === 0) return [];
 
@@ -1589,9 +1900,22 @@ async function translateConcurrently(cfg, cache, texts, concurrency, onProgress,
   let cursor = 0;
   let finished = 0;
   let retried = 0;
+  // F-019-16：错误串统一留 600 字符（原 140）。空正文探针带 finishReason /
+  // reasoningLen / completionTokens / outTokens，140 会把它们全切掉，现场只剩
+  // `"choices":[{"i` —— 本轮误判成内容审核就是这么来的。5 处调用点逐一对齐。
   let lastErr = '';
   // 面板用：告诉外面「这一组真的发出去了 / 回来了」，而不是把整批都算成正在翻译
   const emit = (ev) => { if (typeof onGroup === 'function') { try { onGroup(ev); } catch (e) { /* 面板回调不影响翻译 */ } } };
+  // F-019-24 边翻边贴：一组译文「全部加工完毕」后按组贴屏。传的是**最终 results**
+  // （补 null / 错位守卫 / 出口判据都已经跑完），不是模型原始 out。
+  // 只有两条主链路传这个回调；translateAllFresh（有 doneMods 首中即胜，改序会翻车）
+  // 与 DOM 层不传，保持全批完成再贴。回调抛错绝不能让整组被 catch 判失败、
+  // 再走逐条兜底重发 —— 所以 core 与调用方两层都包 try/catch。
+  const emitDone = (idxs) => {
+    if (typeof onGroupDone !== 'function') return;
+    try { onGroupDone(idxs, idxs.map((i) => results[i])); }
+    catch (e) { /* 贴屏回调失败不影响翻译，调用方末尾补漏循环会兜住 */ }
+  };
 
   const runGroup = async (g) => {
     const chunk = g.map((i) => texts[i]);
@@ -1610,7 +1934,7 @@ async function translateConcurrently(cfg, cache, texts, concurrency, onProgress,
           const one = await llmTranslate(cfg, [chunk[k]], mode);
           if (one && one[0] != null) results[g[k]] = one[0];
           else lastErr = 'empty single';
-        } catch (e) { lastErr = String((e && e.message) || e).slice(0, 140); }
+        } catch (e) { lastErr = String((e && e.message) || e).slice(0, 600); }
         await delay(cfg.requestDelayMs || 150);
       }
       // 串行错位守卫（B3）：只差标点的两条名字会让模型少给一条译文再重复最后一条，
@@ -1626,7 +1950,7 @@ async function translateConcurrently(cfg, cache, texts, concurrency, onProgress,
           // 同 translateBatch：照抄原文不算修好（短名常态），否则会把一条正确的中文
           // 覆盖成英文原文。retried 只记真正被换掉的条数，照抄不计。
           if (one && one[0] != null && one[0] !== chunk[k]) { results[g[k]] = one[0]; retried++; }
-        } catch (e) { lastErr = String((e && e.message) || e).slice(0, 140); }
+        } catch (e) { lastErr = String((e && e.message) || e).slice(0, 600); }
         await delay(cfg.requestDelayMs || 150);
       }
       // 出口判据（0.18）：原文里的工具词在译文里一个都不剩 → 单条重问一次，指名要求保留。
@@ -1648,7 +1972,7 @@ async function translateConcurrently(cfg, cache, texts, concurrency, onProgress,
               results[g[k]] = cand;
               retried++;
             }
-          } catch (e) { lastErr = String((e && e.message) || e).slice(0, 140); }
+          } catch (e) { lastErr = String((e && e.message) || e).slice(0, 600); }
           await delay(cfg.requestDelayMs || 150);
         }
       }
@@ -1659,6 +1983,7 @@ async function translateConcurrently(cfg, cache, texts, concurrency, onProgress,
           try { onItem(g[k], chunk[k], results[g[k]]); } catch (e) { /* 面板回调失败不影响翻译 */ }
         }
       }
+      emitDone(g);   // F-019-24：这组可以贴屏了，不必等其他车道
       return;
     } catch (e) {
       // 上下文超限：劈半重发。整组直接判失败会让页面永远停在英文（用户实测「等几分钟还是英文」）
@@ -1669,7 +1994,7 @@ async function translateConcurrently(cfg, cache, texts, concurrency, onProgress,
         await runGroup(g.slice(half));
         return;
       }
-      lastErr = String((e && e.message) || e).slice(0, 140);
+      lastErr = String((e && e.message) || e).slice(0, 600);
     } finally {
       emit({ type: 'end', idxs: g });
     }
@@ -1678,7 +2003,7 @@ async function translateConcurrently(cfg, cache, texts, concurrency, onProgress,
         const c = cache[chunk[k]];
         if (c) { results[g[k]] = c; continue; }
         results[g[k]] = (await llmTranslate(cfg, [chunk[k]], mode))[0] || null;
-      } catch (e) { lastErr = String((e && e.message) || e).slice(0, 140); }
+      } catch (e) { lastErr = String((e && e.message) || e).slice(0, 600); }
       finished += 1;
       if (onProgress) onProgress(finished, texts.length);
       await delay(cfg.requestDelayMs || 150);
@@ -1696,6 +2021,21 @@ async function translateConcurrently(cfg, cache, texts, concurrency, onProgress,
   const workers = [];
   for (let i = 0; i < Math.min(lanes, groups.length); i++) workers.push(worker());
   await Promise.all(workers);
+  // F-019-33：所有车道都回来之后才能判「跨组错位」——组内 B3 看不见别组的译文。
+  // translateAllFresh 在本函数返回后才 apply，天然吃到纠正后的 results；
+  // 两条流式链路已按组贴过屏，靠第 11 参 onCorrection 用纠正值强制覆盖。
+  if (mode === 'mod' && texts.length > 1) {
+    const rep = await repairCrossGroupClash(cfg, texts, results, mode);
+    retried += rep.retried;
+    if (rep.changed.length) {
+      if (typeof onCorrection === 'function') {
+        try { onCorrection(rep.changed, rep.changed.map((i) => results[i])); }
+        catch (e) { /* 纠正回调失败不影响翻译结果 */ }
+      }
+      // 现场判据：真机一翻译就能在日志里看到有没有触发、触发几条，不用再猜。
+      if (typeof log === 'function') log('info', 'cross group clash repaired', { n: rep.changed.length, retried: rep.retried });
+    }
+  }
   try { results.__err = lastErr; } catch (e) { /* ignore */ }
   // retried 只记「真被换掉」的条数（照抄不计）。挂出来给验收方核对口径用。
   try { results.__retried = retried; } catch (e) { /* ignore */ }
@@ -1719,13 +2059,22 @@ module.exports = {
   splitIndexed,
   pickModel,
   probeContext,
+  isLocalBase,
+  endpointProfileOf,
   estInputTokens,
   learnCtxFrom400,
   _ctxCache: () => ctxCache,
+  outBudgetOf,
+  retryBudgetOf,
+  readChatCompletion,
+  shouldRetryEmpty,
+  emptyProbeOf,
   llmTranslate,
   libreTranslate,
   findMisaligned,
   findRepeatPadding,
+  findCrossGroupClash,
+  repairCrossGroupClash,
   sfwInverted,
   translateBatch,
   translateConcurrently,

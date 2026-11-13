@@ -3,11 +3,11 @@
 把 [Vortex](https://www.nexusmods.com/site/mods/1)（Nexus Mods 官方的模组管理器）变成中文的。
 一个扩展搞定，不依赖任何第三方中文包。
 
-![version](https://img.shields.io/badge/version-0.18.0-blue)
+![version](https://img.shields.io/badge/version-0.19.0-blue)
 ![platform](https://img.shields.io/badge/platform-Windows-lightgrey)
 ![license](https://img.shields.io/badge/license-MIT%20%2B%20CC%20BY--NC--SA-green)
 
-> 界面汉化 6185 条（语言包实际写入条数，可在 `%APPDATA%\Vortex\locales\zh\_vortex-modname-zh.json` 的 `entries` 字段核对）/ 游戏固定译名 759 条 / 模组名、合集名、更新日志走 AI 翻译
+> 界面汉化 6372 条（语言包实际写入条数，可在 `%APPDATA%\Vortex\locales\zh\_vortex-modname-zh.json` 的 `entries` 字段核对）/ 游戏固定译名 759 条 / 模组名、合集名、更新日志走 AI 翻译
 
 📦 **本扩展也已发布到 Nexus Mods：[Vortex Full Chinese Localization - AI Mod Name Translation](https://www.nexusmods.com/site/mods/2475)**
 
