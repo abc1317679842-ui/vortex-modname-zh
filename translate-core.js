@@ -138,7 +138,11 @@ function applyTerms(text, terms, direction) {
   for (const t of sorted) {
     if (!t.en || !t.zh) continue;
     if (direction === 'mask') out = maskOne(out, t);
-    else out = out.replace(new RegExp('『' + escapeRegExp(t.zh) + '』', 'g'), t.zh);
+    // 0.20 F-020-06：还原必须用**函数式替换**。以前传字符串 t.zh，词库里只要出现
+    // `$&` / `$1` / `$'` / `` $` `` 就会被 String.replace 当替换模式解释（`$&` 展开成
+    // 匹配到的整段、`$'` 展开成剩余全文），静默写出错译文且无任何日志。
+    // 概率极低（词库是人工维护的中文名），但一旦命中就是「无痕错译」，代价不对称。
+    else out = out.replace(new RegExp('『' + escapeRegExp(t.zh) + '』', 'g'), () => t.zh);
   }
   return out;
 }
@@ -324,8 +328,14 @@ const BB_HEAD = 'b|i|u|s|url|img|quote|spoiler|list|\\*|color|size|font|center|c
 
 function protectPaths(text, box) {
   let s = String(text);
+  // F-020-23（v4 审计 §8.2）：源文本**自带** `{{P1}}` 这类字面量时不能再用同号占位符。
+  // 实锤：`has {{P1}} and C:\a\b.txt` → protect 成 `has {{P1}} and {{P1}}`，还原时
+  // 两处都被换成路径 → **用户原文被静默篡改**，而且所有守卫都看不出来（占位符数量对得上、
+  // 还原后也没有残留）。先把源里已占用的编号记下来，生成时跳过。
+  const taken = new Set(s.match(/\{\{P\d+\}\}/g) || []);
   const put = (frag) => {
-    const k = '{{P' + (box.seq++) + '}}';
+    let k = '{{P' + (box.seq++) + '}}';
+    while (taken.has(k)) k = '{{P' + (box.seq++) + '}}';
     box.map.set(k, frag);
     return k;
   };
@@ -335,9 +345,16 @@ function protectPaths(text, box) {
   s = s.replace(/\[\/?(?:b|i|u|s|url|img|quote|spoiler|list|\*|color|size|font|center|code|table|tr|td|th|h[1-6])(?:=[^\]]{0,64})?\]/gi,
     (m) => put(m));
   // 盘符路径 C:\Users\...\x.log
-  s = s.replace(/[A-Za-z]:\\(?:[^\\\s"'<>|*?]+\\)*[^\\\s"'<>|*?]*/g, (m) => (m.length > 3 ? put(m) : m));
+  // ⚠ 字符类里排除 `{}` 是**必须的**（F-020-22 / v4 审计 §8.1）：上一步刚把 BBCode
+  // 换成 `{{P2}}`，不排除就会把紧贴路径的占位符一起吞进路径值里 —— 实测
+  // `[b]C:\a\b.zip[/b]` → `{{P1}}C:\a\b.zip{{P2}}` → 路径正则把 `C:\a\b.zip{{P2}}`
+  // 整段吃掉，还原时 `{{P2}}` 的轮次已经过去，永久残留在译文里。路径里不会有 `{`。
+  s = s.replace(/[A-Za-z]:\\(?:[^\\\s"'<>|*?{}]+\\)*[^\\\s"'<>|*?{}]*/g, (m) => (m.length > 3 ? put(m) : m));
   // URL 整条
-  s = s.replace(/https?:\/\/[^\s"'<>）)】]+/g, (m) => put(m));
+  // ⚠ 同样必须排除 `{}`：`[img]https://cdn.e.com/a.png[/img]` 里 URL 紧贴 `{{P2}}`，
+  // 不排除就把占位符吞掉。这是 Nexus 描述里最常见的写法，命中后该条**永远翻不出来**
+  // （占位符缺失 → 1242 的 box 校验打回 → 界面一直英文），不是偶发。
+  s = s.replace(/https?:\/\/[^\s"'<>）)】{}]+/g, (m) => put(m));
   // 游戏名紧贴在路径分隔符前：The Witcher 3\mods\xxx
   for (const a of PATH_GAME_ALIASES) {
     const re = new RegExp(escapeRegExp(a) + '(?=\\s*[\\\\/])', 'g');
@@ -1130,8 +1147,30 @@ async function llmTranslate(cfg, texts, modeOverride, extraRule) {
     // 0.18：这里必须遍历 maskTerms 而不是 terms —— TOOL_TERMS 里有一批词（CNS、CBBE、
     // ImprovedUI…）不在 190 条词库里，只存在于 maskTerms。用 terms 的话，模型把
     // 『CNS』改写成「CNS」时这一层就还原不了，界面上会留下「CNS」款赛车服模组（真机实录）。
+    // F-020-28（2026-11-14 多样性专项实修）：这段循环本意是清「模型自己给术语套的壳」，
+    // 但 `Skyrim Script Extender (SKSE64)` → `上古卷轴5脚本扩展（SKSE64）` 这种
+    // **原文自带**的合法括注也会被剥成 `…扩展SKSE64`（粘连）。实测真实语料 49 条命中，
+    // 旧逻辑只保住 1 条。修法：剥之前先看原始原文 `src` 里是否本来就用同一对括号
+    // 包住这个术语 —— 是就整条跳过。src 是 texts[i]（未遮罩未保护的原文），可直接判。
+    // 取舍：同一术语在译文里既出现合法括注、又出现模型自造壳时，连自造壳也不剥
+    // （保守：宁可留壳，不剥合法括注）；实测「模型自造壳」正例剥离 8/10，与修前一致、无退化。
+    // 三方案数据见 local-docs/audit-corpus/diversity2-fixes-probe.json（A 1/49、B 1/49、C 49/49）。
+    const BRACKET_PAIRS = [['（', '）'], ['(', ')'], ['[', ']'], ['《', '》'],
+      ['「', '」'], ['『', '』'], ['“', '”'], ['‘', '’'], ['"', '"']];
+    const srcForBracket = String(src == null ? '' : src);
+    const srcHasBracketed = (w) => BRACKET_PAIRS.some(([l, r]) => new RegExp(
+      escapeRegExp(l) + '\\s*' + escapeRegExp(String(w)) + '\\s*' + escapeRegExp(r)
+    ).test(srcForBracket));
     for (const t of maskTerms) {
       if (!t.zh) continue;
+      // F-020-28 v2（用户质疑后复核）：v1 只比对 t.zh，漏掉「原文是英文术语、
+      // 译文是中文术语」的同语义形态。实跑（f02028-en-zh-probe）：
+      //   `(The Witcher 3) Wild Hunt Mod` → `（巫师3）狂猎模组`
+      //   v1 剥成 `巫师3狂猎模组`（粘连），v2 保住括注。
+      //   同时比 t.en 后：已覆盖的 (MO2)/(SKSE64) 形态不变、原文无括注的自造壳仍剥、
+      //   括注里装别的内容 (Wild Hunt) 仍剥 —— 4 组对照零退化。
+      //   数据：E1 修好、E2/E4 一致、E3 两版同样被 0.19 幻觉守卫拦（与本改动无关）。
+      if (srcHasBracketed(t.zh) || (t.en && t.en !== t.zh && srcHasBracketed(t.en))) continue;
       s = s.replace(new RegExp('[「『\\[(（《"\u2018\u201c]' + escapeRegExp(t.zh) + '[」』\\])）》"\u2019\u201d]', 'g'), t.zh);
     }
     // 结构修复（C5+C7 v6）：成对的三道还原都跑完之后，剩下的孤立/错配符号交给它。
@@ -1490,7 +1529,13 @@ function splitIndexed(texts, budget, minChunks, maxItems, splitKey) {
     while (groups.length < need) {
       groups.sort((a, b) => b.length - a.length);
       const big = groups.shift();
-      if (!big || big.length < 2) { groups.push(big); break; }
+      // 0.20 F-020-21（外审 O-4）：`!big` 以前和 `length < 2` 合成一句，而那句的
+      // 动作是 `groups.push(big); break;` —— 空数组进来时 big 就是 undefined，
+      // 结果**把 undefined 推回 groups**，splitIndexed([]) 返回 [undefined] 而不是 []。
+      // 下游 `for (const g of groups) ... g.map(...)` 会直接 TypeError。
+      // 实测确认可达：`splitIndexed([], 2400, 1, 0)` → `[undefined]`。
+      if (!big) break;                        // 真没有可分的组 → 收手，绝不再 push
+      if (big.length < 2) { groups.push(big); break; }
       const half = Math.ceil(big.length / 2);
       groups.push(big.slice(0, half), big.slice(half));
     }
@@ -1749,14 +1794,34 @@ async function repairCrossGroupClash(cfg, texts, results, mode) {
     probe[i] = val;
     return findCrossGroupClash(texts, probe).strong.indexOf(i) >= 0;
   };
-  for (const i of strong.slice(0, 20)) {
+  // 0.20 F-020-03：以前只处理 `strong.slice(0,20)` / `weak.slice(0,10)`，越界项
+  // **既不重译也不置 null**，带着可能错位的译文直接通过 —— 而冲突条目越多，越说明
+  // 这一批的归属可信度低，恰恰是最该护栏的场景（长列表 / 大量同族名）。
+  // 改法保留「串行重译有上限」这个性能约束（每条都要打一次模型 + delay，不能无界），
+  // 但越界的**强冲突一律置 null 保持英文** —— 宁可留英文，绝不写错译文。
+  // 弱冲突的越界项与「重译没改善」同口径（保留原值）：弱证据本就不足以判定错位，
+  // 为它多烧一次模型没有根据，既定语义就是「没有改善证据就不动」。
+  // ⚠ 「救谁」的语义边界（0.20 复核补）：`strong` 由 findCrossGroupClash 返回，
+  //   已经是 `sort((x,y) => x-y)` 的**下标升序**，与遍历顺序无关（不是「谁先被发现就救谁」）。
+  //   这个顺序**没有语义优先级**，也不打算编一个：判据只给布尔证据（S1/S2），
+  //   没有「这条重译更可能成功」的信号；而上限是**成本预算**（每条一次模型调用 + delay），
+  //   越界项一律置 null（留英文）而不是留错译文，所以挑选顺序不改变「最终有多少条是中文」
+  //   的期望值，只改变是哪几条。谁要在这里按「看起来更严重」重排，先拿出可验证的强度信号，
+  //   否则只是把下标序换成另一个同样任意的序。
+  const STRONG_RETRY_CAP = 20;
+  const WEAK_RETRY_CAP = 10;
+  for (let n = 0; n < strong.length; n++) {
+    const i = strong[n];
+    if (n >= STRONG_RETRY_CAP) { results[i] = null; changed.push(i); continue; }
     const cand = await askOne(i);
     if (cand != null && !stillStrong(i, cand)) { results[i] = cand; retried++; }
     else results[i] = null;                    // 强证据仍成立 → 保持英文，绝不写错译文
     changed.push(i);
     await delay(cfg.requestDelayMs || 150);
   }
-  for (const i of weak.slice(0, 10)) {
+  for (let n = 0; n < weak.length; n++) {
+    if (n >= WEAK_RETRY_CAP) continue;
+    const i = weak[n];
     const cand = await askOne(i);
     // 弱证据只有「原本无版本号 → 重译后有版本号」才算改善；照抄 / 抛错都保留原值。
     const candHasVer = (String(cand == null ? '' : cand).match(/\d+\.\d+(?:\.\d+)*/g) || []).length > 0;
@@ -1789,6 +1854,13 @@ async function translateBatch(cfg, cache, texts, mode, splitKey) {
         if (!r) {
           try {
             const single = await llmTranslate(cfg, [t], mode);
+            // 0.20 F-020-19（外审 P2-5 的修正版）：llmTranslate 会把「格式被拒」
+            // 的条目挂在返回数组的 `_rejects` 上（1109 的 withRejects）。正常路径在
+            // 1824 汇总了它，**兜底路径以前只看 single[0]、把这份证据丢了** ——
+            // 于是 DOM 层拿到「没有译文 + 没有被拒证据」，按「模型照抄原文」处理，
+            // 计 2 次失败后置 -1 永久放弃；而真实原因是格式问题，本来可以换切分重试。
+            // （注：`res._rejects` 本身一直有挂，1872 无条件执行；丢的是**单条那一份**。）
+            if (single && single._rejects) for (const rr of single._rejects) rejects.add(rr);
             r = single[0];
           } catch (e) {
             // 公共 LibreTranslate 是隐私暗通道（文本逐条发往第三方服务器）：
@@ -1920,6 +1992,15 @@ async function translateConcurrently(cfg, cache, texts, concurrency, onProgress,
   const runGroup = async (g) => {
     const chunk = g.map((i) => texts[i]);
     emit({ type: 'start', idxs: g });
+    // 0.20 F-020-20（外审 O-3）：一组的 start 只发一次，end 也必须只发一次。
+    // 以前 CTX_OVER 劈半分支显式 `emit({type:'end'})`，然后 `return` 会走 `finally`
+    // 再发一次 —— 同一条车道的结束事件发两遍。面板 `B.groups` 是「开始 +1 / 结束 -1」，
+    // 收到两次 end 就会把别的仍在飞的车减掉（代码用 Math.max(0,…) 兜住不下溢，
+    // 但计数已经偏小 → 「在飞几组」显示假低）。
+    // 显式那次**不能删**：劈半前先放掉 inflight，否则整组会一直挂在「在飞」里
+    // 直到两个半组跑完（长文分批时是几分钟）。所以改成「只发一次」而不是「只留 finally」。
+    let ended = false;
+    const endOnce = () => { if (ended) return; ended = true; emit({ type: 'end', idxs: g }); };
     try {
       const out = await llmTranslate(cfg, chunk, mode);
       if (out && out._rejects) for (const r of out._rejects) rejects.add(r);
@@ -1988,7 +2069,7 @@ async function translateConcurrently(cfg, cache, texts, concurrency, onProgress,
     } catch (e) {
       // 上下文超限：劈半重发。整组直接判失败会让页面永远停在英文（用户实测「等几分钟还是英文」）
       if (e && e.code === 'CTX_OVER' && g.length > 1) {
-        emit({ type: 'end', idxs: g });
+        endOnce();
         const half = Math.ceil(g.length / 2);
         await runGroup(g.slice(0, half));
         await runGroup(g.slice(half));
@@ -1996,14 +2077,22 @@ async function translateConcurrently(cfg, cache, texts, concurrency, onProgress,
       }
       lastErr = String((e && e.message) || e).slice(0, 600);
     } finally {
-      emit({ type: 'end', idxs: g });
+      endOnce();                                 // 与上面劈半分支共用，只发一次
     }
     for (let k = 0; k < chunk.length; k++) {
+      // 缓存命中直接收：不进 onItem/onProgress（既有语义，改动会影响面板进度口径）
+      const cached = cache[chunk[k]];
+      if (cached) { results[g[k]] = cached; continue; }
       try {
-        const c = cache[chunk[k]];
-        if (c) { results[g[k]] = c; continue; }
         results[g[k]] = (await llmTranslate(cfg, [chunk[k]], mode))[0] || null;
       } catch (e) { lastErr = String((e && e.message) || e).slice(0, 600); }
+      // F-020-24（v4 审计 §7.6）：逐条兜底这条路上的失败以前**一条都不报给面板** ——
+      // 整组失败 → 逐条重发 → 仍然失败，`B.fail` 一动不动，面板显示「失败 0」。
+      // 成功路径 2027 段是报的，这里补齐才有可比性；`B.ok - B.fail` 也才敢当成功率用。
+      // 只在「真发了一次单独请求」之后报，缓存命中不报（不算一次尝试）。
+      if (typeof onItem === 'function') {
+        try { onItem(g[k], chunk[k], results[g[k]]); } catch (e) { /* 面板回调失败不影响翻译 */ }
+      }
       finished += 1;
       if (onProgress) onProgress(finished, texts.length);
       await delay(cfg.requestDelayMs || 150);

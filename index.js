@@ -173,7 +173,15 @@ let wordCache = {};   // 词级补翻词表：英文词 → 中文（跨会话�
 const WORD_FIXES = {
   Gwent: '昆特牌', gwent: '昆特牌',
   Roach: '萝卜', roach: '萝卜',
-  Oils: '剑油', oils: '剑油', Oil: '剑油', oil: '剑油',
+  // F-020-29（2026-11-14 收口）：删掉 Oil / oil 两个**死条目**，不是修 bug。
+  //  ① residueWords 有 `w.length < 4` 硬门槛，3 字母 Oil 永远进不了 refineByWords；
+  //  ② wordFixTerms() 的 skip(['oil']) 早把两条排除在遮蔽表外（注释见下方）；
+  //  ③ wordCache 在 F-019-37 后只写不读，没有任何消费者。
+  // 留着只会误导「把整张 WORD_FIXES 并进术语表」的脚本绕过生产隔离：
+  // diversity2-translate.cjs 曾这么干，造出 `Coal-Oil` → `煤剑油` 的假缺陷。
+  // A/B 687 条真实译文实跑：删前删后 refineByWords 输出逐字节一致（closeout-probe.json p1），
+  // `Oils→剑油` 的巫师 3 真需求不受影响。判据守卫见 020-closeout-test.js。
+  Oils: '剑油', oils: '剑油',
   // 巫师 3 五法印：全是 4~5 字母，正好卡在旧的「≥5 字符」盲区上
   Igni: '伊格尼', igni: '伊格尼',
   Quen: '昆恩', quen: '昆恩',
@@ -359,8 +367,19 @@ function normKey(s) {
   return String(s == null ? '' : s).replace(/[\u200b-\u200d\u2060\ufeff]/g, '').replace(/\s+/g, ' ').trim();
 }
 
+/** 扩展版本号。**缓存挂在函数对象上，不引模块级变量** —— 测试沙箱按函数名抽源码
+ *  再 new Function，引用模块级常量会 ReferenceError（与 applyTranslation.lastDisplayed 同一手法）。
+ *  0.20 F-020-05：以前每次调用都 readFileSync，调用点 1889/1937/2514/6009 ——
+ *  右键「保留英文」多选 N 条就是 N 次读盘、每次预检失败弹窗又读一遍。
+ *  版本号在进程生命周期内不会变（扩展升级本来就要求重启 Vortex），读一次即可。
+ *  读失败（文件还没落地）**不缓存**，下次调用重试 —— 装完立刻触发的那条路径能自愈。 */
 function extVerOf() {
-  try { return (JSON.parse(fs.readFileSync(path.join(EXT_DIR, 'info.json'), 'utf8')).version) || ''; } catch (e) { return ''; }
+  if (extVerOf.cached) return extVerOf.cached;
+  try {
+    const v = (JSON.parse(fs.readFileSync(path.join(EXT_DIR, 'info.json'), 'utf8')).version) || '';
+    if (v) extVerOf.cached = v;
+    return v;
+  } catch (e) { return ''; }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1884,7 +1903,12 @@ function keepNameEn(text, opts) {
   const t = keepRawNameOf(text);
   if (!t) return { kept: false, restored: 0 };
   const list = userKeepList();
-  if (!list.includes(t)) list.push(t);
+  // 0.20 F-020-04：入名单按 **normKey** 去重，不用字面 includes。
+  // 判据同源：isKeptName（1887）与 unkeepName（1990）都按 normKey 比，只有这里按字面，
+  // 于是 `VAXIS_x_v1.5.zip` 与 `VAXIS_x_v1.5` 会作为两条进名单 —— 取消保留只摘掉一条，
+  // isKeptName 仍返回 true，右键菜单永远显示「取消保留英文」，用户以为按钮坏了。
+  const listNk = normKey(t);
+  if (!list.some((x) => normKey(String(x)) === listNk)) list.push(t);
   if (!batched) {
     saveJson(USER_KEEP_PATH, { ver: extVerOf(), at: Date.now(), names: list }, 'userKeep add');
   }
@@ -1971,22 +1995,28 @@ function unkeepName(text, opts) {
   if (!t) return { removed: 0, note: 'empty' };
   const nk = normKey(t);
   const list = userKeepList();
-  const at = list.findIndex((x) => normKey(String(x)) === nk);
-  if (at < 0) return { removed: 0, note: 'not-kept' };
-  const gone = list[at];
-  list.splice(at, 1);
+  // 0.20 F-020-04：**删掉全部同 normKey 的条目**，不只第一条。
+  // 历史名单里可能存在「字面不同、normKey 相同」的重复项（旧版 keepNameEn 用字面
+  // includes 去重留下的）。只删一条时 isKeptName 仍然命中剩下的那条 →
+  // 用户点了「取消保留英文」，右键菜单还显示「取消保留英文」，重翻也原样退英文。
+  const gone = [];
+  for (let i = list.length - 1; i >= 0; i--) {
+    if (normKey(String(list[i])) === nk) gone.push(list.splice(i, 1)[0]);
+  }
+  if (!gone.length) return { removed: 0, note: 'not-kept' };
+  const firstName = gone[gone.length - 1];   // splice 从尾部走，最后 push 的是下标最小的
   // 名单变了，遮蔽表必须重算：不重算的话本轮它仍被当成「整名不翻」，
   // 重翻会原样退回英文，用户看到的就是「取消了还是英文」。
   // v16 F-v16-04：批量模式只改内存，落盘 / 重建 / 日志由 finalizeUnkeepBatch 一次付清。
   if (!batched) {
     saveJson(USER_KEEP_PATH, { ver: extVerOf(), at: Date.now(), names: list }, 'userKeep remove');
     try { mergeRuntimeTerms(); } catch (e) { log('warn', 'rebuild keep names fail', String(e)); }
-    log('info', 'name unkept', { name: String(gone).slice(0, 60), left: list.length });
+    log('info', 'name unkept', { name: String(firstName).slice(0, 60), dropped: gone.length, left: list.length });
   }
   if (keepEnSetRef) {
     for (const x of Array.from(keepEnSetRef)) if (normKey(String(x)) === nk) keepEnSetRef.delete(x);
   }
-  return { removed: 1, name: t, left: list.length };
+  return { removed: gone.length, name: t, left: list.length };
 }
 
 /** 批量收尾（与 302 的 finalizeKeepNamesBatch 对称）：一次落盘 + 一次词表重建。
@@ -2072,6 +2102,10 @@ function scheduleRetranslate(keys) {
       const st = contextRef.api.getState();
       const items = collectTargets(st, null).concat(collectDownloadTargets(st))
         .filter((it) => wanted.indexOf(normKey(it.raw)) !== -1);
+      // F-020-27 v2：点名重翻（右键取消保留英文、retranslateName 等）是用户显式
+      // 「再来一次」，必须突破 done 去重，否则界面纹丝不动。刻意放在 filter 之后
+      // 单独清，保持「整批 keys 过滤」的源码原形（unkeep-batch-test 的契约锚点）。
+      for (const it of items) it.done = false;
       if (!items.length) {
         log('info', 'retranslate nothing to do', { n: wanted.length, name: wanted[0].slice(0, 40) });
         return;
@@ -2650,7 +2684,38 @@ function collectTargets(state, gameIdFilter) {
         const gk = typeof cacheKeyOf === 'function' ? cacheKeyOf(raw) : raw;
         if (gk && isGivenUp(gk)) continue;
       }
-      out.push({ gameId, modId, raw, cached: nameCacheOf(raw), suspect: allSuspect });
+      // F-020-27（2026-11-14 多样性专项实修；同日用户质疑后复核修正为 v2）：
+      // nameCacheOf 走单参严判，看不到「原文里有意保留的英文专名」（Learxfl /
+      // ZoiWorks / Enderal…），会把写入口已用双参验收通过的译文读成 null →
+      // 每轮 autoHook 重新送模型、云端档白烧额度。实测 200 条真实显示名 12 条（6.0%）。
+      // 这里**不动判据**（单参还要拦历史脏缓存），只加一条「本扩展已处理过」的旁路证据。
+      //
+      // ⚠ v1（已作废）：只判 cache[ck] 有任意非空字符串。实跑数据
+      //   local-docs/audit-corpus/done-v2-probe：19 条历史脏缓存里 18 条被误判成
+      //   done（半拉子 / 原文回落 / 占位符残留 / .zip 尾巴…），一旦下游跳过就永久固化。
+      // v2 改成**双证据，缺一不可**：
+      //   ① 写入口验收证据 modNameOk(raw, v) —— 与 applyTranslation 写缓存前同一道闸；
+      //   ② 已贴屏证据 customFileName === v —— 写入口是先 dispatch 成功才写缓存
+      //      （见 3125-3138），状态层没这个值就说明本扩展没贴过，不能算已处理。
+      // 实测：好译文+已贴屏 16/16 判 done；脏缓存+状态层英文 0/19 误判；缓存无值 0/5。
+      // cached 仍为 null → 脏值绝不会被贴屏。
+      // 出口：右键 301 自造目标不带 done；scheduleRetranslate 点名重翻显式清 done；
+      // forceAll 删缓存后 cache[ck] 为空 → done 自动失效；装新版首启清缓存同样重置。
+      // 残留边界（如实记）：若历史脏值**已经贴在界面上**，G3 实跑 10/19 会判 done；
+      // 但 0.20 首启 _ver 精确比对会整份清缓存重建，该形态在真机上不存在。
+      const cv = nameCacheOf(raw);
+      let done = false;
+      if (cv == null) {
+        try {
+          const ck = typeof cacheKeyOf === 'function' ? cacheKeyOf(raw) : '';
+          const v = ck && cache ? cache[ck] : null;
+          if (typeof v === 'string' && v && typeof modNameOk === 'function' && modNameOk(raw, v)) {
+            const shown = String((((mod || {}).attributes) || {}).customFileName || '').trim();
+            done = shown === v.trim();
+          }
+        } catch (e) { /* 沙箱没注 cache / modNameOk → 按未处理走，行为同旧 */ }
+      }
+      out.push({ gameId, modId, raw, cached: cv, done, suspect: allSuspect });
     }
   }
   return out;
@@ -2933,6 +2998,9 @@ function makeLiveHooks(nid, total, texts, lanes) {
       const d = Math.max(0, Number(done) || 0);
       const t = Math.max(n, Number(tot) || 0);   // 单条重试那处初值传 1，真实总数以回调为准
       if (t > 0) B.total = t;
+      // 注意：B.ok 名字叫 ok，实际存的是「已完成条数」（含失败条），面板按「批量翻译中 X/Y」显示，
+      // 失败条另有 B.fail 单独展示。**别当成成功数用**——真要成功数得 B.ok - B.fail，
+      // 而 B.fail 只统计批量路径（逐条兜底那条路不回调 onItem），相减也不准。
       B.ok = Math.min(d, B.total || d);
       B.queued = Math.max(0, (B.total || 0) - d);
       if (B.total > 0 && d >= B.total) finish();
@@ -3287,6 +3355,7 @@ async function translate(list, opts) {
     let cacheOnlyOk = 0;   // 0.19 D4：只入缓存的成功条数（不算贴屏成功，但算本轮有进展）
     let failed = 0;
     let skippedAligned = 0;
+    let skippedDone = 0;   // F-020-27 v2：写入口已贴屏、读出口单参读不出的条目
     const pending = [];
 
     for (const t of list) {
@@ -3309,6 +3378,15 @@ async function translate(list, opts) {
         if (applyTranslation(t, t.cached)) {
           if (appliedDisplayed(t)) applied++; else cacheOnlyOk++;
         }
+      } else if (t.done) {
+        // ★ F-020-27 v2：真正挡住「重复送模型」的是这里，不是 autoHook 的 filter。
+        //   autoHook 那条 filter 只决定「要不要调度」；translateAll() 会重新
+        //   collectTargets 再把全量交给本函数，同轮只要有 1 条新装的模组触发调度，
+        //   所有 cached:null 的发散条目在旧实现里都会从这里的 else 进 pending。
+        //   done 的判据见 collectTargets（双参验收 + 状态层已贴屏两证据）。
+        //   用户点名重翻由 scheduleRetranslate 显式清 done；forceAll 删缓存后
+        //   cache[ck] 为空，done 自动失效 —— 两条强制出口都不受影响。
+        skippedDone++;
       } else {
         pending.push(t);
       }
@@ -3316,8 +3394,9 @@ async function translate(list, opts) {
 
     if (pending.length === 0) {
       saveJson(CACHE_PATH, cache, 'translate done');
+      if (skippedDone > 0) log('info', 'skipped already-displayed names', { skippedDone });
       // #24：全是已对齐条目（0 条真变化）→ 静默退出。弹窗本身就是循环的可见症状。
-      if (applied === 0 && cacheOnlyOk === 0) return { applied: 0, cacheOnlyOk, failed: 0, skipped: skippedAligned, cachedOnly: true };
+      if (applied === 0 && cacheOnlyOk === 0) return { applied: 0, cacheOnlyOk, failed: 0, skipped: skippedAligned, skippedDone, cachedOnly: true };
       // ★ #34（0.18 真机 08:45 用户抓到）：auto 链的对齐轮**不弹窗**。实锤：A-01 修复后
       //   重启，收敛序列每轮弹一条「模组名翻译完成 1 条（命中缓存）」→ 连环弹窗。
       //   对齐是零模型调用的后台动作，队列面板与日志可见即可；手动点按钮才弹。
@@ -3326,7 +3405,7 @@ async function translate(list, opts) {
       } else {
         log('info', 'cached alignment done', { applied, skipped: skippedAligned });
       }
-      return { applied, cacheOnlyOk, failed: 0, cachedOnly: true };
+      return { applied, cacheOnlyOk, failed: 0, skippedDone, cachedOnly: true };
     }
 
     // 发请求前先确认模型连不连得上（0.16.5）：连不上就一条都不烧。
@@ -4043,7 +4122,12 @@ async function translateAllFresh(want, dlIds, opts) {
           if (!manual && typeof isGivenUp === 'function' && isGivenUp(cacheKeyOf(r.base))) { givenUp++; continue; }
           // keepExisting（「立即翻译」）时不删旧译文：那是「强制重翻」才做的事。
           // 以前这里无条件删，导致点了「立即翻译」等于悄悄清了一次缓存。
-          if (!keepExisting && cache[cacheKeyOf(r.base)] !== undefined && typeof dropTranslation === 'function') {
+          // 0.20 F-020-07：判据收进 `forceAll`（= manual && !keepExisting）。
+          // 原来只挡了 keepExisting，**没挡 manual** —— 自动轮（manual:false）会把已经
+          // 验收合格的译文也删掉重翻，白烧模型且期间界面掉回英文。
+          // 当前 4 个调用点全带 manual:true 所以没触发，属潜伏缺陷：将来接一个新自动
+          // 调用点就踩。收紧后现有行为零变化（manual:true 时 forceAll 与 !keepExisting 等价）。
+          if (forceAll && cache[cacheKeyOf(r.base)] !== undefined && typeof dropTranslation === 'function') {
             dropTranslation(r.base);
             cleared++;
           }
@@ -4619,13 +4703,24 @@ async function translateSelected(instanceIds) {
   const miss = [];
   const kept = [];   // 整名在保英文名单里：不送模型，单独提示（0.16.5）
   const diag = { ids: ids.length, mods: 0, dl: 0, miss };
+  // 0.20 F-020-02：跨行重名集合按游戏缓存 —— 多选 N 条同游戏只付一次 O(mods) 聚合，
+  // 与主链 collectTargets（每游戏算一次 dupSet）同代价。typeof 守卫：沙箱没注这个函数时退 null。
+  const dupSetMemo = new Map();
+  const dupSetFor = (gameId, table) => {
+    if (typeof buildDupNameSet !== 'function' || !table) return null;
+    if (dupSetMemo.has(gameId)) return dupSetMemo.get(gameId);
+    const ds = buildDupNameSet(table);
+    dupSetMemo.set(gameId, ds);
+    return ds;
+  };
   for (const id of ids) {
     let hit = null;
     for (const g of Object.keys(modsRoot)) {
       const table = modsRoot[g] || {};
       for (const mid of Object.keys(table)) {
         const m = table[mid] || {};
-        if (mid === id || String(m.id) === id) { hit = { gameId: g, modId: mid, mod: m }; break; }
+        // table 一起带走：下面算 dupSet 要用「本游戏全表」，不重新去 modsRoot 里捞
+        if (mid === id || String(m.id) === id) { hit = { gameId: g, modId: mid, mod: m, table }; break; }
       }
       if (hit) break;
     }
@@ -4642,9 +4737,19 @@ async function translateSelected(instanceIds) {
       notify({ id: 'modname-zh-fix', type: 'info', displayMS: 6000, title: '这条名字已固定', message: '先右键「取消固定」再翻译' });
       continue;
     }
-    const bases = englishBaseNameOf(found.mod, found.modId);
+    // 0.20 F-020-02：补齐与主链（collectTargets 3986/3992）同源的两处判据。
+    // ① dupSet：以前少传第三参，跨行重名降权失效 → 右键单翻拿到的是未降权候选，
+    //    可能与批量路径给出**不同的**英文 base，两个入口对同一条数据各说各话。
+    // ② suspect：主链 2653 会标 allSuspect，让 applyTranslation 走 cacheOnly 门控
+    //    （污染名只入缓存、绝不贴显示名，见 0.19 D5）。301 的 pending 项以前没有这个
+    //    字段，`if (item.suspect) cacheOnly = true` 恒不触发 → 降权候选直接贴上屏，
+    //    把正确候选的译文盖住，界面永远显示别人的模组名。
+    const dupSet = dupSetFor(found.gameId, found.table);
+    const bases = englishBaseNameOf(found.mod, found.modId, dupSet);
     const raw = bases[0] || rawNameOf(found.mod);
     if (!raw) continue;
+    const allSuspect = bases.length > 0 && !!bases.suspect
+      && bases.every((b) => bases.suspect.has(String(b)));
     if (typeof registerKeptBrands === 'function') registerKeptBrands(raw);
     // 整名在保英文名单里 → 点了「立即翻译」也不该送模型：模型只会原样退回，
     // 旧代码把它记成成功并报「1 条成功」，界面一动不动（2026-10-29 真机）。
@@ -4653,7 +4758,7 @@ async function translateSelected(instanceIds) {
     // 不清账的话：批量路径试满 3 次拉黑后，右键也只会静默跳过，用户看到的就是
     // 「手动点翻译没反应 / 提示未通过验收」，这正是 0.16.3 里被反复投诉的无限循环。
     if (typeof clearNameFail === 'function') clearNameFail(cacheKeyOf(raw));
-    list.push({ gameId: found.gameId, modId: found.modId, raw, cached: nameCacheOf(raw) });
+    list.push({ gameId: found.gameId, modId: found.modId, raw, cached: nameCacheOf(raw), suspect: allSuspect });
   }
   log('info', 'translate selected diag', diag);
   const dlTargets = [];
@@ -5207,16 +5312,22 @@ function makeSettingsComponent() {
         let model = String(p.model || '').trim() || await core.pickModel(base, p.apiKey || '');
         if (!model) throw new Error('拿不到模型列表，请手动填模型名');
         const probe = Object.assign({}, c, { provider: Object.assign({}, p, { model }), batchSize: 5 });
-        const out = await core.translateBatch(probe, {}, ['Dynamic Grass - Next Gen']);
+        const PROBE_TEXT = 'Dynamic Grass - Next Gen';
+        const out = await core.translateBatch(probe, {}, [PROBE_TEXT]);
         // translateBatch 失败时不抛异常、只返回含 null 的数组。以前这里照样拼出
         // 「✓ 连接正常（模型: X），示例: 空」——用户按提示去查模型，而真正错的是接口地址。
-        // 没拿到有效译文就必须当失败抛，且不做后面的 failCache 复活。
+        // 0.20 F-020-01：判据从「译文必须与原文不同」改成「有没有返回非空文本」。
+        // 旧写法把「模型遵守『无法翻译就原样返回』」判成失败 —— 本地小模型对纯英文
+        // 专名经常原样退回（F-019-38 实测 87 条里 69 条），于是接口明明好的，却报
+        // 「模型没给出译文（查模型是不是对话模型）」，把用户赶去改地址、换模型。
+        // 现在：返回空 → 才算没通；原样退回 → 通过，但明确点出它不影响实际使用。
         const got = out && out[0];
-        if (!got || got === 'Dynamic Grass - Next Gen') {
+        if (!got) {
           // 走到这里说明地址通、密钥没被拒（预检都过了），不许再让人回去查接口地址。
           // 只剩两类可查：模型类型不对 / 上下文不够。
-          throw new Error('接口和密钥都通，但模型没给出译文（查模型是不是对话模型）' + preflightHint());
+          throw new Error('接口和密钥都通，但模型没返回任何文本（查模型是不是对话模型）' + preflightHint());
         }
+        const echoProbe = String(got).trim() === String(PROBE_TEXT).trim();
         // 模型可用 → 只给「暂态失败」重新来过的机会。
         // -1 是已判定不可译的专名（模型两次原样返回），> RETRY_MAX 是重试用尽，
         // 这两类清掉只会让它们再各烧一轮调用、然后照样失败。
@@ -5232,7 +5343,9 @@ function makeSettingsComponent() {
         // 连接测试通过 = 模型确实活了：顺手叫醒 DOM 层（它可能还卡在 modelDown，
         // 否则界面文本得再等一次 2 分钟探活 —— 用户点这里就是想让它马上好）。
         kickDomLayer('test');
-        const msg = `✓ 连接正常（模型：${model}）` + (revived > 0 ? `，${revived} 条已放回重试` : '');
+        const msg = `✓ 连接正常（模型：${model}）`
+          + (echoProbe ? '，探活串被原样返回（本地小模型常见，不影响翻译）' : '')
+          + (revived > 0 ? `，${revived} 条已放回重试` : '');
         this.flash(msg, true);
       } catch (e) {
         const msg = '✗ ' + String(e && e.message ? e.message : e).slice(0, 80);
@@ -6367,7 +6480,14 @@ function main(context) {
         const st = context.api.getState();
         const todo = (runScope !== 'dls' ? collectTargets(st, null) : [])
           .concat(runScope !== 'mods' ? collectDownloadTargets(st) : [])
-          .filter((t) => !t.cached);
+          // F-020-27 v2：done = 写入口已 dispatch 过中文（双参验收 + 状态层已贴屏），
+          // 只是读出口单参严判读不出来。⚠ 这里**只是「有没有活要干」的调度判据**：
+          // 调度后 translateAll() 会重新 collectTargets 再把全量交给 translate()，
+          // 真正拦住重复送模型的是 translate() 里的 `else if (t.done)` ——
+          // v1 只改了本 filter，同轮只要有一条新装模组触发调度，其余 done 条目
+          // 照样从 `else { pending.push(t) }` 进队列（用户质疑后复核实锤）。
+          // 下载目标没有 done 字段，行为不变。
+          .filter((t) => !t.cached && !t.done);
         if (todo.length === 0) { hookFails = 0; return; }
         scheduled = true;
         const wait = HOOK_BACKOFF[Math.min(hookFails, HOOK_BACKOFF.length - 1)];
