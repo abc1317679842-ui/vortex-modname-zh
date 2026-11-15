@@ -135,6 +135,44 @@ let va = null;
 // 所以这里只存函数，真正 onStateChange 挪到 autostart 段（api 可用后）。
 let autoHookRef = null;
 let autoHookBound = false;
+
+// ── 启动竞态防御（2026-11-16，0.21.0 真机实测）─────────────────────────────────
+// api 在「扩展卸载 / 窗口关闭」过程中会被拆掉：`getState` 从函数变成 undefined。
+// 启动定时器（8s）与关窗动作竞态时必然踩到 —— 用户装完新版重启、看一眼就关软件即复现。
+// 裸调会抛错、被外层 catch 吞成一条 warn，而代价是**整段启动初始化全部跳过**：
+// games 导出、品牌还原、扩展名补种、术语漂移对账、_rebuild 重建调度，以及
+// **自动翻译钩子绑定** —— 后者实测两次启动都没有 `auto hook bound`，
+// 用户看到的就是「装完了，界面是中文，但装新模组不会自动翻」。
+// 以下三个函数都收参数、不闭包模块变量：测试要用 extractFn 切片单独跑（沙箱禁止引模块级常量）。
+function safeGetState(ctx) {
+  try {
+    const api = ctx && ctx.api;
+    return (api && typeof api.getState === 'function') ? api.getState() : null;
+  } catch (e) { return null; }
+}
+
+// 返回 'bound' | 'skip' | 'no-hook' | 'not-ready' | 'error'，调用方据此决定是否重试。
+function bindAutoHook(ctx, hookRef, alreadyBound) {
+  if (!hookRef) return 'no-hook';
+  if (alreadyBound) return 'skip';
+  const api = ctx && ctx.api;
+  if (!api || typeof api.onStateChange !== 'function') return 'not-ready';
+  try {
+    api.onStateChange(['persistent', 'mods'], () => hookRef('mods'));
+    api.onStateChange(['persistent', 'downloads'], () => hookRef('dls'));
+    return 'bound';
+  } catch (e) { return 'error'; }
+}
+
+// 幂等入口：启动段绑一次，手动翻译入口再兜一次。
+// 只有真绑上才置 true；绑失败必须留 false，否则本会话永远不再尝试（原代码就是这个坑）。
+function ensureAutoHook() {
+  const r = bindAutoHook(contextRef, autoHookRef, autoHookBound);
+  if (r === 'bound') { autoHookBound = true; log('info', 'auto hook bound'); }
+  else if (r === 'error') log('warn', 'auto hook bind', 'onStateChange threw');
+  return r === 'bound' || autoHookBound;
+}
+
 // 默认配置：新用户没有 config.json 时也能开箱即用（否则 enabled undefined 会被「已在设置中关闭」拦截）
 const DEFAULT_CFG = {
   enabled: true,
@@ -1011,6 +1049,16 @@ function modNameOk(raw, out) {
   // 本函数是全项目唯一一份验收实现，所有调用点自动生效，无需逐处改。
   const extTail = /\.(zip|7z|rar)$/i;
   if (extTail.test(zh) && (single || !extTail.test(src))) return false;
+  // R6（0.21 · F-021-16）：元话术泄漏。
+  // 输入是纯缩写／纯版本号时模型「没内容可翻」，会把「这是译文」写进名字本身：
+  // `SMAPI 2.5.5的中文译名`、`ArchiveXL译名`、`1.2.3的中文译名`、`SKSE64译名`。
+  // R1–R5 全部放行（有汉字、ASCII 占比不高、无 ≥12 字符长残留、无压缩包尾巴），
+  // 坏译文直接进缓存再贴到界面上（审计 D-041~045 5/5 稳定复现）。
+  // 判据只认「译文／译名」两个词，**不碰「翻译」** —— `谷歌翻译` 这类是正当模组名。
+  // 两参模式：原文本身含同样字样时对称放行（回填/复查场景）。
+  // 单参模式：无法比对原文，含这两个词一律拒 —— 显示名里出现它们基本都是元话术。
+  const metaLeak = /译文|译名/;
+  if (metaLeak.test(zh) && (single || !metaLeak.test(src))) return false;
   return true;
 }
 
@@ -2071,8 +2119,15 @@ function retranslateName(text, opts) {
   if (!batched) saveJson(CACHE_PATH, cache, 'keepName cache drop');
   const ckt = cacheKeyOf(t);
   for (const nd of (ckt && ckt !== t ? [t, ckt] : [t])) {
-    Object.keys(domCache).forEach((k) => { if (k.indexOf(nd) !== -1) delete domCache[k]; });
-    Object.keys(failCache).forEach((k) => { if (k.indexOf(nd) !== -1) delete failCache[k]; });
+    // F-021-25（0.21）：以前用 `k.indexOf(nd) !== -1` 做**模糊删** —— 删 `A` 会连带
+    // 删掉 `AB`、`PREFIX_A_SUFFIX` 这些同子串的无关条目，用户的其它界面文案缓存被
+    // 静默清空，下次还得重新烧模型翻一遍（审计 3/3：删完 domKeys 只剩 `['ZZZ']`）。
+    // 两个缓存的键都是**原始 DOM 文本串**（实测用户数据 domCache.json 里是
+    // `Browse GameBanana` / `Stellar Blade --> Visuals` 这种，无命名空间前缀），
+    // 所以精确匹配就够；加 trim 只是容忍界面文本首尾空白。
+    const hitKey = (k) => k === nd || String(k).trim() === nd;
+    Object.keys(domCache).forEach((k) => { if (hitKey(k)) delete domCache[k]; });
+    Object.keys(failCache).forEach((k) => { if (hitKey(k)) delete failCache[k]; });
   }
   if (!batched) {
     saveJson(DOM_CACHE_PATH, domCache, 'keepName domCache drop');
@@ -2721,8 +2776,10 @@ function collectTargets(state, gameIdFilter) {
   return out;
 }
 
-/** 单条下载记录 → 待翻目标。判据字段是 nexus.fileInfo.name（屏幕上那串），
- *  不是 modInfo.name（状态层写了界面也不显示 —— 续 15 LevelDB 实证）。
+/** 单条下载记录 → 待翻目标。
+ *  ⚠ 取名字段口径**只认下面 `downloadShownNameOf` 这一份实现**（0.21 · F-021-30）：
+ *  `modInfo.name` 优先、`nexus.fileInfo.name` 仅兜底。本注释 0.19 时代写的是
+ *  「判据字段是 nexus.fileInfo.name」，与实现相反，已作废 —— 别再按它改代码。
  *  返回 null = 不需要翻。借译文规则（D2）：已安装条目只有在「版本尾巴对得上」时
  *  才借它的缓存译文，1.3 的行绝不拿 1.5 的译名。 */
 /** 下载行的名字：**只读 modInfo.name**，绝不拿 nexus.fileInfo.name 当判据。
@@ -3264,8 +3321,9 @@ function restoreAll(state) {
     }
     for (const dlId of Object.keys(dlFiles)) {
       const f = dlFiles[dlId];
-      // 判据必须是界面真正显示的那串（nexus.fileInfo.name）。读 modInfo.name
-      // 等于在比对一个没人看的字段 —— 译文写成功了这里也永远判定「没翻过」。
+      // 取名字段与所有入口同源：统一走 downloadShownNameOf（modInfo.name 优先、
+      // nexus.fileInfo.name 仅兜底）。以前这里写「必须是 nexus.fileInfo.name」，
+      // 与实现相反 —— 三处注释口径打架正是 F-021-30 登记的漂移，别再按注释判字段。
       const cur = downloadShownNameOf(f);
       if (!cur) continue;
       const orig = rev.get(cur);
@@ -3790,6 +3848,11 @@ function bumpNameFail(key, model, name) {
   // `nameFail['']` —— 又造一个所有条目共用的桶。与 `clearNameFail` 的判空对齐。
   if (!k) return 0;
   const e = (nameFail && nameFail[k]) || { n: 0, ts: 0 };
+  // F-021-01（0.21）：TTL 过期 = 旧账作废，**必须归零重新计**。
+  // `isGivenUp` 已按 TTL 正确放行重试，但这里直接在旧 n=3 上 +1 变成 4，
+  // 而 NAME_FAIL_MAX=3 —— 于是 TTL 过后只给 1 次机会就重新封 7 天，与函数注释
+  // 写的「TTL 过后旧账作废」正好相反（审计 E 场景10 + G5 20/20：期望 n=1、实际 n=4）。
+  if (e.n && (Date.now() - (e.ts || 0)) > NAME_FAIL_TTL) e.n = 0;
   e.n = (e.n || 0) + 1;
   e.ts = Date.now();
   if (model) e.model = String(model);
@@ -3990,6 +4053,9 @@ async function translateAllFresh(want, dlIds, opts) {
   }
   running = true;
   if (manual) kickDomLayer('fresh');
+  // 兜底补绑（2026-11-16）：启动段若因关窗竞态没绑上钩子，用户点一次手动翻译就恢复，
+  // 不必重启。幂等 —— 已绑上时只是两次判断，零副作用。
+  try { ensureAutoHook(); } catch (e) { /* 补绑失败不影响本次翻译 */ }
   const nid = 'modname-zh-fresh';
   try {
     // v16 F-v16-01：与 translate() 共用同一份配置前置，不再让「立即翻译」有而
@@ -6591,10 +6657,26 @@ function main(context) {
 
   // 启动时只静默套用缓存（不联网、不弹通知）；新装模组才自动联网翻译
   try {
-    setTimeout(() => {
+    // 8s 是经验值（等 Vortex 把 mods/downloads 表装好），但原来是**死等**：
+    // 到点 api 没就绪（慢启动）或已被拆（正在关窗）就一抛到底，整段初始化作废。
+    // 改成「拿到 state 才继续」+ 有限次重试：成功一次即止，不会重复执行；
+    // 重试期间不记日志（关窗每次都记一条就是噪声），只有真等不到才落一条 warn。
+    const STARTUP_MAX_TRIES = 6;
+    const STARTUP_RETRY_MS = 3000;
+    const runStartup = (attempt) => {
+      const st = safeGetState(contextRef);
+      if (!st) {
+        if (attempt < STARTUP_MAX_TRIES) {
+          setTimeout(() => runStartup(attempt + 1), STARTUP_RETRY_MS);
+          return;
+        }
+        log('warn', 'startup api never ready', { attempt });
+        return;
+      }
+      // 钩子先绑：不依赖 state，也是本段最要紧的一步（绑不上 = 本会话自动翻译失效）
+      if (cfg && cfg.enabled) ensureAutoHook();
       try {
         // 顺手把 Vortex 内部的「全部支持游戏」列表导出，供词表对账补漏（纯本地，不联网）
-        const st = contextRef.api.getState();
         const known = st.session && st.session.gameMode && st.session.gameMode.known;
         if (Array.isArray(known) && known.length > 0) {
           const map = {};
@@ -6627,25 +6709,16 @@ function main(context) {
           // 整段等于没跑——0.16.3 实测「蓬松模组管理器」一直没被还原就是这个原因）。
           // 还原成英文后，下一轮 collectTargets 会把它当未翻条目重新送模型 → 「Fluffy 模组管理器」。
           try {
-            const bn = restoreBrandNames(contextRef.api.getState());
+            const bn = restoreBrandNames(st);
             if (bn) log('info', 'brand names restored', { n: bn });
           } catch (e) { log('warn', 'brand name restore fail', String(e)); }
           // 扩展名零模型补种（审计 v4 #5）：`<游戏名> Vortex Extension` 按词库拼，
           // 不写进 cache 的话，DOM 的剥尾贴名通道永远查不到（用户机实测：
           // cache.json 42 条键里含 `Vortex Extension` 的 0 条 → 一条也贴不出来）。
           // 必须在 restoreBrandNames 之后：先还原坏译文，再补正确译文。
-          try { seedExtensionNames(contextRef.api.getState()); } catch (e) { log('warn', 'extension seed fail', String(e)); }
-          // 自动翻译钩子：init 里注册静默失效，这里才是有效点（api 已可用）。
-          if (autoHookRef && !autoHookBound) {
-            autoHookBound = true;
-            try {
-              // 必须包一层箭头：直接把 autoHookRef 当回调会收到 (oldState,newState)，
-              // 被当成 scope 误判。包起来后各自只带自己的链标识。
-              context.api.onStateChange(['persistent', 'mods'], () => autoHookRef && autoHookRef('mods'));
-              context.api.onStateChange(['persistent', 'downloads'], () => autoHookRef && autoHookRef('dls'));
-              log('info', 'auto hook bound');
-            } catch (e) { log('warn', 'auto hook bind', String(e)); }
-          }
+          try { seedExtensionNames(st); } catch (e) { log('warn', 'extension seed fail', String(e)); }
+          // 自动翻译钩子已在 runStartup 开头绑过（ensureAutoHook，幂等）；
+          // 原位置这段一次性绑定是「绑失败就永久失效」的根源（0.21 真机实测），不要再写回来。
           // 存量结构清洗（v6 配套）已于 2026-10-29 删除：同一次改动给 cache.json 加了
           // 「按 _ver 清空」，升级时缓存必为空 → 这块永远在空对象上遍历，只多一次无意义写盘。
           // 老译名的修复实际是靠「清空 → 全量重翻 → finishOne 里的 repairStruct」达成的。
@@ -6763,7 +6836,7 @@ function main(context) {
             n += await healStaleCacheEntries();
             // 0.18 同步式自愈：零模型（只查缓存贴状态层），放 preflight 之前——
             // 模型没开也照贴，缓存里有对的译文就不该等模型（用户 2026-11-09 拍板）
-            n += await syncAllDisplayNamesFromCache(contextRef.api.getState());
+            n += await syncAllDisplayNamesFromCache(safeGetState(contextRef) || st);
             // 下面两条会调模型：先探一次（0.16.5）。模型连不上时硬跑，每条都会被判
             // 「只翻了一半」，记进 nameFail，试满 3 次就永久放弃 —— 等模型开起来时
             // 这些条目已经挂了免战牌，得手动清放弃名单才能救。
@@ -6777,9 +6850,10 @@ function main(context) {
               }
               return n;
             }
-            const st = contextRef.api.getState();
-            n += await healStaleDisplayNames(st);
-            n += await healStaleDownloadNames(st);
+            // 变量名保持 state：namefail-key 守卫按调用点字面钉账（另两处也是 state）
+            const state = safeGetState(contextRef) || st;
+            n += await healStaleDisplayNames(state);
+            n += await healStaleDownloadNames(state);
             return n;
           };
           runStartupHeal(1)
@@ -6802,7 +6876,8 @@ function main(context) {
             .catch((e) => { log('warn', 'heal names fail', String(e)); });
         }
       } catch (e) { log('warn', 'autostart', String(e)); }
-    }, 8000);
+    };
+    setTimeout(() => runStartup(1), 8000);
   } catch (e) {
     log('warn', 'autostart', String(e));
   }

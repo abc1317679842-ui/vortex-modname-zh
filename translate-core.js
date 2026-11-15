@@ -183,11 +183,32 @@ function bbcodeBalanced(s) {
   return stack.length === 0;
 }
 
+/** 繁→简 不能一刀切的**固定词**（F-021-05，0.21）。
+ *  `TRAD_PAIRS` 里 `乾→干` 是为「乾淨→干净」这类准备的，但 `乾坤` / `乾隆` 里的
+ *  `乾` 本来就读 qián、简体写法也保留 `乾`。逐字替换会把 `乾坤罗盘模组` 变成
+ *  `干坤罗盘模组`（审计 C-3/C-7 实测 3/3 稳定复现，模型输出的本来是正确简体）。
+ *  这里只列**确知会误伤**的词，不追求覆盖全部多音字：漏列只是保持原样（无害），
+ *  错列才会改坏正常文本。 */
+const TRAD_KEEP = ['乾坤', '乾隆', '乾卦', '乾陵', '乾县', '乾元', '乾清宫', '乾嘉'];
+const TRAD_HOLD = '\u0001';   // 私有区哨兵：不会被 TRAD_PAIRS 命中，也不出现在正常译文里
+
 function toSimplified(s) {
   if (!s) return s;
   const m = tradMap();
+  let src = String(s);
+  // 先把固定词换成哨兵占位，转完再还原 —— 占位里带序号，靠 TRAD_HOLD+数字+TRAD_HOLD 定位
+  const held = [];
+  for (const w of TRAD_KEEP) {
+    if (src.indexOf(w) === -1) continue;
+    const ph = TRAD_HOLD + held.length + TRAD_HOLD;
+    src = src.split(w).join(ph);
+    held.push(w);
+  }
   let out = '';
-  for (const ch of String(s)) out += m.get(ch) || ch;
+  for (const ch of src) out += m.get(ch) || ch;
+  if (held.length) {
+    for (let i = 0; i < held.length; i++) out = out.split(TRAD_HOLD + i + TRAD_HOLD).join(held[i]);
+  }
   return out;
 }
 
@@ -396,6 +417,11 @@ function repairStruct(s, orig) {
   var FAM = { '\u300c': 'q', '\u300d': 'q', '\u300e': 'q', '\u300f': 'q', '"': 'q', '\u300a': 'b', '\u300b': 'b', '\uff08': 'p', '\uff09': 'p', '\u3010': 'k', '\u3011': 'k', '[': 's', ']': 's' };
   var ISOPEN = { '\u300c': 1, '\u300e': 1, '\u300a': 1, '\uff08': 1, '\u3010': 1, '[': 1 };
   var ISMASK = { '"': 1, '\u300e': 1, '\u300f': 1 };
+  // F-021-09（0.21）：原文本来就用半角双引号包内容时（`Mod showing "OK" button`），
+  // 译文里成对的 `"` 是**合法标点**，不是遮蔽残留。旧版见 `"` 就 blank，把
+  // `显示"确定"按钮的模组` 剥成 `显示确定按钮的模组`（审计 C 消融第 2 个变坏例 3/3）。
+  // 『』（\u300e/\u300f）是 applyTerms 的遮罩专用壳，任何情况都必须清 —— 只给 `"` 开后门。
+  var srcHasQuote = String(orig == null ? '' : orig).indexOf('"') !== -1;
   var CNOPEN = { '\u300c': 1, '\u300e': 1, '\u300a': 1, '\uff08': 1, '\u3010': 1 };
   var CLOSE = { q: '\u300d', b: '\u300b', p: '\uff09', k: '\u3011', s: ']' };
 
@@ -431,7 +457,10 @@ function repairStruct(s, orig) {
     // 配对条件本身就是「同族才配得上」（见上面两处 `FAM[...] === fam` / `ch === '"'`），
     // 所以原来那句 `else if (FAM[L.ch] !== FAM[R.ch]) out[R.idx] = CLOSE[...]` 永远为假，
     // 是死分支（审计 0.16.5 实测报告 §4 指出，已核）。跨族归一发生在上面 orphan 分支。
-    if (ISMASK[L.ch] || ISMASK[R.ch]) { blank(L.idx); blank(R.idx); }
+    if (ISMASK[L.ch] || ISMASK[R.ch]) {
+      // 原文自带双引号 → 这对引号是正常标点，保留（F-021-09）
+      if (!srcHasQuote || (L.ch !== '"' && R.ch !== '"')) { blank(L.idx); blank(R.idx); }
+    }
   }
   for (var si = 0; si < stack.length; si++) { if (stack[si].ch !== '(') blank(stack[si].idx); }
 
@@ -533,17 +562,26 @@ function buildHtmlPrompt(terms) {
 }
 
 function extractJsonArray(s) {
+  // 0.21 全面审计 P2-4：**元素必须是可显示的标量**。
+  // 以前只判 `Array.isArray(v)`，于是模型回 `{"名称": "值"}` 时会被下面「弯引号兜底」
+  // 那条 `JSON.parse('[' + 原文 + ']')` 拼成 `[{...}]` 直接返回；元素是对象，
+  // 后续 `String(obj)` 得到 `[object Object]`，再被残片清理剥掉开头的 `[`，
+  // 界面上就出现 **`object Object`**（0.20 起就有，两臂同样复现）。
+  // 现在只接受 string / number / null；对象与布尔一律判「解析失败」，
+  // 让它继续走后面的单条兜底（`{"…"}` 那种由兜底的剥壳逻辑处理）。
+  const okArr = (v) => Array.isArray(v)
+    && v.every((x) => x === null || typeof x === 'string' || typeof x === 'number');
   let t = String(s).trim();
   t = t.replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
   try {
     const v = JSON.parse(t);
-    if (Array.isArray(v)) return v;
+    if (okArr(v)) return v;
   } catch (e) { /* continue */ }
   const m = t.match(/\[[\s\S]*\]/);
   if (m) {
     try {
       const v = JSON.parse(m[0]);
-      if (Array.isArray(v)) return v;
+      if (okArr(v)) return v;
     } catch (e) { /* give up */ }
   }
   // 模型偶尔只吐 "译文1","译文2"（不带外层方括号），或者用中文逗号/弯引号分开
@@ -551,7 +589,7 @@ function extractJsonArray(s) {
     const fixed = t.replace(/[“”]/g, '"').replace(/[，、]/g, ',');
     try {
       const v = JSON.parse('[' + fixed + ']');
-      if (Array.isArray(v)) return v;
+      if (okArr(v)) return v;
     } catch (e) { /* give up */ }
   }
   // 全角引号兜底：模型有时用 “” 包裹字符串，实测日志里有 `[""ModSkillSlotPages重制版 1.8""]`
@@ -564,20 +602,20 @@ function extractJsonArray(s) {
       .replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
     try {
       const v = JSON.parse(norm);
-      if (Array.isArray(v)) return v;
+      if (okArr(v)) return v;
     } catch (e) { /* give up */ }
     const m2 = norm.match(/\[[\s\S]*\]/);
     if (m2) {
       try {
         const v = JSON.parse(m2[0]);
-        if (Array.isArray(v)) return v;
+        if (okArr(v)) return v;
       } catch (e) { /* give up */ }
     }
     // 不带外层方括号 + 双份引号（""译文A"",""译文B""）也一并救回来
     if (norm.indexOf('[') === -1 && /["']/.test(norm)) {
       try {
         const v = JSON.parse('[' + norm + ']');
-        if (Array.isArray(v)) return v;
+        if (okArr(v)) return v;
       } catch (e) { /* give up */ }
     }
   }
@@ -609,6 +647,37 @@ function salvageJsonArray(s) {
     i = j;
   }
   return out;
+}
+
+/** 多段粘连的**分段救援**（F-021-11，0.21）。
+ *  模型忘闭合引号时会把多段写成 `["甲]\n["乙]\n["丙"]` —— `salvageJsonArray` 逐字符扫描
+ *  会把 `]\n["` 当成「字符串结束 + 新串开始」，只救回首段（实测 3 段只出第 1 段，
+ *  后 2/3 译文丢失且不重试）。这里按「一段一对 `[]`、段内不含方括号与引号」逐个收，
+ *  由调用方判定段数是否可信。
+ *
+ *  ⚠ 返回值是 `{ segs, stray }` 而不是数组（0.21 全面审计 P1-3）：
+ *  调用方原来只判「≥2 段 + 至少一段含汉字」就采纳，于是模型吐**正常带方括号中文正文**
+ *  （`[描述] …正文… [安装] …正文…`）时被判成多段，`segs.join()` 把括号外正文整段丢掉，
+ *  只剩 `描述\n\n安装`。现在把「没被任何方括号覆盖的原文」一并返回，调用方要求
+ *  `stray` 只剩 JSON 标点才肯采纳 —— 也就是方括号必须**真的铺满**整串。 */
+function splitBracketSegments(s) {
+  const out = [];
+  // 段内只排除方括号与**半角双引号**（JSON 分隔符）。中文弯引号 `‘活人’`、半角单引号
+  // 在正常译文里到处都是，第一版把它们也排除掉，结果含 `‘活人’` 的那段被整段跳过
+  // （实测 3 段只拼回 2 段）—— 别再加进字符类。
+  const re = /\[\s*["“”]?\s*([^\[\]"]{2,})\s*["“”]?\s*\]/g;
+  let m;
+  const text = String(s == null ? '' : s);
+  let stray = '';
+  let last = 0;
+  while ((m = re.exec(text))) {
+    const v = m[1].trim();
+    if (v) out.push(v);
+    stray += text.slice(last, m.index) + ' ';
+    last = m.index + m[0].length;
+  }
+  stray += text.slice(last);
+  return { segs: out, stray };
 }
 
 /** 估算一段文本的 token 占用（按字符分类加权）。
@@ -1018,6 +1087,57 @@ async function llmTranslate(cfg, texts, modeOverride, extraRule) {
   const boxes = payloadList.map(() => ({ seq: 1, map: new Map() }));
   const safeList = payloadList.map((t, i) => protectPaths(t, boxes[i]));
 
+  // F-021-12（0.21）：**没有可译内容**的条目直接原样返回，不送模型。
+  // 实测：输入是纯 URL（`https://github.com/...`），`protectPaths` 把它换成 `{{P1}}`，
+  // 送过去等于让模型「翻译一个占位符」，它回 `[{"{{P1}}"}}]` 这种畸形 JSON，
+  // 整条变成空译文（该翻没翻／漏贴），而且白烧 2 次 HTTP 且不会成功。
+  // 判据：去掉 URL / 占位符 / 伪标签后还剩 ≥2 个连续字母才算「有可译文字」。
+  // 只用原文判、不看遮罩后 —— 遮罩会把 `Witcher 3` 变成 `『巫师3』`，按遮罩串判会误判。
+  // ⚠ 下面三条正则的字符类里**不许出现裸引号字符**：测试沙箱的 `extractFn` 是简易词法
+  //   状态机（只认代码/字符串两态，且把反引号也当字符串定界），注释里混进一个孤立引号
+  //   就会让它把后面整段代码当字符串吞掉、函数体配平失败（预算那条套件实测）。
+  //   用 `\S+` 替代「排除若干字符」的写法即可，URL 后面紧跟中文标点时多吃一格无副作用。
+  // ⚠ 0.21 全面审计 P1-1/P1-2 补：「可译文字」**不能只认 ASCII 字母**。
+  //   第一版只写 `[A-Za-z]{2,}`，于是 `Ведьмак 3 — Кровь и Вино`（西里尔）、
+  //   `고해상도 텍스처 팩`（谚文）被整条判成「没内容可翻」原样返回 —— 该翻的没翻。
+  //   （日文侥幸没中招，因为 `ハイポリゴン化MOD` 里带 ASCII 的 `MOD`。）
+  //   现在把这些文字区块也算「可译」：西里尔／希腊／假名／谚文／希伯来／阿拉伯。
+  //   汉字刻意不列：中文条目本来就不需要送模型，繁体那条交给下面的 `passthru` 做繁→简。
+  const hasWord = (t) => {
+    const v = String(t == null ? '' : t)
+      .replace(/https?:\/\/\S+/g, ' ')
+      .replace(/\{\{[^{}]+\}\}/g, ' ')
+      .replace(/<\/?i\d+>/g, ' ');
+    if (/[A-Za-z]{2,}/.test(v)) return true;
+    if (/[\u0400-\u04ff\u0370-\u03ff\u3040-\u30ff\u31f0-\u31ff\uac00-\ud7af\u0590-\u05ff\u0600-\u06ff]/.test(v)) return true;
+    // 含繁体字也要送模型：`巫師 3：狂獵 介面強化` 一个 ASCII 字母都没有，但单字表只能把
+    // 「師→师、獵→猎」逐字换掉，「介面→界面」这种**词级**差异它管不了，最后得到简繁混杂的
+    // `巫师 3：狂猎 介面强化`（审计 P1-1 实测）。送模型才是 0.20 的正确行为。
+    return toSimplified(v) !== v;
+  };
+  // noop 条目也不能原样吐回去：源是繁体中文时（`巫師 3：狂獵`）它一个 ASCII 字母都没有，
+  // 直接原样返回就等于**跳过了繁→简**（0.20 是送模型后由 `toSimplified` 收尾的）。
+  // 这里只补这一步转换，别的收尾一概不做 —— noop 条目的原文就是最终显示内容，
+  // 多动一步（trim／剥壳／塌陷）都可能改坏用户本来就写好的中文。
+  const passthru = (t) => toSimplified(String(t == null ? '' : t));
+  const noopIdx = [];
+  texts.forEach((t, i) => { if (!hasWord(t)) noopIdx.push(i); });
+  if (noopIdx.length) {
+    const allSame = (list) => {
+      const cp = list.map((x) => passthru(x));
+      try { cp._rejects = new Set(); } catch (e) { /* ignore */ }
+      return cp;
+    };
+    if (noopIdx.length === texts.length) return allSame(texts);
+    const rest = [], restPos = [];
+    texts.forEach((t, i) => { if (hasWord(t)) { rest.push(t); restPos.push(i); } });
+    const out = await llmTranslate(cfg, rest, mode, extraRule);
+    const merged = texts.map((x) => passthru(x));
+    restPos.forEach((orig, j) => { merged[orig] = out[j]; });
+    try { merged._rejects = (out && out._rejects) || new Set(); } catch (e) { /* ignore */ }
+    return merged;
+  }
+
   // 系统提示词先构建：估算输入占用时要连它一起算（见下方 estIn）
   // ⛔ 2026-11-06 试过「提示词只放 userTerms、砍掉 gameTerms 术语表」，**实测否决，已回滚**：
   //   · 串味没消失：真实链路（先遮罩再送模型）A/B 20 组，对照 2/40 vs 处理 2/40 打平，
@@ -1051,6 +1171,32 @@ async function llmTranslate(cfg, texts, modeOverride, extraRule) {
   const want = Math.ceil(inChars * (mode === 'mod' ? 0.5 : 0.85)) + 256;
   const room = ctx - estIn - 128;                            // 留给输出的空间
   if (room < 400 || room < Math.min(want, 4096)) {
+    // F-021-19（0.21）：**单条超长文本自己分段翻**，不要把整条丢空。
+    // 13311 字的简介在 4096 窗口下估 4500+ token，这里直接抛 CTX_OVER；而
+    // translateBatch 的「劈半重发」判据是 `g.length > 1`，单条批次无处可劈，
+    // 最终 HTTP=0、该条永远是 null（审计 F-008 3/3）。
+    // 段长预算按「输出也要塞得下」反推：ctx - 系统提示词 - 余量，再按 want≈0.5~0.85×入参保守打折。
+    if (texts.length === 1 && !cfg.__noSplit) {
+      const sysTok = Math.ceil(sysPrompt.length / 1.2);
+      const per = Math.max(300, Math.floor((ctx - sysTok - 512) / 1.2));
+      const parts = splitLongText(String(texts[0]), per);
+      if (parts.length > 1) {
+        const cfg2 = Object.assign({}, cfg, { __noSplit: true });
+        const got = [];
+        const subRejects = new Set();
+        for (const p of parts) {
+          try {
+            const sub = await llmTranslate(cfg2, [p], mode, extraRule);
+            if (sub && sub._rejects) for (const rr of sub._rejects) subRejects.add(rr);
+            got.push(sub && sub[0] != null ? sub[0] : p);
+          } catch (e) { got.push(p); }
+          await delay(cfg.requestDelayMs || 150);
+        }
+        const res = [got.join('')];
+        try { res._rejects = subRejects; } catch (e) { /* ignore */ }
+        return res;
+      }
+    }
     const e = new Error('CTX_OVER 输入约 ' + estIn + ' token（含系统提示词 ' + Math.ceil(sysPrompt.length / 1.2) +
       '），输出约需 ' + Math.min(want, 4096) + '，模型上下文只有 ' + ctx);
     e.code = 'CTX_OVER';
@@ -1130,8 +1276,19 @@ async function llmTranslate(cfg, texts, modeOverride, extraRule) {
       // BBCode 闭合扶正（review4）：小模型把闭合写成 [b> 或 HTML 风格 </b>。
       // 只认已知 BB 标签名（[abc> 这种普通文本不动）；html 模式不碰 ——
       // </b> 在 HTML 里是合法标签，绝不能被转成 BBCode。
-      s = s.replace(new RegExp('\\[(\\/?)(' + BB_HEAD + ')>', 'gi'), (m0, sl, nm) => '[' + sl + nm + ']');
-      s = s.replace(new RegExp('<\\/(' + BB_HEAD + ')>', 'gi'), (m0, nm) => '[/' + nm + ']');
+      // F-021-03（0.21）：还要再判一层「这条真在写 BBCode」。`SKSE [b>2 补丁说明] 插件`
+      // 里的 `[b>` 是普通区间/数学写法（原文 `[b>2 notes]` 也是），旧版无条件改成 `[b]`，
+      // 再被后面的空格塌陷粘成 `SKSE [b]2 补丁说明插件` —— 把好译文改坏（审计 C-1 3/3）。
+      // 判据：译文或原文里真存在该标签的开/闭形式（`[b]` / `[/b]`）才扶正。
+      const srcStr0 = String(src == null ? '' : src);
+      const hasTag = (nm) => {
+        const re = new RegExp('\\[\\/?' + escapeRegExp(nm) + '\\]', 'i');
+        return re.test(s) || re.test(srcStr0);
+      };
+      s = s.replace(new RegExp('\\[(\\/?)(' + BB_HEAD + ')>', 'gi'),
+        (m0, sl, nm) => (hasTag(nm) ? '[' + sl + nm + ']' : m0));
+      s = s.replace(new RegExp('<\\/(' + BB_HEAD + ')>', 'gi'),
+        (m0, nm) => (hasTag(nm) ? '[/' + nm + ']' : m0));
     }
     // unmask 必须所有模式都跑：ui/html 现在也遮蔽（见 maskTerms），
     // 漏了回填就会把『剑星』『Vortex』这些占位符原样露在界面上。
@@ -1161,6 +1318,20 @@ async function llmTranslate(cfg, texts, modeOverride, extraRule) {
     const srcHasBracketed = (w) => BRACKET_PAIRS.some(([l, r]) => new RegExp(
       escapeRegExp(l) + '\\s*' + escapeRegExp(String(w)) + '\\s*' + escapeRegExp(r)
     ).test(srcForBracket));
+    // F-021-04（0.21）：模型自造壳只包核心词，**同一条里 ≥2 个术语各自带括注**是
+    // 合理并列写法（`（CNS）与（CBBE）合集`），剥掉会变成 `CNS与CBBE合集`（审计 C-2 3/3）。
+    // 两条保护任命中即跳过剥离：
+    //   ① 本条译文有 ≥2 个不同术语各自被括注包住 → 视为并列列举；
+    //   ② 该术语的括注左右紧邻并列连词（与/和/及/、）→ 视为并列列举。
+    const WRAP_L = '[「『\\[(（《"\u2018\u201c]';
+    const WRAP_R = '[」』\\])）》"\u2019\u201d]';
+    const wrapRe = (zh) => new RegExp(WRAP_L + escapeRegExp(String(zh)) + WRAP_R);
+    let wrappedTermN = 0;
+    for (const x of maskTerms) { if (x && x.zh && wrapRe(x.zh).test(s)) wrappedTermN++; }
+    const parallelCtx = (zh) => new RegExp(
+      '[与和及、]\\s*' + WRAP_L + escapeRegExp(String(zh)) + WRAP_R
+      + '|' + WRAP_L + escapeRegExp(String(zh)) + WRAP_R + '\\s*[与和及、]'
+    ).test(s);
     for (const t of maskTerms) {
       if (!t.zh) continue;
       // F-020-28 v2（用户质疑后复核）：v1 只比对 t.zh，漏掉「原文是英文术语、
@@ -1171,7 +1342,9 @@ async function llmTranslate(cfg, texts, modeOverride, extraRule) {
       //   括注里装别的内容 (Wild Hunt) 仍剥 —— 4 组对照零退化。
       //   数据：E1 修好、E2/E4 一致、E3 两版同样被 0.19 幻觉守卫拦（与本改动无关）。
       if (srcHasBracketed(t.zh) || (t.en && t.en !== t.zh && srcHasBracketed(t.en))) continue;
-      s = s.replace(new RegExp('[「『\\[(（《"\u2018\u201c]' + escapeRegExp(t.zh) + '[」』\\])）》"\u2019\u201d]', 'g'), t.zh);
+      // F-021-04：合理并列括注不剥（见上面两条件）
+      if (wrappedTermN >= 2 || parallelCtx(t.zh)) continue;
+      s = s.replace(new RegExp(WRAP_L + escapeRegExp(t.zh) + WRAP_R, 'g'), t.zh);
     }
     // 结构修复（C5+C7 v6）：成对的三道还原都跑完之后，剩下的孤立/错配符号交给它。
     // 只给 mod 模式：ui/html 的正文可能有合法的『』引用与英文引号，全量剥会改坏正常文本。
@@ -1188,17 +1361,49 @@ async function llmTranslate(cfg, texts, modeOverride, extraRule) {
     // 顺序必须在空格塌陷之前：「离线契约 巫师3」塌成「离线契约巫师3」后就找不到分隔位置了。
     // 先整段剥带括号的幻觉标题：`《巫师3：骑士圣殿》强化模组` 只剥「《巫师3」会剩一个孤立 `》`
     // （verify 实测 1/2201），所以凡「括号内出现巫师3」就整块拿掉，四个括号族都覆盖。
-    if (mode === 'mod' && !/\bwitcher|巫师|猎魔人|杰洛特|\bTW\s?3\b|\bW3\b|wied[zź]min/i.test(String(src))) {
+    // 0.21 全量审计 R2-A-1（严重）：收尾清理以前**整块**挂在这个 if 里，于是「原文含巫师
+    // 系列」的题材一律不清理 —— 多余空格、NBSP、首尾标点、模型多写的空行全部留在界面上。
+    // 巫师3 是最热门的模组品类之一，等于对这批用户整条清理链失效。
+    // 拆成两段：剥幻觉仍然只在「原文没提巫师」时做（那是它的语义），收尾清理**所有 mod 都做**。
+    const witcherLike = /\bwitcher|巫师|猎魔人|杰洛特|\bTW\s?3\b|\bW3\b|wied[zź]min|ведьмак|відьмак|vedmak|věd[mn]ák/i.test(String(src));
+    if (mode === 'mod' && !witcherLike) {
+      // F-021-06（0.21）：西里尔／波兰／捷克词形也算「原文提到了巫师系列」。
+      // 旧判据只认英文与中文，`Ведьмак 3 - Кровь и Вино` 认不出来 → 译文里的真
+      // 「巫师3」被当幻觉删掉，只剩 `血与酒`（审计 C-4 3/3）。
       s = s.replace(/[《【「『][^》】」』]*?巫师\s?3[^》】」』]*[》】」』]/g, ' ')
-        .replace(/[《【「『"'（(]?\s*巫师\s?3\s*[》】」』"')）]?/g, ' ')
-        .replace(/[\s,，、]{2,}/g, ' ')
-        .replace(/^[\s\-–—,，:：、]+|[\s\-–—,，:：、]+$/g, '')
+        .replace(/[《【「『"'（(]?\s*巫师\s?3\s*[》】」』"')）]?/g, ' ');
+    }
+    if (mode === 'mod') {
+      // F-021-31（0.21）：收尾清理照旧**无条件**跑（旧版就在这里跑，不删幻觉也跑），
+      // 但**换行必须排除在塌陷类之外** —— 旧版用 `\s`，把段落间 `\n\n` 压成一个半角空格
+      // （审计两轮 e2e：RAW 含 `\n\n`、POST 全无，2/2 稳定）。
+      // 用 `[^\S\n\r]`（= 空白但非换行）而不是 `[ \t]`：模型吐的空格常是 NBSP / 全角空格，
+      // `[ \t]` 匹配不到，`[b]   [/b]` 这种多余宽度就压不下去（真实语料 B-014 回归撞到）。
+      s = s.replace(/(?:[^\S\n\r]|[,，、]){2,}/g, ' ')
+        .replace(/^[ \t\-–—,，:：、]+|[ \t\-–—,，:：、]+$/g, '')
         .trim();
+      // F-021-31 补充（0.21）：换行**保真**而不是**放纵**。上一条不再吃 `\n` 之后，
+      // 模型自己多写的空行会原样留下（真实语料 B-012/014/028/102 四条实测：源内
+      // `\n\n` 计数为 0，译文却多出 1~3 个空行）。所以换行结构以源为准：
+      //   源用显式结构（`<br />` / BBcode）且源内没有空行 → 模型的空行是编的，压成单换行；
+      //   源内本来就有空行，或源是纯文本（模型分段是善意排版）→ 一律不动。
+      const srcTxt0 = String(src == null ? '' : src);
+      const srcStructured = /<br\s*\/?>|\[\/?(?:b|i|u|s|list|\*|size|color|font|center|quote|spoiler|img|url|code|heading|table)\b/i.test(srcTxt0);
+      if (srcStructured && !/\n[ \t]*\n/.test(srcTxt0)) s = s.replace(/\n{2,}/g, '\n');
     }
     // 汉字段之间不该有半角空格：遮罩后的中文块（『黑暗之魂：重制版』）模型会当成独立短语，
     // 两边补空格 ——「烧焦的契约 黑暗之魂：重制版」「BTZ血红色 界面主题」。
     // 全语料 35/2431；只塌汉字↔汉字，汉字↔数字/英文的空格保留（「第 1 部分」不动）。
-    if (mode === 'mod') s = s.replace(/([\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])/g, '$1');
+    if (mode === 'mod') s = s.replace(/([\u4e00-\u9fff])[ \t]+(?=[\u4e00-\u9fff])/g, (m0, ch, off, whole) => {
+      // F-021-08（0.21）：并列单字之间**刻意留的空格**不能吞（`红 蓝 绿 三色可选`）。
+      // 判据看左邻：当前字左侧不是汉字（开头／空格／标点）＝ 它是个孤立单字，属于
+      // 「单字并列」列举 → 保留空格；左邻是汉字（处在词组内部）才照旧塌陷。
+      // `血红色 界面主题`（左邻「红」是汉字）照塌 —— 那才是本规则要治的粘连。
+      // F-021-31（0.21）：空白类由 `\s+` 收窄成 `[ \t]+`。`\s` 含换行，段落间
+      // `\n\n` 会被这条「汉字间空格塌陷」连带吃掉 —— 长描述的段落结构就是这样丢的。
+      const prev = off > 0 ? whole.charAt(off - 1) : '';
+      return /[\u4e00-\u9fff]/.test(prev) ? ch : m0;
+    });
     s = toSimplified(s).trim();
     // 模型有时把路径反斜杠多转义一层（C:\\Users 变成 C:\\\\Users），原文没这层就压平
     if (String(src).indexOf('\\\\') === -1 && s.indexOf('\\\\') !== -1) s = s.replace(/\\\\/g, '\\');
@@ -1211,6 +1416,13 @@ async function llmTranslate(cfg, texts, modeOverride, extraRule) {
     if (!/^[【（「『\[\(]/.test(srcHead)) {
       const m2 = s.match(/^([【「『])([\s\S]*)([】」』])$/);
       if (m2) s = m2[2].trim();
+      // F-021-15 / F-021-21（0.21）：**部分**壳剥不掉的历史缺口。
+      // m2 要求整条被壳包住，而模型常写 `【X】模组`、html 里写 `【{{P1}}…】…` ——
+      // 壳只包住开头一段，于是【】原样贴到界面上（S-070 与 F-013 两轮 e2e 都是稳定复现）。
+      // 判据：壳内**不含汉字**（纯外文／占位符／数字）才算模型自造壳；原文本来就用【】
+      // 的中文标题由外层 `srcHead` 门挡掉，不会误伤。
+      const mHeadShell = s.match(/^([【「『])\s*([^【】「」『』]{1,40}?)\s*([】」』])\s*([\s\S]+)$/);
+      if (mHeadShell && !/[\u4e00-\u9fff]/.test(mHeadShell[2])) s = mHeadShell[2] + mHeadShell[4];
       // 方括号 JSON 壳（review4）：模型把译文包成 [“模组内容”] / ["Mod Content"] 的壳，
       // 原文并没有方括号 → 剥掉。壳内不能含方括号，否则会把 [b]…[/b] 的标签本尊吃掉。
       const mShell = s.match(/^\[\s*["“”']*\s*([^\[\]【】「」『』]+?)\s*["“”']*\s*\]$/);
@@ -1218,6 +1430,12 @@ async function llmTranslate(cfg, texts, modeOverride, extraRule) {
     }
     // 模型也爱给游戏名/作品名套《》（实测游戏卡片显示成「《我的夏日座驾》」），原文没有就去掉
     if (s.indexOf('《') === 0 && s.indexOf('》') === s.length - 1 && String(src).indexOf('《') === -1) {
+      // F-021-07（0.21）**实测回退**：审计只给了 1 条构造反例（`《模组使用手册》` →
+      // 剥成 `模组使用手册`，判定为「合法书名号被剥」），但拿 264 条真实模型输出做回归后
+      // 发现反方向代价大得多 —— 模型给整条 mod 名套《》是常态（`《无限存档II-…-1757429002.zip》`
+      // `《昆特牌多样性与平衡性全面重制版》` `《太空实验室零件（预览版）》` 等 12 条），
+      // 不剥就是界面上多一层书名号。而剥掉「手册/指南」那层《》只是少一个装饰性标点，不算错。
+      // → 维持 0.20 的全剥行为，F-021-07 记为「审计误判，真实语料推翻」。
       s = s.slice(1, -1).trim();
     }
     // 模型有时给整条译文套一对弯引号（“…”），原文没有就剥掉
@@ -1255,6 +1473,28 @@ async function llmTranslate(cfg, texts, modeOverride, extraRule) {
   }
 
   let arr = extractJsonArray(content);
+  // F-021-11（0.21）：单条输入 + 模型吐**多段粘连**（段尾忘写闭合引号）时先把各段捞回来。
+  // 严格解析必然失败（引号不闭合），salvageJsonArray 又只救首段 —— 必须先于它的判据走。
+  // 采纳条件收紧：≥2 段、且至少一段含汉字（英译中不可能全无汉字），否则放弃走原路径。
+  if ((!arr || arr.length === 0) && texts.length === 1) {
+    const split = splitBracketSegments(content);
+    const segs = split.segs;
+    const cjkSegs = segs.filter((x) => /[\u4e00-\u9fff]/.test(x)).length;
+    // 方括号必须**铺满**整串才认（P1-3）：多段粘连的原文里括号外只剩 `\n` 和 JSON 标点，
+    // 而正常正文 `[描述] …正文… [安装] …正文…` 的括号外是大段真实文字。不判这一条
+    // 就会把括号外正文整段丢掉、只拼回 `描述\n\n安装`。
+    // `\\[nrt]` 那一步：语料里存的是转义后的串，段间残留是**字面量**反斜杠+n，不是真换行，
+    // 光靠字符类 `\s` 清不掉（B-009 实测残留 `\n\n` 四个字符 → 长度判据误拒）。
+    const stray = split.stray.replace(/\\[nrt]/g, '').replace(/[\[\]"“”'‘’\s,，:：、\\]/g, '');
+    if (segs.length >= 2 && cjkSegs >= 1 && stray.length <= 2) {
+      const box0 = boxes[0];
+      const holeLost = box0 && box0.map.size
+        && [...box0.map.keys()].some((k) => segs.join('').indexOf(k) === -1);
+      if (!holeLost) {
+        return withRejects([restorePaths(finishOne(segs.join('\n\n'), texts[0]), box0)]);
+      }
+    }
+  }
   if (!arr || arr.length === 0) {
     // 解析失败最常见的原因就是输出被 max_tokens 截断（长 changelog 批）：
     // 先把完整的前几条捞回来，缺的置 null 交给上层单条补发，别整批作废
@@ -1298,6 +1538,12 @@ async function llmTranslate(cfg, texts, modeOverride, extraRule) {
   if (texts.length > 1) {
     let c = String(content).trim().replace(/^```(?:json)?/i, '').replace(/```\s*$/, '').trim();
     c = c.replace(/^["'“”‘’\s]+/, '').replace(/["'“”‘’\s。．.]+$/, '');
+    // F-021-17（0.21）：**说明文字**不许被拆成多条译文。
+    // 实测模型不返回 JSON，直接回「这不是 JSON 数组，因为输入格式不对」/ 英文
+    // 「Sorry, this is plain text not a JSON array」—— 按标点拆出来正好等于输入条数，
+    // 条数约束挡不住，于是被静默采纳、写进缓存、不重试，界面文案变成一句解释。
+    // 整串提到 JSON 就一律不拆，交给下面的 throw → 上层逐条重试。
+    if (/\bJSON\b/i.test(c)) throw new Error('模型回复是说明文字不是译文: ' + c.slice(0, 200));
     const trySplit = (sepRe) => {
       const parts = c.split(sepRe)
         .map((s) => s.trim().replace(/^["'“”‘’\s]+|["'“”‘’\s]+$/g, '').trim())
@@ -1327,6 +1573,34 @@ async function llmTranslate(cfg, texts, modeOverride, extraRule) {
   if (texts.length === 1) {
     let raw = String(content).trim();
     raw = raw.replace(/^```(?:json)?/i, '').replace(/```\s*$/, '').trim();
+    // F-021-18（0.21）：模型吐**畸形 JSON 对象** `{"译文内容"}` 时，旧版把花括号和引号
+    // 一起当译文贴到界面上（实测 `{"这是一段畸形 JSON 对象形式的中文译文内容"}`）。
+    // 能取出内层字符串就用内层（内容本身是好的），取不到就让下面的格式校验打回重试。
+    const mObjWrap = raw.match(/^\{\s*"([\s\S]*)"\s*\}$/);
+    // 只有「里面就是一句纯译文」才剥壳（内层不含任何半角双引号）。
+    // 内层还带引号说明这是个**真 JSON 片段**（`{"名称": "值"}`，原文本来就在讲配置项），
+    // 剥了会把内容改坏（审计 P2-4）；这种情况原样留着，也不要抛错重试。
+    if (mObjWrap && mObjWrap[1].indexOf('"') === -1) {
+      raw = mObjWrap[1].trim();
+    } else if (!mObjWrap && /^\{\s*"/.test(raw)) {
+      // 只认**真像 JSON 对象**的（`{` 后紧跟引号）。判据不能写成 `/^\{/ && /\}$/`：
+      // 带占位符的长文本来就以 `{{P1}}` 开头、以 `{{P7}}` 结尾，会被误判成畸形对象
+      // 直接抛错（真实语料 B-024 回归撞到，整条变成 null）。
+      throw new Error('模型返回畸形 JSON 对象: ' + raw.slice(0, 200));
+    }
+    // F-021-20（0.21）：被 max_tokens 截断的数组字面量 `["译文` 会原样泄漏进正文
+    // （实测输出以 `["` 开头）。剥掉开头的 `[`/`{` + 引号、结尾的引号 + `]`/`}` 残片。
+    // ⚠ 审计 P1-4 补：先判「这串本身是不是**完整合法 JSON**」。模型把原文里的配置片段
+    //   `{"名称": "值"}` 原样翻回来时，整串是合法 JSON 而不是残片，剥掉就变成
+    //   `名称": "值`（内容改坏）。真残片（`["译文` 被截断）JSON.parse 必然失败，照旧清。
+    let rawIsJson = false;
+    try {
+      const pv = JSON.parse(raw);
+      if (pv && typeof pv === 'object') rawIsJson = true;
+    } catch (e) { /* 不是完整 JSON → 按残片处理 */ }
+    if (!rawIsJson) {
+      raw = raw.replace(/^[\[\{]\s*["“”'‘’]\s*/, '').replace(/\s*["“”'‘’]\s*[\]\}]\s*$/, '');
+    }
     raw = raw.replace(/^"+|"+$/g, '');
     const src = String(texts[0]);
     // 模型有时把整条译文用方括号括起来、且不带引号（实测 html 模式「inZOI Vortex Extension」
@@ -1336,7 +1610,12 @@ async function llmTranslate(cfg, texts, modeOverride, extraRule) {
     // 模型偶尔输出「[原文] 译文」这种把原文包进方括号的格式（实测 inZOI 那条一直失败：
     // 「[inZOI Vortex Extension] 即为《inZOI Vortex》的扩展内容包。」），把前缀剥掉照样能用
     const mEcho = raw.match(/^\[([^\[\]]{1,160})\]\s*([\s\S]+)$/);
-    if (mEcho && mEcho[1].trim().toLowerCase() === src.trim().toLowerCase() && /[\u4e00-\u9fff]/.test(mEcho[2])) {
+    // F-021-13（0.21）：只有「前缀 = 一整条原文」**且原文够长（≥8 字符）**才剥。
+    // 短串（`A|B` / `pillType`）前缀虽然不是原文全长的回声，而是**模型刻意保留的原名** ——
+    // 剥掉等于把 `[A|B]模组` 变成 `模组`，原名直接丢失（审计 S-011/032/054 三格合并 3/3）。
+    // 真句子（`[inZOI Vortex Extension] 即为…`）照旧剥前缀。
+    if (mEcho && src.trim().length >= 8
+      && mEcho[1].trim().toLowerCase() === src.trim().toLowerCase() && /[\u4e00-\u9fff]/.test(mEcho[2])) {
       raw = mEcho[2].trim();
     }
     const cjkN = (raw.match(/[\u4e00-\u9fff]/g) || []).length;
@@ -1410,6 +1689,35 @@ async function libreTranslate(cfg, one) {
 }
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** 单条超长文本切段（F-021-19，0.21）。
+ *  `translateBatch` 的 CTX_OVER 劈半只对多条目批次生效；单条 13000 字的简介无处可劈，
+ *  只能整条留空（该翻没翻）。这里按「段落 → 句子 → 硬切」三级切到字数预算以内，
+ *  切点保留分隔符本身，拼回时段落结构不丢（`\n\n` 留在段尾）。 */
+function splitLongText(t, limit) {
+  const s = String(t == null ? '' : t);
+  const cap = Math.max(200, Math.floor(limit || 2000));
+  if (s.length <= cap) return [s];
+  const pieces = [];
+  // 段落分隔符单独成片（保留 `\n\n` 原样），这样拼回时结构不变
+  for (const para of s.split(/(\n{2,})/)) {
+    if (!para) continue;
+    if (para.length <= cap) { pieces.push(para); continue; }
+    for (const sen of para.split(/(?<=[。！？；!?;])/)) {
+      if (!sen) continue;
+      if (sen.length <= cap) { pieces.push(sen); continue; }
+      for (let i = 0; i < sen.length; i += cap) pieces.push(sen.slice(i, i + cap));
+    }
+  }
+  const chunks = [];
+  let cur = '';
+  for (const p of pieces) {
+    if (cur && (cur.length + p.length) > cap) { chunks.push(cur); cur = ''; }
+    cur += p;
+  }
+  if (cur) chunks.push(cur);
+  return chunks.length ? chunks : [s];
+}
 
 /** 按字符预算切块：长文自动变小批，避免一批输出超出 max_tokens 被截断。
  * minChunks：并发保底——短文本总字符不够预算时也要切成 minChunks 块，
